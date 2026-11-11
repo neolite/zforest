@@ -70,7 +70,26 @@ pub const Tag = enum {
 /// and is set for boolean attributes.
 pub const Attr = struct {
     name: []const u8,
-    value: ?[]const u8,
+    value: ?Value = null,
+    presence: bool = false,
+};
+
+/// An attribute/`.text` operand held for deferred resolution: either a
+/// rendered string, or a `Bound` thunk (`computed`, or a `*T.get()` store
+/// pointer) invoked by `resolveValue` inside writeNode/diffNode/seedNode.
+pub const Value = union(enum) {
+    str: []const u8,
+    bound: Bound,
+};
+
+/// A deferred binding produced by `computed` (store pointers passed to
+/// `.text`/attrs are wrapped automatically). The thunk runs at render/
+/// diff/seed time, so its output is always current and lives in the
+/// per-render arena.
+pub const Bound = struct {
+    ctx: *const anyopaque,
+    call: *const fn (a: std.mem.Allocator, ctx: *const anyopaque) ?[]const u8,
+    /// Resolved bools render as bare-name presence attributes.
     presence: bool = false,
 };
 
@@ -92,8 +111,10 @@ pub const Element = struct {
     /// `{parent_id}/{lid}` (e.g. `cb` inside `row-3` → `row-3/cb`).
     lid: ?[]const u8 = null,
     /// Bound textContent — rendered into the element and diffed via
-    /// `Dom.setText`. When set it replaces `children` entirely.
-    text: ?[]const u8 = null,
+    /// `Dom.setText`. When set it replaces `children` entirely. Accepts
+    /// anything `resolveValue` handles: strings, ints, `*T.get()` store
+    /// pointers, and `computed` bindings.
+    text: ?Value = null,
     attrs: []const Attr = &.{},
     children: Children = .{ .nodes = &.{} },
 };
@@ -106,6 +127,9 @@ pub const Node = union(enum) {
     text: []const u8,
     /// Trusted markup — emitted verbatim, never escaped, never diffed.
     raw: []const u8,
+    /// A transparent sibling group — emits no markup of its own, so a
+    /// component fn can return one Node covering several roots.
+    fragment: []const Node,
 };
 
 /// Text child node — HTML-escaped on output.
@@ -125,15 +149,58 @@ pub fn each(nodes: []const Node) Children {
     return .{ .keyed = nodes };
 }
 
+/// Group sibling nodes into one transparent `Node` — emits no wrapper of
+/// its own. `kids` accepts the same shapes as `el` children; this is how a
+/// component (a plain fn → Node) can cover several roots.
+pub fn fragment(a: std.mem.Allocator, kids: anytype) Node {
+    return .{ .fragment = switch (normChildren(a, kids)) {
+        .nodes, .keyed => |s| s,
+    } };
+}
+
+/// Bind `store` (any `*T` exposing `.get()`) through the mapping fn `f` —
+/// `f(a, store.get())` is resolved lazily wherever the `Bound` lands
+/// (`.text` or an attribute), so `.text = computed(s.remaining, countText)`
+/// renders and diffs like the equivalent pre-rendered string.
+pub fn computed(store: anytype, comptime f: anytype) Bound {
+    const S = @TypeOf(store);
+    comptime assertGettable(S);
+    const gen = struct {
+        fn call(a: std.mem.Allocator, ctx: *const anyopaque) ?[]const u8 {
+            const s: *const std.meta.Child(S) = @ptrCast(@alignCast(ctx));
+            return resolveValue(a, f(a, s.get()));
+        }
+    };
+    return .{
+        .ctx = store,
+        .call = &gen.call,
+        .presence = comptime fnReturnsBool(@TypeOf(f)),
+    };
+}
+
+/// Build a keyed child list from `items`: `render(a, ctx, item)` maps each
+/// item to a `Node` — returning null filters it out. Every non-null child
+/// must be an element carrying `.id` (enforced at diff/seed time).
+pub fn eachOf(a: std.mem.Allocator, items: anytype, ctx: anytype, render: anytype) Children {
+    var list: std.ArrayListUnmanaged(Node) = .empty;
+    for (items) |item| {
+        if (render(a, ctx, item)) |n| list.append(a, n) catch @panic("OOM");
+    }
+    return .{ .keyed = list.toOwnedSlice(a) catch @panic("OOM") };
+}
+
 /// Build an element node in `a` (the per-render arena). `attrs` is an
 /// anonymous struct: field names become attribute names (use `@"data-*"`
 /// for dashed names); `id`, `lid` and `text` are the bindings documented
 /// on `Element` — everything else is a plain attribute. Value types:
 /// `?T` omits the attribute on null, `bool` is presence/absence, ints are
-/// formatted with `{d}`, strings are emitted escaped.
+/// formatted with `{d}`, strings are emitted escaped — and any `*T`
+/// exposing `.get()` (e.g. a zefx `Store`, duck-typed: forest does not
+/// depend on it) resolves `v.get()` and formats it like a plain value,
+/// lazily at render/diff/seed time. `computed` bindings work the same.
 ///
 /// `children` accepts `[]const Node`, a single `Node`, a string (a text
-/// child), a tuple of nodes, or `each(rows)` for a keyed list.
+/// child), a tuple of nodes, or `each`/`eachOf(...)` for a keyed list.
 pub fn el(a: std.mem.Allocator, comptime tag: Tag, attrs: anytype, children: anytype) Node {
     var e: Element = .{ .tag = tag };
     const sinfo = @typeInfo(@TypeOf(attrs)).@"struct";
@@ -141,11 +208,11 @@ pub fn el(a: std.mem.Allocator, comptime tag: Tag, attrs: anytype, children: any
     inline for (sinfo.field_names) |name| {
         const v = @field(attrs, name);
         if (comptime std.mem.eql(u8, name, "id")) {
-            e.id = optStr(v);
+            e.id = resolveValue(a, v);
         } else if (comptime std.mem.eql(u8, name, "lid")) {
-            e.lid = optStr(v);
+            e.lid = resolveValue(a, v);
         } else if (comptime std.mem.eql(u8, name, "text")) {
-            e.text = optStr(v);
+            e.text = valueFor(a, v);
         } else {
             list.append(a, attrOf(a, name, v)) catch @panic("OOM");
         }
@@ -178,30 +245,145 @@ pub fn diff(a: std.mem.Allocator, nodes: []const Node, dom: *Dom, log: *PatchLog
 
 // ── internals ───────────────────────────────────────────────────
 
-fn optStr(v: anytype) ?[]const u8 {
-    switch (@typeInfo(@TypeOf(v))) {
-        .optional => return if (v) |s| optStr(s) else null,
+/// Normalize any view-layer operand to its rendered string (null = the
+/// binding is absent). The single resolution point used by `el` and by
+/// writeNode/diffNode/seedNode:
+///   - null / null optional           → null
+///   - `Bound` / `Value`              → deferred thunk resolution
+///   - `*T` exposing `.get()`         → resolve `v.get()` recursively
+///   - bool                           → presence: "" when set, null when not
+///   - int                            → "{d}" into `a`
+///   - []const u8 / string literal    → verbatim
+fn resolveValue(a: std.mem.Allocator, v: anytype) ?[]const u8 {
+    const T = @TypeOf(v);
+    if (T == Bound) return v.call(a, v.ctx);
+    if (T == Value) return switch (v) {
+        .str => |s| s,
+        .bound => |b| b.call(a, b.ctx),
+    };
+    switch (@typeInfo(T)) {
+        .null => return null,
+        .optional => return if (v) |inner| resolveValue(a, inner) else null,
+        .bool => return if (v) "" else null,
+        .int, .comptime_int => return std.fmt.allocPrint(a, "{d}", .{v}) catch @panic("OOM"),
+        .pointer => {
+            if (comptime isGetPtr(T)) return resolveValue(a, v.get());
+            return v;
+        },
+        else => @compileError("unsupported view value type: " ++ @typeName(T)),
+    }
+}
+
+/// Whether `T` is a `*Child` where `Child` declares `.get` — the
+/// duck-typed store contract (zefx `Store`, test fakes, anything
+/// compatible). `@hasDecl` only accepts container types, hence the gate.
+fn isGetPtr(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => |p| p.size == .one and switch (@typeInfo(p.child)) {
+            .@"struct", .@"union", .@"enum", .@"opaque" => @hasDecl(p.child, "get"),
+            else => false,
+        },
+        else => false,
+    };
+}
+
+/// Wrap an attr/`.text` operand for deferred resolution: `Bound` passes
+/// through, `*T.get()` pointers become lazy `Bound` thunks, and plain
+/// values render eagerly into `a` like before. Null operands → null.
+fn valueFor(a: std.mem.Allocator, v: anytype) ?Value {
+    const T = @TypeOf(v);
+    if (T == Bound) return .{ .bound = v };
+    if (T == Value) return v;
+    switch (@typeInfo(T)) {
+        .null => return null,
+        .optional => return if (v) |inner| valueFor(a, inner) else null,
+        .pointer => {
+            if (comptime isGetPtr(T)) return .{ .bound = bindGet(v) };
+            return .{ .str = v };
+        },
         else => {
-            const s: []const u8 = v;
-            return s;
+            const s = resolveValue(a, v) orelse return null;
+            return .{ .str = s };
         },
     }
 }
 
-fn attrOf(a: std.mem.Allocator, comptime name: [:0]const u8, v: anytype) Attr {
-    switch (@typeInfo(@TypeOf(v))) {
-        .bool => return .{ .name = name, .value = if (v) "" else null, .presence = true },
-        .optional => return if (v) |inner| attrOf(a, name, inner) else .{ .name = name, .value = null },
-        .int, .comptime_int => return .{
-            .name = name,
-            .value = std.fmt.allocPrint(a, "{d}", .{v}) catch @panic("OOM"),
-        },
-        .pointer => {
-            const s: []const u8 = v;
-            return .{ .name = name, .value = s };
-        },
-        else => @compileError("unsupported attr value type: " ++ @typeName(@TypeOf(v))),
+/// Wrap a `*T.get()` store pointer as a `Bound` — the get() call is
+/// deferred so writeNode/diffNode/seedNode always see the live value.
+fn bindGet(store: anytype) Bound {
+    const S = @TypeOf(store);
+    const gen = struct {
+        fn call(a: std.mem.Allocator, ctx: *const anyopaque) ?[]const u8 {
+            const s: *const std.meta.Child(S) = @ptrCast(@alignCast(ctx));
+            return resolveValue(a, s.get());
+        }
+    };
+    return .{
+        .ctx = store,
+        .call = &gen.call,
+        .presence = comptime getReturnsBool(S),
+    };
+}
+
+fn assertGettable(comptime S: type) void {
+    if (!isGetPtr(S)) {
+        @compileError("expected a pointer to a type exposing .get(), found " ++ @typeName(S));
     }
+}
+
+fn unwrapOpt(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .optional => |o| unwrapOpt(o.child),
+        else => T,
+    };
+}
+
+/// Whether `*T`'s `.get()` returns a bool — those bindings are presence
+/// attributes (`checked`-style), not `key="value"` pairs.
+fn getReturnsBool(comptime S: type) bool {
+    if (!isGetPtr(S)) return false;
+    const r = switch (@typeInfo(@TypeOf(std.meta.Child(S).get))) {
+        .@"fn" => |f| f.return_type orelse return false,
+        else => return false,
+    };
+    return unwrapOpt(r) == bool;
+}
+
+/// Whether `f` (a fn or fn pointer) returns a bool — for `computed`.
+fn fnReturnsBool(comptime F: type) bool {
+    const r = switch (@typeInfo(F)) {
+        .@"fn" => |f| f.return_type orelse return false,
+        .pointer => |p| switch (@typeInfo(p.child)) {
+            .@"fn" => |f| f.return_type orelse return false,
+            else => return false,
+        },
+        else => return false,
+    };
+    return unwrapOpt(r) == bool;
+}
+
+/// Whether a plain (non-Bound) operand resolves to a presence attribute.
+fn presenceOf(comptime T: type) bool {
+    const U = unwrapOpt(T);
+    return switch (@typeInfo(U)) {
+        .bool => true,
+        .pointer => getReturnsBool(U),
+        else => false,
+    };
+}
+
+fn attrOf(a: std.mem.Allocator, name: []const u8, v: anytype) Attr {
+    const T = @TypeOf(v);
+    switch (@typeInfo(T)) {
+        .optional => return if (v) |inner| attrOf(a, name, inner) else .{ .name = name },
+        else => {},
+    }
+    if (T == Bound) return .{ .name = name, .value = .{ .bound = v }, .presence = v.presence };
+    return .{
+        .name = name,
+        .value = valueFor(a, v),
+        .presence = comptime presenceOf(T),
+    };
 }
 
 fn oneNode(a: std.mem.Allocator, n: Node) []const Node {
@@ -264,6 +446,7 @@ fn writeNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, writer: 
     switch (node) {
         .text => |s| try escapeHtmlInto(writer, s),
         .raw => |s| try writer.writeAll(s),
+        .fragment => |kids| for (kids) |k| try writeNode(a, k, parent_path, writer),
         .element => |e| {
             const id = resolvedId(a, e, parent_path);
             try writer.writeByte('<');
@@ -274,7 +457,7 @@ fn writeNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, writer: 
                 try writer.writeByte('"');
             }
             for (e.attrs) |at| {
-                const v = at.value orelse continue;
+                const v = resolveValue(a, at.value) orelse continue;
                 try writer.writeByte(' ');
                 try writer.writeAll(at.name);
                 if (!at.presence) {
@@ -285,8 +468,8 @@ fn writeNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, writer: 
             }
             try writer.writeByte('>');
             if (e.tag.isVoid()) return;
-            if (e.text) |t| {
-                try escapeHtmlInto(writer, t);
+            if (e.text) |tv| {
+                if (resolveValue(a, tv)) |t| try escapeHtmlInto(writer, t);
             } else {
                 const kids: []const Node = switch (e.children) {
                     .nodes, .keyed => |k| k,
@@ -304,11 +487,14 @@ fn writeNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, writer: 
 fn diffNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, dom: *Dom, log: *PatchLog) void {
     switch (node) {
         .text, .raw => {},
+        .fragment => |kids| for (kids) |k| diffNode(a, k, parent_path, dom, log),
         .element => |e| {
             const id = resolvedId(a, e, parent_path);
             if (id) |nid| {
-                for (e.attrs) |at| dom.setAttr(log, nid, at.name, at.value);
-                if (e.text) |t| dom.setText(log, nid, t);
+                for (e.attrs) |at| dom.setAttr(log, nid, at.name, resolveValue(a, at.value));
+                if (e.text) |tv| {
+                    if (resolveValue(a, tv)) |t| dom.setText(log, nid, t);
+                }
             }
             const path = id orelse parent_path;
             if (e.text != null) return; // .text owns the element's content
@@ -365,11 +551,14 @@ fn diffKeyed(a: std.mem.Allocator, parent_id: []const u8, kids: []const Node, do
 fn seedNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, dom: *Dom) void {
     switch (node) {
         .text, .raw => {},
+        .fragment => |kids| for (kids) |k| seedNode(a, k, parent_path, dom),
         .element => |e| {
             const id = resolvedId(a, e, parent_path);
             if (id) |nid| {
-                for (e.attrs) |at| dom.seedAttr(nid, at.name, at.value);
-                if (e.text) |t| dom.seedText(nid, t);
+                for (e.attrs) |at| dom.seedAttr(nid, at.name, resolveValue(a, at.value));
+                if (e.text) |tv| {
+                    if (resolveValue(a, tv)) |t| dom.seedText(nid, t);
+                }
             }
             const path = id orelse parent_path;
             if (e.text != null) return;
@@ -512,6 +701,133 @@ test "view SSR writes bound .text and int attrs" {
     );
     const inp = el(a, .input, .{ .maxlength = @as(u16, 500) }, .{});
     try std.testing.expectEqualStrings("<input maxlength=\"500\">", renderStr(a, &.{inp}));
+}
+
+/// Duck-typed fake store: forest bindings only require a `*T.get()`,
+/// never a concrete type (zefx stays out of this module).
+fn FakeStore(comptime T: type) type {
+    return struct {
+        v: T,
+        pub fn get(self: *const @This()) T {
+            return self.v;
+        }
+    };
+}
+
+test "store pointers bind in .text and attrs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var n = FakeStore(usize){ .v = 3 };
+    var flag = FakeStore(bool){ .v = true };
+
+    const v = el(a, .span, .{ .id = "c", .text = &n }, .{});
+    try std.testing.expectEqualStrings("<span id=\"c\">3</span>", renderStr(a, &.{v}));
+
+    const d = el(a, .div, .{ .id = "d", .@"data-n" = &n, .hidden = &flag }, .{});
+    try std.testing.expectEqualStrings(
+        "<div id=\"d\" data-n=\"3\" hidden></div>",
+        renderStr(a, &.{d}),
+    );
+
+    // Live binding: mutating between renders resolves the new value.
+    n.v = 7;
+    flag.v = false;
+    try std.testing.expectEqualStrings("<span id=\"c\">7</span>", renderStr(a, &.{v}));
+    try std.testing.expectEqualStrings(
+        "<div id=\"d\" data-n=\"7\"></div>",
+        renderStr(a, &.{d}),
+    );
+}
+
+test "computed maps a store through a fn lazily" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var remaining = FakeStore(usize){ .v = 2 };
+    const fmt = struct {
+        fn count(alloc: std.mem.Allocator, rem: usize) []const u8 {
+            return std.fmt.allocPrint(alloc, "{d} item{s} left", .{ rem, if (rem == 1) "" else "s" }) catch @panic("OOM");
+        }
+    }.count;
+
+    const v = el(a, .span, .{ .id = "count", .text = computed(&remaining, fmt) }, .{});
+    try std.testing.expectEqualStrings(
+        "<span id=\"count\">2 items left</span>",
+        renderStr(a, &.{v}),
+    );
+    remaining.v = 1; // resolved at render time, not at el() time
+    try std.testing.expectEqualStrings(
+        "<span id=\"count\">1 item left</span>",
+        renderStr(a, &.{v}),
+    );
+}
+
+test "eachOf maps items through ctx render and filters nulls" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Ctx = struct {
+        skip: u8,
+        fn row(alloc: std.mem.Allocator, c: *const @This(), n: u8) ?Node {
+            if (n == c.skip) return null;
+            return el(alloc, .li, .{
+                .id = std.fmt.allocPrint(alloc, "r-{d}", .{n}) catch @panic("OOM"),
+            }, "x");
+        }
+    };
+    const ctx = Ctx{ .skip = 2 };
+    const items = [3]u8{ 1, 2, 3 };
+
+    const kids = eachOf(a, &items, &ctx, Ctx.row);
+    try std.testing.expect(kids == .keyed);
+    try std.testing.expectEqual(@as(usize, 2), kids.keyed.len);
+
+    const v = el(a, .ul, .{ .id = "list" }, kids);
+    try std.testing.expectEqualStrings(
+        "<ul id=\"list\"><li id=\"r-1\">x</li><li id=\"r-3\">x</li></ul>",
+        renderStr(a, &.{v}),
+    );
+}
+
+test "bool presence attr diffs on a bound non-keyed node" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var dom = Dom.init(std.testing.allocator);
+    defer dom.deinit();
+    var log = PatchLog.init(std.testing.allocator);
+    defer log.deinit();
+
+    diff(a, &.{el(a, .div, .{ .id = "flt", .class = "filters", .hidden = false }, .{})}, &dom, &log);
+    log.clear();
+
+    diff(a, &.{el(a, .div, .{ .id = "flt", .class = "filters", .hidden = true }, .{})}, &dom, &log);
+    try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
+    try expectAttr(log.patches.items[0], "flt", "hidden", "");
+    log.clear();
+
+    diff(a, &.{el(a, .div, .{ .id = "flt", .class = "filters", .hidden = false }, .{})}, &dom, &log);
+    try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
+    try expectAttr(log.patches.items[0], "flt", "hidden", null);
+}
+
+test "fragment renders siblings without a wrapper" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const v = fragment(a, .{
+        el(a, .h1, .{}, "title"),
+        el(a, .form, .{ .id = "add-form" }, .{}),
+    });
+    try std.testing.expectEqualStrings(
+        "<h1>title</h1><form id=\"add-form\"></form>",
+        renderStr(a, &.{v}),
+    );
 }
 
 fn expectAttr(p: patch_mod.Patch, id: []const u8, name: []const u8, value: ?[]const u8) !void {

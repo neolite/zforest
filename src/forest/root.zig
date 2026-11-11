@@ -13,12 +13,17 @@ pub const Row = dom.Row;
 pub const Node = view.Node;
 pub const Element = view.Element;
 pub const Attr = view.Attr;
+pub const Value = view.Value;
+pub const Bound = view.Bound;
 pub const Children = view.Children;
 pub const Tag = view.Tag;
 pub const el = view.el;
 pub const text = view.text;
 pub const raw = view.raw;
 pub const each = view.each;
+pub const eachOf = view.eachOf;
+pub const fragment = view.fragment;
+pub const computed = view.computed;
 pub const writeHtml = view.writeHtml;
 pub const diff = view.diff;
 

@@ -246,9 +246,70 @@ pub const Session = struct {
     }
 };
 
-fn countText(a: std.mem.Allocator, s: *Session) []const u8 {
-    const rem = s.remaining.get();
+fn countText(a: std.mem.Allocator, rem: usize) []const u8 {
     return std.fmt.allocPrint(a, "{d} item{s} left", .{ rem, if (rem == 1) "" else "s" }) catch @panic("OOM");
+}
+
+// ── view components ─────────────────────────────────────────────
+// A component is a plain fn returning a forest.Node. `buildView`
+// composes them; `forest.fragment` groups several roots into one Node
+// without emitting wrapper markup.
+
+/// Static chrome: the title and the add form — no bound state.
+fn headerView(a: std.mem.Allocator) forest.Node {
+    return forest.fragment(a, .{
+        forest.el(a, .h1, .{}, .{
+            forest.text("zforest "),
+            forest.el(a, .span, .{}, "todos"),
+        }),
+        forest.el(a, .form, .{
+            .id = "add-form",
+            .autocomplete = "off",
+        }, .{
+            forest.el(a, .input, .{
+                .id = "new-title",
+                .name = "title",
+                .placeholder = "What needs to be done?",
+                .maxlength = max_title_len,
+                .autofocus = true,
+            }, .{}),
+            forest.el(a, .button, .{ .type = "submit" }, "Add"),
+        }),
+    });
+}
+
+/// The filter button row: bound `flt-*` / `data-active` state, hidden
+/// along with the footer when the list is empty (real TodoMVC chrome).
+fn filtersView(a: std.mem.Allocator, s: *Session) forest.Node {
+    var btns: std.ArrayListUnmanaged(forest.Node) = .empty;
+    inline for (.{ Filter.all, Filter.active, Filter.completed }) |f| {
+        btns.append(a, forest.el(a, .button, .{
+            .id = comptime "flt-" ++ f.name(),
+            .@"data-filter" = f.name(),
+            .@"data-active" = if (s.filter == f) "1" else null,
+        }, f.name())) catch @panic("OOM");
+    }
+    return forest.el(a, .div, .{
+        .id = "flt",
+        .class = "filters",
+        .hidden = s.todos.items.len == 0,
+    }, btns.toOwnedSlice(a) catch @panic("OOM"));
+}
+
+/// The keyed todo list — `eachOf` renders every todo through rowOrNull.
+fn listView(a: std.mem.Allocator, s: *Session) forest.Node {
+    return forest.el(a, .ul, .{ .id = "list" }, forest.eachOf(a, s.todos.items, s, rowOrNull));
+}
+
+/// The footer: hidden on an empty list, `count` bound via `computed` —
+/// `countText` is the mapping fn over the `remaining` store.
+fn footerView(a: std.mem.Allocator, s: *Session) forest.Node {
+    return forest.el(a, .footer, .{
+        .id = "foot",
+        .hidden = s.todos.items.len == 0,
+    }, .{
+        forest.el(a, .span, .{ .id = "count", .text = forest.computed(s.remaining, countText) }, .{}),
+    });
 }
 
 fn buildRow(a: std.mem.Allocator, t: Todo) forest.Node {
@@ -271,6 +332,13 @@ fn buildRow(a: std.mem.Allocator, t: Todo) forest.Node {
     });
 }
 
+/// `eachOf` render fn: the active filter hides rows by returning null;
+/// every survivor is an element carrying `.id`.
+fn rowOrNull(a: std.mem.Allocator, s: *Session, t: Todo) ?forest.Node {
+    if (!s.visible(t)) return null;
+    return buildRow(a, t);
+}
+
 fn buildRows(a: std.mem.Allocator, s: *Session) []const forest.Node {
     var rows: std.ArrayListUnmanaged(forest.Node) = .empty;
     for (s.todos.items) |t| {
@@ -284,38 +352,12 @@ fn buildRows(a: std.mem.Allocator, s: *Session) []const forest.Node {
 /// buttons (`flt-*` / `data-active`), the keyed todo list, and the bound
 /// `count` text.
 fn buildView(a: std.mem.Allocator, s: *Session) []const forest.Node {
-    var nodes: std.ArrayListUnmanaged(forest.Node) = .empty;
-    nodes.append(a, forest.el(a, .h1, .{}, .{
-        forest.text("zforest "),
-        forest.el(a, .span, .{}, "todos"),
-    })) catch @panic("OOM");
-    nodes.append(a, forest.el(a, .form, .{
-        .id = "add-form",
-        .autocomplete = "off",
-    }, .{
-        forest.el(a, .input, .{
-            .id = "new-title",
-            .name = "title",
-            .placeholder = "What needs to be done?",
-            .maxlength = max_title_len,
-            .autofocus = true,
-        }, .{}),
-        forest.el(a, .button, .{ .type = "submit" }, "Add"),
-    })) catch @panic("OOM");
-    var btns: std.ArrayListUnmanaged(forest.Node) = .empty;
-    inline for (.{ Filter.all, Filter.active, Filter.completed }) |f| {
-        btns.append(a, forest.el(a, .button, .{
-            .id = comptime "flt-" ++ f.name(),
-            .@"data-filter" = f.name(),
-            .@"data-active" = if (s.filter == f) "1" else null,
-        }, f.name())) catch @panic("OOM");
-    }
-    nodes.append(a, forest.el(a, .div, .{ .class = "filters" }, btns.toOwnedSlice(a) catch @panic("OOM"))) catch @panic("OOM");
-    nodes.append(a, forest.el(a, .ul, .{ .id = "list" }, forest.each(buildRows(a, s)))) catch @panic("OOM");
-    nodes.append(a, forest.el(a, .footer, .{}, .{
-        forest.el(a, .span, .{ .id = "count", .text = countText(a, s) }, .{}),
-    })) catch @panic("OOM");
-    return nodes.toOwnedSlice(a) catch @panic("OOM");
+    const nodes = a.alloc(forest.Node, 4) catch @panic("OOM");
+    nodes[0] = headerView(a);
+    nodes[1] = filtersView(a, s);
+    nodes[2] = listView(a, s);
+    nodes[3] = footerView(a, s);
+    return nodes;
 }
 
 /// Wired session constructor (separate so `wire` can reference self).
