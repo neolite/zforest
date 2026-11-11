@@ -17,6 +17,33 @@
     type: true,
   };
 
+  // Comment anchors for "when" ops: id -> {start, end} Comment nodes.
+  // Marker comments are never removed while their anchor is live, so a
+  // hit is cached forever; entries whose markers were replaced (branch
+  // markup can carry nested anchors) are re-found via isConnected.
+  var whenAnchors = {};
+
+  function whenRange(id) {
+    var r = whenAnchors[id];
+    if (r && r.start.isConnected && r.end.isConnected) return r;
+    var start = null;
+    var want = "z-when:" + id;
+    var wantEnd = "/z-when:" + id;
+    var w = document.createTreeWalker(document.body, NodeFilter.SHOW_COMMENT);
+    for (var n = w.nextNode(); n; n = w.nextNode()) {
+      var v = (n.nodeValue || "").trim();
+      if (!start) {
+        if (v === want) start = n;
+      } else if (v === wantEnd) {
+        whenAnchors[id] = { start: start, end: n };
+        return whenAnchors[id];
+      }
+    }
+    // Don't cache a miss — the anchor may be mounted by a later op.
+    delete whenAnchors[id];
+    return null;
+  }
+
   function applyPatch(p) {
     var el;
     switch (p.op) {
@@ -49,6 +76,21 @@
         el = document.getElementById(p.id);
         if (el) el.innerHTML = p.html; // trusted server-generated, data escaped
         break;
+      case "when": {
+        // Idempotent "set content strictly between the z-when markers".
+        var range = whenRange(p.id);
+        if (!range) break;
+        var node = range.start.nextSibling;
+        while (node && node !== range.end) {
+          var next = node.nextSibling;
+          node.parentNode.removeChild(node);
+          node = next;
+        }
+        var wtpl = document.createElement("template");
+        wtpl.innerHTML = p.html; // trusted server-generated, data escaped
+        range.end.before(wtpl.content);
+        break;
+      }
       case "attr":
         el = document.getElementById(p.id);
         if (!el || !ATTR_WHITELIST[p.name]) return;

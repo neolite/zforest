@@ -297,8 +297,16 @@ fn headerView(a: std.mem.Allocator) forest.Node {
     });
 }
 
-/// The filter button row: bound `flt-*` / `data-active` state, hidden
-/// along with the footer when the list is empty (real TodoMVC chrome).
+/// The empty-state note: mounted via the `w-empty` anchor only while the
+/// list has no todos at all — real mount/unmount instead of `hidden`.
+fn emptyView(a: std.mem.Allocator, s: *Session) forest.Node {
+    return forest.when(a, .{ .id = "w-empty" }, s.todos.items.len == 0,
+        forest.el(a, .p, .{ .id = "empty-msg" }, "Nothing yet"));
+}
+
+/// The filter button row: mounted via the `w-flt` anchor while the list
+/// is non-empty. The div itself is static branch markup; the `flt-*`
+/// buttons keep absolute ids so `data-active` still diffs in place.
 fn filtersView(a: std.mem.Allocator, s: *Session) forest.Node {
     var btns: std.ArrayListUnmanaged(forest.Node) = .empty;
     inline for (.{ Filter.all, Filter.active, Filter.completed }) |f| {
@@ -309,11 +317,8 @@ fn filtersView(a: std.mem.Allocator, s: *Session) forest.Node {
             .arg = f.name(),
         }, f.name())) catch @panic("OOM");
     }
-    return forest.el(a, .div, .{
-        .id = "flt",
-        .class = "filters",
-        .hidden = s.todos.items.len == 0,
-    }, btns.toOwnedSlice(a) catch @panic("OOM"));
+    return forest.when(a, .{ .id = "w-flt" }, s.todos.items.len != 0,
+        forest.el(a, .div, .{ .class = "filters" }, btns.toOwnedSlice(a) catch @panic("OOM")));
 }
 
 /// The keyed todo list — `eachOf` renders every todo through rowOrNull.
@@ -321,15 +326,14 @@ fn listView(a: std.mem.Allocator, s: *Session) forest.Node {
     return forest.el(a, .ul, .{ .id = "list" }, forest.eachOf(a, s.todos.items, s, rowOrNull));
 }
 
-/// The footer: hidden on an empty list, `count` bound via `computed` —
-/// `countText` is the mapping fn over the `remaining` store.
+/// The footer: mounted via the `w-foot` anchor while the list is
+/// non-empty. `count` keeps its absolute id inside the branch and stays
+/// bound via `computed` — `countText` maps the `remaining` store.
 fn footerView(a: std.mem.Allocator, s: *Session) forest.Node {
-    return forest.el(a, .footer, .{
-        .id = "foot",
-        .hidden = s.todos.items.len == 0,
-    }, .{
-        forest.el(a, .span, .{ .id = "count", .text = forest.computed(s.remaining, countText) }, .{}),
-    });
+    return forest.when(a, .{ .id = "w-foot" }, s.todos.items.len != 0,
+        forest.el(a, .footer, .{}, .{
+            forest.el(a, .span, .{ .id = "count", .text = forest.computed(s.remaining, countText) }, .{}),
+        }));
 }
 
 fn buildRow(a: std.mem.Allocator, t: Todo) forest.Node {
@@ -361,15 +365,17 @@ fn rowOrNull(a: std.mem.Allocator, s: *Session, t: Todo) ?forest.Node {
     return buildRow(a, t);
 }
 
-/// The `<main>` inner content: static chrome (h1, form), bound filter
-/// buttons (`flt-*` / `data-active`), the keyed todo list, and the bound
-/// `count` text.
+/// The `<main>` inner content: static chrome (h1, form), the `w-empty` /
+/// `w-flt` / `w-foot` conditional anchors around the empty-state note,
+/// filter buttons (`flt-*` / `data-active`), and bound `count`, plus the
+/// permanently mounted keyed todo list.
 fn buildView(a: std.mem.Allocator, s: *Session) []const forest.Node {
-    const nodes = a.alloc(forest.Node, 4) catch @panic("OOM");
+    const nodes = a.alloc(forest.Node, 5) catch @panic("OOM");
     nodes[0] = headerView(a);
-    nodes[1] = filtersView(a, s);
-    nodes[2] = listView(a, s);
-    nodes[3] = footerView(a, s);
+    nodes[1] = emptyView(a, s);
+    nodes[2] = filtersView(a, s);
+    nodes[3] = listView(a, s);
+    nodes[4] = footerView(a, s);
     return nodes;
 }
 
@@ -522,4 +528,56 @@ test "action validation rejects bad input" {
 
     // nothing leaked into the model
     try std.testing.expectEqual(@as(usize, 0), s.todos.items.len);
+}
+
+test "chrome mounts and unmounts through when anchors" {
+    const alloc = std.testing.allocator;
+    const s = createSession(alloc);
+    defer s.deinit();
+
+    // SSR: all three anchor pairs present; only the empty note is mounted.
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    try s.writeView(&aw.writer);
+    const page = aw.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, page, "<!--z-when:w-empty--><p id=\"empty-msg\">Nothing yet</p><!--/z-when:w-empty-->") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<!--z-when:w-flt--><!--/z-when:w-flt-->") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<!--z-when:w-foot--><!--/z-when:w-foot-->") != null);
+    s.seedDom();
+
+    // First todo: the chrome branches swap in and the note out — one
+    // when op per anchor plus the row create.
+    var f1 = titleFields(alloc, "one");
+    defer f1.deinit(alloc);
+    try s.dispatch("add", null, null, &f1);
+    const j1 = patchJson(s, alloc);
+    defer alloc.free(j1);
+    try std.testing.expect(std.mem.indexOf(u8, j1, "\"op\":\"when\",\"id\":\"w-empty\",\"html\":\"\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, j1, "\"op\":\"when\",\"id\":\"w-flt\",\"html\":\"\\u003cdiv class=\\\"filters\\\"\\u003e") != null);
+    try std.testing.expect(std.mem.indexOf(u8, j1, "\"op\":\"when\",\"id\":\"w-foot\",\"html\":\"\\u003cfooter\\u003e") != null);
+    try std.testing.expect(std.mem.indexOf(u8, j1, "id=\\\"count\\\"") != null);
+
+    // Seeded: a second add doesn't touch the anchors at all.
+    var f2 = titleFields(alloc, "two");
+    defer f2.deinit(alloc);
+    try s.dispatch("add", null, null, &f2);
+    const j2 = patchJson(s, alloc);
+    defer alloc.free(j2);
+    try std.testing.expect(std.mem.indexOf(u8, j2, "\"op\":\"when\"") == null);
+
+    // Back to zero: note remounts, chrome unmounts, row leaves. The
+    // final delete's batch carries the three when ops.
+    var idbuf: [16]u8 = undefined;
+    var last: ?[]u8 = null;
+    while (s.todos.items.len > 0) {
+        const arg = std.fmt.bufPrint(&idbuf, "{d}", .{s.todos.items[0].id}) catch unreachable;
+        try s.dispatch("delete", arg, null, null);
+        if (last) |l| alloc.free(l);
+        last = patchJson(s, alloc);
+    }
+    const j3 = last.?;
+    defer alloc.free(j3);
+    try std.testing.expect(std.mem.indexOf(u8, j3, "\"op\":\"when\",\"id\":\"w-empty\",\"html\":\"\\u003cp id=\\\"empty-msg\\\"\\u003e") != null);
+    try std.testing.expect(std.mem.indexOf(u8, j3, "\"op\":\"when\",\"id\":\"w-flt\",\"html\":\"\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, j3, "\"op\":\"when\",\"id\":\"w-foot\",\"html\":\"\"") != null);
 }

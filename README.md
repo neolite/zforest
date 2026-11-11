@@ -2,7 +2,7 @@
 
 Server-driven Todo UI in Zig: the `zefx` reactive graph core plus `forest`, a
 fine-grained DOM patch layer, served by a minimal `std.http` server with a
-~150-line vanilla JS patch client. No database, no framework, no build step.
+~300-line vanilla JS patch client. No database, no framework, no build step.
 
 ## Run
 
@@ -36,7 +36,8 @@ zig build test   # engine, forest, and session tests
    event; reducers mutate the model in the **pure
    phase**, a settle loop propagates derived stores (`seq` → `remaining`),
    and an after-flush hook rebuilds the declarative view tree
-   (`src/forest/view.zig`: `el`/`text`/`eachOf`/`computed` nodes, with
+   (`src/forest/view.zig`: `el`/`text`/`eachOf`/`computed`/`variant`/`when`
+   nodes, with
    store-pointer bindings resolved lazily) and diffs it against
    the tracked DOM into a `PatchLog`. The same tree also renders the SSR
    page and the snapshot `ops` — one description, all outputs.
@@ -44,12 +45,20 @@ zig build test   # engine, forest, and session tests
    model mutex the batch is serialized once, published into the session's
    bounded history (64 batches / 2 MiB, oldest evicted), and every SSE
    subscriber of that session receives its own copy.
-5. The client applies ops (`create`/`remove`/`move`/`text`/`attr`/`html`)
+5. The client applies ops (`create`/`remove`/`move`/`text`/`attr`/`html`/`when`)
    with `<template>` parsing + `insertBefore` for creates (trusted
    server-generated HTML with escaped data), `textContent` for text,
-   `innerHTML` for `html` state dumps, and an
-   attribute whitelist for `attr` ops. Patch batches with `rev <= lastRev`
+   `innerHTML` for `html` state dumps, comment-marker ranges for `when`,
+   and an attribute whitelist for `attr` ops. Patch batches with `rev <= lastRev`
    are ignored; a `snapshot` event resets state wholesale.
+
+   Conditional subtrees use `variant`/`when` anchors: SSR always emits a
+   `<!--z-when:ID-->` + `<!--/z-when:ID-->` comment pair (comments don't
+   affect CSS selectors or sibling counts), and `Dom` tracks the mounted
+   branch key per anchor. A branch-key change emits one idempotent `when`
+   op carrying the new branch markup; same-branch edits recurse as normal
+   attr/text ops. `.lid` anchors compose inside keyed rows (`row-N/sw`)
+   and are purged with the row by `removeTracked`.
 
 ## Scope notes (deliberate)
 

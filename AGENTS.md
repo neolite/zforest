@@ -7,8 +7,8 @@
 - `src/zefx/root.zig`: public API surface exported as module `zefx`.
 - `src/zefx/engine.zig`, `event.zig`, `store.zig`, `sample.zig`, `shape.zig`, `effect.zig`: reactive graph primitives and operators.
 - `src/forest/patch.zig`: HTML escaping + `Patch`/`PatchLog` (owned strings, JSON batch; `writeOpJson` serializes one op).
-- `src/forest/dom.zig`: server-side DOM state tracking, text/attr bindings, keyed list diff.
-- `src/forest/view.zig`: declarative view tree (`el`/`text`/`raw`/`eachOf`/`fragment`/`computed`) — one tree drives SSR (`writeHtml`), the DOM-patch `diff`, and the full-state snapshot (`writeSnapshotOps`). Attrs and `.text` accept duck-typed `*T.get()` store pointers and `computed` wrappers resolved lazily; `.on`/`.arg` emit `data-on-<event>`/`data-arg` DOM-event attrs.
+- `src/forest/dom.zig`: server-side DOM state tracking, text/attr bindings, keyed list diff, `when_states` branch keys for `z-when` anchors.
+- `src/forest/view.zig`: declarative view tree (`el`/`text`/`raw`/`eachOf`/`fragment`/`computed`/`variant`/`when`) — one tree drives SSR (`writeHtml`), the DOM-patch `diff`, and the full-state snapshot (`writeSnapshotOps`). Attrs and `.text` accept duck-typed `*T.get()` store pointers and `computed` wrappers resolved lazily; `.on`/`.arg` emit `data-on-<event>`/`data-arg` DOM-event attrs; `variant`/`when` mount/unmount subtrees between `<!--z-when:ID-->` comment pairs via idempotent `when` ops.
 - `src/todo_app.zig`: per-browser-session Todo model wired through the zefx graph; `Session.dispatch` is the whitelisted action entry (`{action, arg?, value?, fields?}`).
 - `src/server/http.zig`: loopback HTTP server (cookie sessions, POST /action → ACK, GET /events → SSE stream).
 - `src/server/history.zig`: bounded per-session ring of serialized patch batches for SSE subscribers.

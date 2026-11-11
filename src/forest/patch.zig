@@ -64,6 +64,11 @@ pub const Patch = union(enum) {
     /// Replace an element's innerHTML — the full-state snapshot op
     /// (client uses innerHTML on trusted server-generated markup).
     html: struct { id: []const u8, html: []const u8 },
+    /// Replace everything strictly between the `<!--z-when:ID-->` /
+    /// `<!--/z-when:ID-->` comment anchors — the conditional-subtree op,
+    /// idempotent like `html`. `html` is trusted server-generated markup;
+    /// "" mounts the empty branch.
+    when: struct { id: []const u8, html: []const u8 },
 };
 
 /// Ordered patch batch for one revision. Strings are duplicated into an
@@ -145,6 +150,12 @@ pub const PatchLog = struct {
         self.push(.{ .html = .{ .id = self.dupe(id), .html = self.dupe(html) } });
     }
 
+    /// Queue a between-anchors replacement for a `z-when` comment pair —
+    /// emitted by diff on a branch-key change and by snapshot state dumps.
+    pub fn setWhen(self: *PatchLog, id: []const u8, html: []const u8) void {
+        self.push(.{ .when = .{ .id = self.dupe(id), .html = self.dupe(html) } });
+    }
+
     /// Serialize as `{"rev":N,"patches":[...]}`.
     pub fn writeJson(self: *const PatchLog, writer: anytype) !void {
         try writer.writeAll("{\"rev\":");
@@ -218,6 +229,13 @@ pub fn writeOpJson(writer: anytype, p: Patch) !void {
             try writeJsonStringInto(writer, h.html);
             try writer.writeByte('}');
         },
+        .when => |w| {
+            try writer.writeAll("{\"op\":\"when\",\"id\":");
+            try writeJsonStringInto(writer, w.id);
+            try writer.writeAll(",\"html\":");
+            try writeJsonStringInto(writer, w.html);
+            try writer.writeByte('}');
+        },
     }
 }
 
@@ -238,6 +256,8 @@ test "patch log serializes owned strings to JSON" {
     log.setAttr("flt-all", "hidden", null);
     log.move("list", "row-3", "row-7");
     log.remove("row-9");
+    log.setWhen("w-flt", "<div class=\"filters\">on</div>");
+    log.setWhen("w-empty", "");
     log.revision = 4;
 
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
@@ -247,7 +267,7 @@ test "patch log serializes owned strings to JSON" {
     defer std.testing.allocator.free(got);
 
     try std.testing.expectEqualStrings(
-        \\{"rev":4,"patches":[{"op":"create","parent":"list","id":"row-\u003c7\u003e","before":null,"html":"\u003cli\u003esafe \u0026amp; sound\u003c/li\u003e"},{"op":"text","id":"count","text":"2 left"},{"op":"attr","id":"flt-all","name":"data-active","value":"1"},{"op":"attr","id":"flt-all","name":"hidden","value":null},{"op":"move","parent":"list","id":"row-3","before":"row-7"},{"op":"remove","id":"row-9"}]}
+        \\{"rev":4,"patches":[{"op":"create","parent":"list","id":"row-\u003c7\u003e","before":null,"html":"\u003cli\u003esafe \u0026amp; sound\u003c/li\u003e"},{"op":"text","id":"count","text":"2 left"},{"op":"attr","id":"flt-all","name":"data-active","value":"1"},{"op":"attr","id":"flt-all","name":"hidden","value":null},{"op":"move","parent":"list","id":"row-3","before":"row-7"},{"op":"remove","id":"row-9"},{"op":"when","id":"w-flt","html":"\u003cdiv class=\"filters\"\u003eon\u003c/div\u003e"},{"op":"when","id":"w-empty","html":""}]}
     , got);
 }
 

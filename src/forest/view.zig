@@ -119,6 +119,24 @@ pub const Element = struct {
     children: Children = .{ .nodes = &.{} },
 };
 
+/// A conditional subtree pinned between `<!--z-when:ID-->` /
+/// `<!--/z-when:ID-->` comment anchors — the markers are always emitted,
+/// so a branch mounts/unmounts at a fixed DOM position without wrapper
+/// markup. `key` names the active branch (resolved via `resolveValue` —
+/// bound values ok); `null` is the empty branch. `nodes` is the
+/// caller-picked markup for the current branch, rendered only while
+/// `key` is non-null.
+pub const Variant = struct {
+    /// Bound anchor id, resolved like `Element.id` — becomes the marker
+    /// text (`z-when:ID`), so `--` is not allowed in it.
+    id: ?[]const u8 = null,
+    /// Local id composed against the nearest bound ancestor's id —
+    /// `lid` inside `row-3` anchors `row-3/sw`.
+    lid: ?[]const u8 = null,
+    key: ?Value = null,
+    nodes: []const Node = &.{},
+};
+
 /// One node of a view tree. Strings are borrowed — keep them alive until
 /// `writeHtml`/`diff` return (a per-render arena covers this naturally).
 pub const Node = union(enum) {
@@ -130,6 +148,9 @@ pub const Node = union(enum) {
     /// A transparent sibling group — emits no markup of its own, so a
     /// component fn can return one Node covering several roots.
     fragment: []const Node,
+    /// A conditional subtree between `z-when` comment anchors — see
+    /// `variant`/`when`.
+    variant: Variant,
 };
 
 /// Text child node — HTML-escaped on output.
@@ -156,6 +177,46 @@ pub fn fragment(a: std.mem.Allocator, kids: anytype) Node {
     return .{ .fragment = switch (normChildren(a, kids)) {
         .nodes, .keyed => |s| s,
     } };
+}
+
+/// A conditional subtree at a fixed DOM position. `idspec` is an
+/// anonymous struct — `.id`/`.lid` resolved like element bindings —
+/// naming the `<!--z-when:ID-->` / `<!--/z-when:ID-->` anchor pair.
+/// `key` identifies the active branch (any `resolveValue` operand:
+/// strings, ints, optionals, `*T.get()` stores, `computed` bindings);
+/// `null` mounts the empty branch. `children` is the current branch's
+/// markup — the same shapes as `el` children except a bare keyed list
+/// (wrap `each`/`eachOf` in a bound parent element instead: a comment
+/// anchor can't be a create/move parent) — rendered only while `key` is
+/// non-null. SSR always emits both comments; on a branch-key change the
+/// diff ships one idempotent `when` op with the new branch markup.
+pub fn variant(a: std.mem.Allocator, idspec: anytype, key: anytype, children: anytype) Node {
+    var v: Variant = .{ .key = valueFor(a, key) };
+    const sinfo = @typeInfo(@TypeOf(idspec)).@"struct";
+    inline for (sinfo.field_names) |name| {
+        const f = @field(idspec, name);
+        if (comptime std.mem.eql(u8, name, "id")) {
+            v.id = resolveValue(a, f);
+        } else if (comptime std.mem.eql(u8, name, "lid")) {
+            v.lid = resolveValue(a, f);
+        } else {
+            @compileError("variant idspec fields must be .id/.lid, found ." ++ name);
+        }
+    }
+    v.nodes = switch (normChildren(a, children)) {
+        .nodes => |s| s,
+        .keyed => @panic("variant children can't be a bare keyed list; wrap each/eachOf in a bound parent element"),
+    };
+    return .{ .variant = v };
+}
+
+/// `variant` sugar for a boolean condition: mounts `children` while
+/// `cond` is truthy (bool, non-zero int, non-empty string, present
+/// optional, or a `*T.get()`/`computed` of one of those). The branch key
+/// is "on"/null.
+pub fn when(a: std.mem.Allocator, idspec: anytype, cond: anytype, children: anytype) Node {
+    const key: ?[]const u8 = if (truthy(a, cond)) "on" else null;
+    return variant(a, idspec, key, children);
 }
 
 /// Bind `store` (any `*T` exposing `.get()`) through the mapping fn `f` —
@@ -262,8 +323,10 @@ pub fn diff(a: std.mem.Allocator, nodes: []const Node, dom: *Dom, log: *PatchLog
 /// Serialize `nodes` as a full-state ops array — the SSE snapshot
 /// payload. Keyed parents emit `{"op":"html","id":pid,"html":<children>}`
 /// (an idempotent innerHTML state dump whose markup fully covers the
-/// subtree); bound nodes emit one attr op per attr plus a text op for
-/// `.text`. Op order is irrelevant: this is a state dump, not a diff.
+/// subtree); `variant`/`when` anchors emit `{"op":"when","id":aid,"html":
+/// <branch>}` covering everything between their comment markers; bound
+/// nodes emit one attr op per attr plus a text op for `.text`. Op order
+/// is irrelevant: this is a state dump, not a diff.
 /// `a` is scratch space for resolved ids and row markup.
 pub fn writeSnapshotOps(a: std.mem.Allocator, nodes: []const Node, writer: anytype) !void {
     var ops: std.ArrayListUnmanaged(patch_mod.Patch) = .empty;
@@ -472,11 +535,55 @@ fn normChildren(a: std.mem.Allocator, c: anytype) Children {
 
 /// The DOM id a node answers to: `.id` verbatim, or `.lid` composed
 /// against the nearest bound ancestor's id (`parent/lid`).
-fn resolvedId(a: std.mem.Allocator, e: Element, parent_path: []const u8) ?[]const u8 {
-    if (e.id) |v| return v;
-    const l = e.lid orelse return null;
+fn resolvedId(a: std.mem.Allocator, id: ?[]const u8, lid: ?[]const u8, parent_path: []const u8) ?[]const u8 {
+    if (id) |v| return v;
+    const l = lid orelse return null;
     if (parent_path.len == 0) return a.dupe(u8, l) catch @panic("OOM");
     return std.fmt.allocPrint(a, "{s}/{s}", .{ parent_path, l }) catch @panic("OOM");
+}
+
+/// The id a `z-when` comment pair answers to — `resolvedId` over the
+/// variant's `.id`/`.lid`. An anchor is required and `--` would corrupt
+/// the marker text (ids are dev-controlled, so assert).
+fn anchorId(a: std.mem.Allocator, v: Variant, parent_path: []const u8) []const u8 {
+    const anchor = resolvedId(a, v.id, v.lid, parent_path) orelse
+        @panic("variant requires a bound anchor (.id/.lid)");
+    std.debug.assert(std.mem.indexOf(u8, anchor, "--") == null);
+    return anchor;
+}
+
+/// `when` condition truthiness, mirroring `resolveValue`'s operand set:
+/// bool → itself; optional → null is false, else the inner recurses;
+/// `*T.get()` → deref and recurse; int → non-zero; string → non-empty;
+/// `Bound`/`Value` → resolved, then presence-bound non-null or
+/// non-empty is true.
+fn truthy(a: std.mem.Allocator, v: anytype) bool {
+    const T = @TypeOf(v);
+    if (T == Bound) return truthyBound(a, v);
+    if (T == Value) return switch (v) {
+        .str => |s| s.len != 0,
+        .bound => |b| truthyBound(a, b),
+    };
+    switch (@typeInfo(T)) {
+        .null => return false,
+        .optional => return if (v) |inner| truthy(a, inner) else false,
+        .bool => return v,
+        .int, .comptime_int => return v != 0,
+        .pointer => |p| {
+            if (comptime isGetPtr(T)) return truthy(a, v.get());
+            if (p.child == u8 and p.size == .slice) return v.len != 0;
+            if (p.size == .one and @typeInfo(p.child) == .array and
+                @typeInfo(p.child).array.child == u8) return v.len != 0;
+            @compileError("unsupported when() cond type: " ++ @typeName(T));
+        },
+        else => @compileError("unsupported when() cond type: " ++ @typeName(T)),
+    }
+}
+
+fn truthyBound(a: std.mem.Allocator, b: Bound) bool {
+    const s = b.call(a, b.ctx) orelse return false;
+    // Presence bindings render "" for true; plain ones a real string.
+    return if (b.presence) true else s.len != 0;
 }
 
 fn keyedChildId(k: Node) []const u8 {
@@ -492,8 +599,21 @@ fn writeNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, writer: 
         .text => |s| try escapeHtmlInto(writer, s),
         .raw => |s| try writer.writeAll(s),
         .fragment => |kids| for (kids) |k| try writeNode(a, k, parent_path, writer),
+        .variant => |v| {
+            // Both markers always — branch markup lives strictly between.
+            const anchor = anchorId(a, v, parent_path);
+            try writer.writeAll("<!--z-when:");
+            try writer.writeAll(anchor);
+            try writer.writeAll("-->");
+            if (resolveValue(a, v.key) != null) {
+                for (v.nodes) |k| try writeNode(a, k, anchor, writer);
+            }
+            try writer.writeAll("<!--/z-when:");
+            try writer.writeAll(anchor);
+            try writer.writeAll("-->");
+        },
         .element => |e| {
-            const id = resolvedId(a, e, parent_path);
+            const id = resolvedId(a, e.id, e.lid, parent_path);
             try writer.writeByte('<');
             try writer.writeAll(@tagName(e.tag));
             if (id) |v| {
@@ -533,8 +653,33 @@ fn diffNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, dom: *Dom
     switch (node) {
         .text, .raw => {},
         .fragment => |kids| for (kids) |k| diffNode(a, k, parent_path, dom, log),
+        .variant => |v| {
+            const anchor = anchorId(a, v, parent_path);
+            const key = resolveValue(a, v.key);
+            if (!dom.setWhen(anchor, key)) {
+                // Same branch: recurse normally; an empty branch mounts nothing.
+                if (key != null) for (v.nodes) |k| diffNode(a, k, anchor, dom, log);
+                return;
+            }
+            // Branch changed (appear/disappear/swap): one idempotent
+            // when-op ships the new branch markup; stale `anchor/…` state
+            // is dropped and the shipped branch seeded so the next diff
+            // emits only real changes. (Absolute .id nodes inside the
+            // branch aren't anchor-prefixed — re-seeded on every remount,
+            // bounded and harmless.)
+            var aw: std.Io.Writer.Allocating = .init(a);
+            defer aw.deinit();
+            if (key != null) {
+                for (v.nodes) |k| writeNode(a, k, anchor, &aw.writer) catch @panic("OOM");
+            }
+            log.setWhen(anchor, aw.toOwnedSlice() catch @panic("OOM"));
+            dom.removeTracked(anchor);
+            // removeTracked drops the anchor's own when_state too — re-seed.
+            dom.seedWhen(anchor, key);
+            if (key != null) for (v.nodes) |k| seedNode(a, k, anchor, dom);
+        },
         .element => |e| {
-            const id = resolvedId(a, e, parent_path);
+            const id = resolvedId(a, e.id, e.lid, parent_path);
             if (id) |nid| {
                 for (e.attrs) |at| dom.setAttr(log, nid, at.name, resolveValue(a, at.value));
                 if (e.text) |tv| {
@@ -598,8 +743,23 @@ fn snapshotOps(a: std.mem.Allocator, node: Node, parent_path: []const u8, ops: *
     switch (node) {
         .text, .raw => {},
         .fragment => |kids| for (kids) |k| try snapshotOps(a, k, parent_path, ops),
+        .variant => |v| {
+            // One full-state when-op per anchor; the branch markup covers
+            // everything between the markers — no inner ops (same rule as
+            // a keyed `html` op covering its rows).
+            const anchor = anchorId(a, v, parent_path);
+            var aw: std.Io.Writer.Allocating = .init(a);
+            defer aw.deinit();
+            if (resolveValue(a, v.key) != null) {
+                for (v.nodes) |k| writeNode(a, k, anchor, &aw.writer) catch @panic("OOM");
+            }
+            ops.append(a, .{ .when = .{
+                .id = anchor,
+                .html = aw.toOwnedSlice() catch @panic("OOM"),
+            } }) catch @panic("OOM");
+        },
         .element => |e| {
-            const id = resolvedId(a, e, parent_path);
+            const id = resolvedId(a, e.id, e.lid, parent_path);
             if (id) |nid| {
                 for (e.attrs) |at| {
                     ops.append(a, .{ .attr = .{
@@ -636,8 +796,14 @@ fn seedNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, dom: *Dom
     switch (node) {
         .text, .raw => {},
         .fragment => |kids| for (kids) |k| seedNode(a, k, parent_path, dom),
+        .variant => |v| {
+            const anchor = anchorId(a, v, parent_path);
+            const key = resolveValue(a, v.key);
+            dom.seedWhen(anchor, key);
+            if (key != null) for (v.nodes) |k| seedNode(a, k, anchor, dom);
+        },
         .element => |e| {
-            const id = resolvedId(a, e, parent_path);
+            const id = resolvedId(a, e.id, e.lid, parent_path);
             if (id) |nid| {
                 for (e.attrs) |at| dom.seedAttr(nid, at.name, resolveValue(a, at.value));
                 if (e.text) |tv| {
@@ -1167,4 +1333,264 @@ test "created row seeds bindings so toggle emits only real diffs" {
     try expectAttr(log.patches.items[0], "row-7", "class", "todo done");
     try expectAttr(log.patches.items[1], "row-7/cb", "checked", "");
     try expectText(log.patches.items[2], "count", "0 items left");
+}
+
+// ─────────────────────────────────────────────
+// variant/when tests
+// ─────────────────────────────────────────────
+
+test "variant SSR anchors the branch between comment markers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const on = variant(a, .{ .id = "w-x" }, "a", el(a, .p, .{ .class = "note" }, "hi"));
+    try std.testing.expectEqualStrings(
+        "<!--z-when:w-x--><p class=\"note\">hi</p><!--/z-when:w-x-->",
+        renderStr(a, &.{on}),
+    );
+
+    // null key = empty branch: both comments and nothing between.
+    const off = variant(a, .{ .id = "w-x" }, null, el(a, .p, .{}, "hi"));
+    try std.testing.expectEqualStrings(
+        "<!--z-when:w-x--><!--/z-when:w-x-->",
+        renderStr(a, &.{off}),
+    );
+
+    // when() sugar: truthy mounts the branch, falsy mounts nothing.
+    const w_on = when(a, .{ .id = "w-e" }, true, el(a, .p, .{}, "shown"));
+    try std.testing.expectEqualStrings(
+        "<!--z-when:w-e--><p>shown</p><!--/z-when:w-e-->",
+        renderStr(a, &.{w_on}),
+    );
+    const w_off = when(a, .{ .id = "w-e" }, false, el(a, .p, .{}, "shown"));
+    try std.testing.expectEqualStrings(
+        "<!--z-when:w-e--><!--/z-when:w-e-->",
+        renderStr(a, &.{w_off}),
+    );
+}
+
+test "variant lid composes anchor ids inside a row" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const row = el(a, .li, .{ .id = "row-3" }, .{
+        variant(a, .{ .lid = "sw" }, "on", el(a, .span, .{ .lid = "tag" }, "x")),
+    });
+    try std.testing.expectEqualStrings(
+        "<li id=\"row-3\"><!--z-when:row-3/sw--><span id=\"row-3/sw/tag\">x</span><!--/z-when:row-3/sw--></li>",
+        renderStr(a, &.{row}),
+    );
+}
+
+test "variant bound keys resolve lazily" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var branch = FakeStore(?[]const u8){ .v = "a" };
+    const v = variant(a, .{ .id = "w-b" }, &branch, el(a, .p, .{}, "on"));
+    try std.testing.expectEqualStrings(
+        "<!--z-when:w-b--><p>on</p><!--/z-when:w-b-->",
+        renderStr(a, &.{v}),
+    );
+    // Same node, mutated store: the key resolves at render time.
+    branch.v = null;
+    try std.testing.expectEqualStrings(
+        "<!--z-when:w-b--><!--/z-when:w-b-->",
+        renderStr(a, &.{v}),
+    );
+}
+
+test "variant appear emits one when op and seeds branch bindings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var dom = Dom.init(std.testing.allocator);
+    defer dom.deinit();
+    var log = PatchLog.init(std.testing.allocator);
+    defer log.deinit();
+
+    // Seed the absent-branch state (first sight records the key).
+    diff(a, &.{variant(a, .{ .id = "w-f" }, null, el(a, .div, .{ .id = "in" }, "hi"))}, &dom, &log);
+    log.clear();
+
+    // Branch appears: a single when-op carries the branch markup.
+    diff(a, &.{variant(a, .{ .id = "w-f" }, "on", el(a, .div, .{ .id = "in", .@"data-x" = "1" }, "hi"))}, &dom, &log);
+    try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
+    const w = log.patches.items[0].when;
+    try std.testing.expectEqualStrings("w-f", w.id);
+    try std.testing.expectEqualStrings("<div id=\"in\" data-x=\"1\">hi</div>", w.html);
+    log.clear();
+
+    // The shipped branch was seeded: only the real attr change emits.
+    diff(a, &.{variant(a, .{ .id = "w-f" }, "on", el(a, .div, .{ .id = "in", .@"data-x" = "2" }, "hi"))}, &dom, &log);
+    try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
+    try expectAttr(log.patches.items[0], "in", "data-x", "2");
+}
+
+test "variant disappear and swap ship replacement html" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var dom = Dom.init(std.testing.allocator);
+    defer dom.deinit();
+    var log = PatchLog.init(std.testing.allocator);
+    defer log.deinit();
+
+    diff(a, &.{variant(a, .{ .id = "w-v" }, "a", el(a, .div, .{ .id = "va" }, "A"))}, &dom, &log);
+    log.clear();
+
+    // Branch swap A -> B: one when-op, new markup, stale state dropped.
+    diff(a, &.{variant(a, .{ .id = "w-v" }, "b", el(a, .span, .{ .id = "vb" }, "B"))}, &dom, &log);
+    try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
+    try std.testing.expectEqualStrings("w-v", log.patches.items[0].when.id);
+    try std.testing.expectEqualStrings("<span id=\"vb\">B</span>", log.patches.items[0].when.html);
+    log.clear();
+
+    // Disappear: the empty branch is a when-op with "".
+    diff(a, &.{variant(a, .{ .id = "w-v" }, null, el(a, .span, .{ .id = "vb" }, "B"))}, &dom, &log);
+    try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
+    try std.testing.expectEqualStrings("", log.patches.items[0].when.html);
+    log.clear();
+
+    // Stable empty branch: nothing to emit.
+    diff(a, &.{variant(a, .{ .id = "w-v" }, null, el(a, .span, .{ .id = "vb" }, "B"))}, &dom, &log);
+    try std.testing.expectEqual(@as(usize, 0), log.patches.items.len);
+}
+
+test "variant same branch recurses inner bindings without a when op" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var dom = Dom.init(std.testing.allocator);
+    defer dom.deinit();
+    var log = PatchLog.init(std.testing.allocator);
+    defer log.deinit();
+
+    const mk = struct {
+        fn view(alloc: std.mem.Allocator, active: bool) Node {
+            return variant(alloc, .{ .id = "w-s" }, "on", el(alloc, .button, .{
+                .id = "b1",
+                .@"data-active" = if (active) "1" else null,
+            }, "x"));
+        }
+    }.view;
+
+    diff(a, &.{mk(a, true)}, &dom, &log);
+    log.clear();
+
+    diff(a, &.{mk(a, false)}, &dom, &log);
+    try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
+    try expectAttr(log.patches.items[0], "b1", "data-active", null);
+}
+
+test "nested variants diff the inner anchor" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var dom = Dom.init(std.testing.allocator);
+    defer dom.deinit();
+    var log = PatchLog.init(std.testing.allocator);
+    defer log.deinit();
+
+    const mk = struct {
+        fn view(alloc: std.mem.Allocator, key: ?[]const u8, label: []const u8) Node {
+            return variant(alloc, .{ .id = "w-o" }, "on", variant(alloc, .{ .id = "w-i" }, key, el(alloc, .em, .{}, label)));
+        }
+    }.view;
+
+    // Mount: one when-op for the outer anchor; its html nests the inner markers.
+    diff(a, &.{mk(a, "a", "A")}, &dom, &log);
+    try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
+    const outer = log.patches.items[0].when;
+    try std.testing.expectEqualStrings("w-o", outer.id);
+    try std.testing.expectEqualStrings(
+        "<!--z-when:w-i--><em>A</em><!--/z-when:w-i-->",
+        outer.html,
+    );
+    log.clear();
+
+    // Outer stable, inner key flips: the recursion reaches the inner anchor.
+    diff(a, &.{mk(a, "b", "B")}, &dom, &log);
+    try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
+    const inner = log.patches.items[0].when;
+    try std.testing.expectEqualStrings("w-i", inner.id);
+    try std.testing.expectEqualStrings("<em>B</em>", inner.html);
+    log.clear();
+
+    // Outer unmounts: single op; inner state is dropped and re-seeded.
+    diff(a, &.{variant(a, .{ .id = "w-o" }, null, variant(a, .{ .id = "w-i" }, "b", el(a, .em, .{}, "B")))}, &dom, &log);
+    try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
+    try std.testing.expectEqualStrings("w-o", log.patches.items[0].when.id);
+    try std.testing.expectEqualStrings("", log.patches.items[0].when.html);
+}
+
+test "variant inside a keyed row seeds on create and purges on removal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var dom = Dom.init(std.testing.allocator);
+    defer dom.deinit();
+    var log = PatchLog.init(std.testing.allocator);
+    defer log.deinit();
+
+    const mk = struct {
+        fn view(alloc: std.mem.Allocator, key: ?[]const u8) Node {
+            // Rows must outlive the call — each() borrows the slice.
+            const rows = alloc.alloc(Node, 1) catch @panic("OOM");
+            rows[0] = el(alloc, .li, .{ .id = "row-1" }, .{
+                variant(alloc, .{ .lid = "sw" }, key, el(alloc, .span, .{ .lid = "tag", .class = "t" }, "x")),
+            });
+            return el(alloc, .ul, .{ .id = "list" }, each(rows));
+        }
+    }.view;
+
+    // Row create ships the anchored branch markup inside the row html…
+    diff(a, &.{mk(a, "on")}, &dom, &log);
+    try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
+    try std.testing.expect(log.patches.items[0] == .create);
+    try std.testing.expect(std.mem.indexOf(u8, log.patches.items[0].create.html, "<!--z-when:row-1/sw-->") != null);
+    // …and seeds the anchor state, so an in-place key flip diffs minimal.
+    try std.testing.expect(dom.when_states.get("row-1/sw") != null);
+    try std.testing.expect(dom.attrs.get("row-1/sw/tag\x00class") != null);
+    log.clear();
+
+    diff(a, &.{mk(a, "off")}, &dom, &log);
+    try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
+    const w = log.patches.items[0].when;
+    try std.testing.expectEqualStrings("row-1/sw", w.id);
+    log.clear();
+
+    // Removing the row purges the lid-composed anchor state.
+    diff(a, &.{el(a, .ul, .{ .id = "list" }, each(&.{}))}, &dom, &log);
+    try std.testing.expect(dom.when_states.get("row-1/sw") == null);
+    try std.testing.expect(dom.attrs.get("row-1/sw/tag\x00class") == null);
+}
+
+test "snapshot ops cover variant branches without inner ops" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const view = fragment(a, .{
+        variant(a, .{ .id = "w-s" }, "on", el(a, .div, .{
+            .id = "in",
+            .@"data-x" = "1",
+            .text = "body",
+        }, .{})),
+        variant(a, .{ .id = "w-off" }, null, el(a, .div, .{ .id = "gone" }, "x")),
+    });
+
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try writeSnapshotOps(a, &.{view}, &aw.writer);
+    const json = aw.writer.buffered();
+
+    // One when op per anchor; mounted branch html covers its contents.
+    try std.testing.expect(std.mem.indexOf(u8, json, "{\"op\":\"when\",\"id\":\"w-s\",\"html\":\"\\u003cdiv id=\\\"in\\\" data-x=\\\"1\\\"\\u003ebody\\u003c/div\\u003e\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "{\"op\":\"when\",\"id\":\"w-off\",\"html\":\"\"}") != null);
+    // Covered subtrees emit no inner ops.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"id\":\"in\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"id\":\"gone\"") == null);
 }

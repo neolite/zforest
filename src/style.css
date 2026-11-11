@@ -82,6 +82,7 @@ button:hover { border-color: var(--accent); }
 }
 .todo .del:hover { color: #c0392b; }
 footer { margin-top: .9rem; color: var(--muted); font-size: .85rem; }
+#empty-msg { color: var(--muted); font-size: .9rem; margin: 0 0 .75rem; }
 #error {
   background: #fbeaea;
   color: #8c2f2f;

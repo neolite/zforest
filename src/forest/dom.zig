@@ -16,6 +16,8 @@ pub const Dom = struct {
     attrs: std.StringHashMapUnmanaged(?[]u8) = .empty,
     /// parent id -> last known child order
     orders: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]u8)) = .empty,
+    /// `z-when` anchor id -> last mounted branch key (null value = empty branch)
+    when_states: std.StringHashMapUnmanaged(?[]u8) = .empty,
 
     pub fn init(gpa: std.mem.Allocator) Dom {
         return .{ .gpa = gpa };
@@ -41,6 +43,12 @@ pub const Dom = struct {
             self.gpa.free(e.key_ptr.*);
         }
         self.orders.deinit(self.gpa);
+        var wi = self.when_states.iterator();
+        while (wi.next()) |e| {
+            self.gpa.free(e.key_ptr.*);
+            if (e.value_ptr.*) |v| self.gpa.free(v);
+        }
+        self.when_states.deinit(self.gpa);
     }
 
     /// Emit a text patch only when the tracked value differs.
@@ -123,6 +131,37 @@ pub const Dom = struct {
         self.setAttr(log, id, "checked", if (checked) "" else null);
     }
 
+    /// Compare `key` (the active branch of the `z-when` anchor `id`) against
+    /// tracked state and store it; returns true when the branch changed —
+    /// the caller then emits a `when` op carrying the new branch markup.
+    /// `key == null` is the empty branch.
+    pub fn setWhen(self: *Dom, id: []const u8, key: ?[]const u8) bool {
+        const new_key = self.gpa.dupe(u8, id) catch @panic("OOM");
+        const gop = self.when_states.getOrPut(self.gpa, new_key) catch @panic("OOM");
+        if (gop.found_existing) {
+            self.gpa.free(new_key);
+            const old = gop.value_ptr.*;
+            const same = (old == null and key == null) or
+                (old != null and key != null and std.mem.eql(u8, old.?, key.?));
+            if (same) return false;
+            if (old) |v| self.gpa.free(v);
+        }
+        gop.value_ptr.* = if (key) |k| self.gpa.dupe(u8, k) catch @panic("OOM") else null;
+        return true;
+    }
+
+    /// Record an anchor's branch key without comparing — for seeding state
+    /// that matches markup already shipped (SSR, create patch, when-op html).
+    pub fn seedWhen(self: *Dom, id: []const u8, key: ?[]const u8) void {
+        const new_key = self.gpa.dupe(u8, id) catch @panic("OOM");
+        const gop = self.when_states.getOrPut(self.gpa, new_key) catch @panic("OOM");
+        if (gop.found_existing) {
+            self.gpa.free(new_key);
+            if (gop.value_ptr.*) |v| self.gpa.free(v);
+        }
+        gop.value_ptr.* = if (key) |k| self.gpa.dupe(u8, k) catch @panic("OOM") else null;
+    }
+
     /// Drop tracked state for `id` and any child bindings ("<id>/...").
     pub fn removeTracked(self: *Dom, id: []const u8) void {
         var prefix_buf: [128]u8 = undefined;
@@ -153,6 +192,20 @@ pub const Dom = struct {
         }
         for (adel.items) |k| {
             const kv = self.attrs.fetchRemove(k).?;
+            self.gpa.free(kv.key);
+            if (kv.value) |v| self.gpa.free(v);
+        }
+
+        var wdel: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer wdel.deinit(self.gpa);
+        var wi = self.when_states.iterator();
+        while (wi.next()) |e| {
+            if (std.mem.eql(u8, e.key_ptr.*, id) or std.mem.startsWith(u8, e.key_ptr.*, prefix)) {
+                wdel.append(self.gpa, e.key_ptr.*) catch @panic("OOM");
+            }
+        }
+        for (wdel.items) |k| {
+            const kv = self.when_states.fetchRemove(k).?;
             self.gpa.free(kv.key);
             if (kv.value) |v| self.gpa.free(v);
         }
@@ -405,4 +458,31 @@ test "removed rows drop tracked bindings" {
     dom.syncKeyedList(&log, "list", &.{}, null);
     try std.testing.expectEqual(@as(usize, 0), dom.texts.count());
     try std.testing.expectEqual(@as(usize, 0), dom.attrs.count());
+}
+
+test "when anchors track branch keys and purge with their row" {
+    var dom = Dom.init(std.testing.allocator);
+    defer dom.deinit();
+
+    // First set records and reports a change; same key is a no-op.
+    try std.testing.expect(dom.setWhen("w-x", "on"));
+    try std.testing.expect(!dom.setWhen("w-x", "on"));
+    // Branch swap and unmount are changes too; null compares equal to null.
+    try std.testing.expect(dom.setWhen("w-x", "other"));
+    try std.testing.expect(dom.setWhen("w-x", null));
+    try std.testing.expect(!dom.setWhen("w-x", null));
+
+    // seedWhen records without diffing.
+    dom.seedWhen("row-1/sw", "on");
+    dom.seedWhen("row-1/deep/nest", "on");
+    dom.seedWhen("w-top", "on");
+    try std.testing.expect(!dom.setWhen("row-1/sw", "on"));
+
+    // Removing the row drops only prefix-matched anchor state.
+    dom.removeTracked("row-1");
+    try std.testing.expect(dom.when_states.get("row-1/sw") == null);
+    try std.testing.expect(dom.when_states.get("row-1/deep/nest") == null);
+    try std.testing.expect(dom.when_states.get("w-top") != null);
+    // Purged anchors report changed again on next diff.
+    try std.testing.expect(dom.setWhen("row-1/sw", "on"));
 }
