@@ -1,14 +1,21 @@
 const std = @import("std");
 const server = @import("server/http.zig");
+const todo = @import("todo_app.zig");
+
+/// Parse the optional `bind-ip` arg: a dotted IPv4 literal, or loopback
+/// for anything unparsable (safe default for a demo server).
+fn bindIp(arg: ?[]const u8) std.Io.net.Ip4Address {
+    const s = arg orelse return .loopback(0);
+    return std.Io.net.Ip4Address.parse(s, 0) catch .loopback(0);
+}
 
 pub fn main(init: std.process.Init) !void {
-    const port: u16 = blk: {
-        const argv = init.minimal.args.vector;
-        if (argv.len < 2) break :blk 8080;
-        break :blk std.fmt.parseInt(u16, std.mem.span(argv[1]), 10) catch 8080;
-    };
+    const argv = init.minimal.args.vector;
+    const port: u16 = if (argv.len < 2) 8080 else std.fmt.parseInt(u16, std.mem.span(argv[1]), 10) catch 8080;
+    var bind = bindIp(if (argv.len < 3) null else std.mem.span(argv[2]));
+    bind.port = port;
 
-    try server.serve(init.gpa, init.io, port);
+    try server.serve(init.gpa, init.io, bind, todo.Session);
 }
 
 test {

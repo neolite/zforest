@@ -1,6 +1,7 @@
 const std = @import("std");
 const zefx = @import("zefx");
 const forest = @import("forest");
+const History = @import("server/history.zig").History;
 
 pub const Filter = enum {
     all,
@@ -40,7 +41,19 @@ pub const ActionError = error{ InvalidAction, InvalidTitle, TodoNotFound, TooMan
 
 /// One browser session: an isolated zefx graph + todo model + DOM patch state.
 /// Server is the single owner — all methods assume serialized access.
+///
+/// Session contract for the generic server (see server/http.zig):
+/// `create`, `deinit`, `csrf_token`/`setCsrf`, `history`, `seq.get()`,
+/// `dispatch`, `writeView`, `buildViewNodes`, `setRoute`, `servePage`,
+/// `syncPull`, `out_cookie`, `page_title`, `page_class`, `cookie_name`.
 pub const Session = struct {
+    /// Page <title> and <main> class rendered by the server's page shell.
+    pub const page_title = "zforest todos";
+    pub const page_class = "app";
+    /// Session cookie name — "zfxb" on the board app to avoid clobbering
+    /// this app's session on the same host.
+    pub const cookie_name = "zfxs";
+
     gpa: std.mem.Allocator,
     app: zefx.App,
     todos: std.ArrayListUnmanaged(Todo) = .empty,
@@ -53,11 +66,20 @@ pub const Session = struct {
 
     dom: forest.Dom,
     log: forest.PatchLog,
+    /// Retained patch batches for SSE replay (see server/history.zig).
+    history: History,
     /// Scratch space for the per-render view tree; reset each render.
     render_arena: std.heap.ArenaAllocator,
     /// Per-session CSRF token rendered into the page and verified on POST.
     /// Owned by the session; set by the server at creation.
     csrf_token: []u8 = &.{},
+    /// Extra `Set-Cookie` header emitted on /action responses ("" = none).
+    /// Set by dispatch when minting the session user; owned by the server.
+    out_cookie: []const u8 = &.{},
+
+    pub fn create(gpa: std.mem.Allocator) *Session {
+        return createSession(gpa);
+    }
 
     pub fn deinit(self: *Session) void {
         if (self.csrf_token.len != 0) self.gpa.free(self.csrf_token);
@@ -65,9 +87,39 @@ pub const Session = struct {
         self.todos.deinit(self.gpa);
         self.dom.deinit();
         self.log.deinit();
+        self.history.deinit();
         self.render_arena.deinit();
         self.app.deinit();
         self.gpa.destroy(self);
+    }
+
+    /// Install the server-minted session token (owned by the session).
+    pub fn setCsrf(self: *Session, token: []u8) void {
+        if (self.csrf_token.len != 0) self.gpa.free(self.csrf_token);
+        self.csrf_token = token;
+    }
+
+    /// Request-route hook: the todo app serves exactly one page.
+    pub fn setRoute(self: *Session, path: []const u8) bool {
+        _ = self;
+        return std.mem.eql(u8, path, "/");
+    }
+
+    /// Full-page render for a navigating client: resolve the route, drop
+    /// tracked DOM state, write the page body, then reseed so subsequent
+    /// diffs emit only real changes.
+    pub fn servePage(self: *Session, path: []const u8, writer: anytype) !bool {
+        if (!self.setRoute(path)) return false;
+        self.dom.reset();
+        try self.writeView(writer);
+        self.seedDom();
+        return true;
+    }
+
+    /// Cross-session model fan-out hook — todo state is per-session, so
+    /// nothing external can change between polls.
+    pub fn syncPull(self: *Session) void {
+        _ = self;
     }
 
     fn bumpSeq(self: *Session) void {
@@ -300,8 +352,7 @@ fn headerView(a: std.mem.Allocator) forest.Node {
 /// The empty-state note: mounted via the `w-empty` anchor only while the
 /// list has no todos at all — real mount/unmount instead of `hidden`.
 fn emptyView(a: std.mem.Allocator, s: *Session) forest.Node {
-    return forest.when(a, .{ .id = "w-empty" }, s.todos.items.len == 0,
-        forest.el(a, .p, .{ .id = "empty-msg" }, "Nothing yet"));
+    return forest.when(a, .{ .id = "w-empty" }, s.todos.items.len == 0, forest.el(a, .p, .{ .id = "empty-msg" }, "Nothing yet"));
 }
 
 /// The filter button row: mounted via the `w-flt` anchor while the list
@@ -317,8 +368,7 @@ fn filtersView(a: std.mem.Allocator, s: *Session) forest.Node {
             .arg = f.name(),
         }, f.name())) catch @panic("OOM");
     }
-    return forest.when(a, .{ .id = "w-flt" }, s.todos.items.len != 0,
-        forest.el(a, .div, .{ .class = "filters" }, btns.toOwnedSlice(a) catch @panic("OOM")));
+    return forest.when(a, .{ .id = "w-flt" }, s.todos.items.len != 0, forest.el(a, .div, .{ .class = "filters" }, btns.toOwnedSlice(a) catch @panic("OOM")));
 }
 
 /// The keyed todo list — `eachOf` renders every todo through rowOrNull.
@@ -330,10 +380,9 @@ fn listView(a: std.mem.Allocator, s: *Session) forest.Node {
 /// non-empty. `count` keeps its absolute id inside the branch and stays
 /// bound via `computed` — `countText` maps the `remaining` store.
 fn footerView(a: std.mem.Allocator, s: *Session) forest.Node {
-    return forest.when(a, .{ .id = "w-foot" }, s.todos.items.len != 0,
-        forest.el(a, .footer, .{}, .{
-            forest.el(a, .span, .{ .id = "count", .text = forest.computed(s.remaining, countText) }, .{}),
-        }));
+    return forest.when(a, .{ .id = "w-foot" }, s.todos.items.len != 0, forest.el(a, .footer, .{}, .{
+        forest.el(a, .span, .{ .id = "count", .text = forest.computed(s.remaining, countText) }, .{}),
+    }));
 }
 
 fn buildRow(a: std.mem.Allocator, t: Todo) forest.Node {
@@ -390,6 +439,7 @@ pub fn createSession(gpa: std.mem.Allocator) *Session {
         .remaining = undefined,
         .dom = forest.Dom.init(gpa),
         .log = forest.PatchLog.init(gpa),
+        .history = History.init(gpa),
         .render_arena = std.heap.ArenaAllocator.init(gpa),
         .filter = .all,
     };

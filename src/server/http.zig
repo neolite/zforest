@@ -1,12 +1,11 @@
 const std = @import("std");
-const todo = @import("../todo_app.zig");
 const stream_mod = @import("stream.zig");
 const History = @import("history.zig").History;
 
 const index_js = @embedFile("../client.js");
 const style_css = @embedFile("../style.css");
 
-const cookie_name = "zfxs";
+const cookie_name = "zfxs"; // default; Session may declare `cookie_name`
 const max_sessions = 32;
 const max_body_len = 4096;
 const max_conns = 128;
@@ -14,85 +13,110 @@ const head_buf_len = 8192;
 const sse_poll_ms = 50;
 const sse_heartbeat_ticks = 200; // 200 * 50ms ≈ 10s
 
-/// A live session plus its retained patch-batch history for SSE replay.
-const Entry = struct {
-    s: *todo.Session,
-    history: History,
-};
-
+/// Session contract for the generic server. A session type provides:
+///
+///   - `pub fn create(gpa: std.mem.Allocator) *Self` — wired constructor.
+///   - `deinit()`, `csrf_token: []u8`, `setCsrf(token: []u8)`.
+///   - `history: History` — retained patch batches for SSE replay.
+///   - `seq: *zefx.Store(u64)` (or anything exposing `.get()`) — revision.
+///   - `dispatch(action, arg, value, fields) !void` — the DOM event
+///     protocol (see Action below); errors map via `statusOf`.
+///   - `writeView(writer)` / `buildViewNodes(a) []const forest.Node`.
+///   - `setRoute(path) bool` — request-path hook: false → 404. Multi-route
+///     apps (board) implement real routing; single-page apps accept "/".
+///   - `servePage(path, writer) !bool` — setRoute + dom.reset + writeView
+///     + seedDom so tracked state matches the shipped page.
+///   - `syncPull()` — called by the SSE worker every poll; sessions whose
+///     model is shared (board) re-render when `model.global_seq` moved.
+///   - `out_cookie: []const u8` — Set-Cookie value for the /action response
+///     ("" = none); used to mint per-user cookies on first POST.
+///   - `page_title` / `page_class` — <title> text and <main> class.
+///   - `cookie_name` — session cookie name (avoid host-wide clobbering).
+///   - Optional `readCookies(cookie_header)` — called before dispatch so
+///     the session can pick up auxiliary cookies (board's `zfxu`).
+///   - Optional `validPath(path) bool` — pure route check run before a
+///     session is created for a GET; false → 404 without minting one.
+///
 /// Session registry. Demo cap: `max_sessions`, oldest session is evicted
 /// (documented teardown policy — no persistence, no timers needed).
 /// All access is serialized by `Server.mutex`.
-pub const SessionStore = struct {
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    by_token: std.StringHashMapUnmanaged(*Entry) = .empty,
-    order: std.ArrayListUnmanaged([]u8) = .empty,
+pub fn SessionStore(comptime Session: type) type {
+    return struct {
+        const Self = @This();
 
-    pub fn init(gpa: std.mem.Allocator, io: std.Io) SessionStore {
-        return .{ .gpa = gpa, .io = io };
-    }
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        by_token: std.StringHashMapUnmanaged(*Session) = .empty,
+        order: std.ArrayListUnmanaged([]u8) = .empty,
 
-    pub fn deinit(self: *SessionStore) void {
-        for (self.order.items) |tok| {
-            const e = self.by_token.get(tok).?;
-            e.s.deinit();
-            e.history.deinit();
-            self.gpa.destroy(e);
-            self.gpa.free(tok);
+        pub fn init(gpa: std.mem.Allocator, io: std.Io) Self {
+            return .{ .gpa = gpa, .io = io };
         }
-        self.order.deinit(self.gpa);
-        self.by_token.deinit(self.gpa);
-    }
 
-    pub fn lookup(self: *SessionStore, token: []const u8) ?*Entry {
-        return self.by_token.get(token);
-    }
-
-    /// Create a session and return its fresh token (owned by the store).
-    pub fn create(self: *SessionStore) []u8 {
-        if (self.order.items.len >= max_sessions) {
-            const oldest = self.order.orderedRemove(0);
-            const e = self.by_token.fetchRemove(oldest).?;
-            e.value.s.deinit();
-            e.value.history.deinit();
-            self.gpa.destroy(e.value);
-            self.gpa.free(oldest);
+        pub fn deinit(self: *Self) void {
+            for (self.order.items) |tok| {
+                const s = self.by_token.get(tok).?;
+                s.deinit();
+                self.gpa.free(tok);
+            }
+            self.order.deinit(self.gpa);
+            self.by_token.deinit(self.gpa);
         }
-        var rand_bytes: [16]u8 = undefined;
-        self.io.random(&rand_bytes);
-        const token = std.fmt.allocPrint(self.gpa, "{x:0>16}", .{std.mem.readInt(u64, rand_bytes[0..8], .little)}) catch @panic("OOM");
-        const e = self.gpa.create(Entry) catch @panic("OOM");
-        e.* = .{ .s = todo.createSession(self.gpa), .history = History.init(self.gpa) };
-        e.s.csrf_token = std.fmt.allocPrint(self.gpa, "{x:0>32}", .{std.mem.readInt(u128, &rand_bytes, .little)}) catch @panic("OOM");
-        self.by_token.put(self.gpa, token, e) catch @panic("OOM");
-        self.order.append(self.gpa, token) catch @panic("OOM");
-        return token;
-    }
-};
+
+        pub fn lookup(self: *Self, token: []const u8) ?*Session {
+            return self.by_token.get(token);
+        }
+
+        /// Create a session and return its fresh token (owned by the store).
+        pub fn create(self: *Self) []u8 {
+            if (self.order.items.len >= max_sessions) {
+                const oldest = self.order.orderedRemove(0);
+                const s = self.by_token.fetchRemove(oldest).?;
+                s.value.deinit();
+                self.gpa.free(oldest);
+            }
+            var rand_bytes: [16]u8 = undefined;
+            self.io.random(&rand_bytes);
+            const token = std.fmt.allocPrint(self.gpa, "{x:0>16}", .{std.mem.readInt(u64, rand_bytes[0..8], .little)}) catch @panic("OOM");
+            const s = Session.create(self.gpa);
+            s.setCsrf(std.fmt.allocPrint(self.gpa, "{x:0>32}", .{std.mem.readInt(u128, &rand_bytes, .little)}) catch @panic("OOM"));
+            self.by_token.put(self.gpa, token, s) catch @panic("OOM");
+            self.order.append(self.gpa, token) catch @panic("OOM");
+            return token;
+        }
+    };
+}
 
 /// Shared server state. `mutex` serializes every access to the session
 /// store, the reactive models, and the patch histories. It is NEVER held
 /// while doing network I/O or sleeping — connection tasks read/write
 /// sockets and poll outside the critical section.
-const Server = struct {
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    store: SessionStore,
-    mutex: std.Io.Mutex = .init,
-    conns: std.atomic.Value(u32) = .init(0),
-};
+pub fn Server(comptime Session: type) type {
+    return struct {
+        const Self = @This();
 
-fn cookieValue(cookie_header: ?[]const u8) ?[]const u8 {
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        store: SessionStore(Session),
+        mutex: std.Io.Mutex = .init,
+        conns: std.atomic.Value(u32) = .init(0),
+    };
+}
+
+fn cookieValue(cookie_header: ?[]const u8, name: []const u8) ?[]const u8 {
     const h = cookie_header orelse return null;
     var it = std.mem.splitScalar(u8, h, ';');
     while (it.next()) |part| {
         const kv = std.mem.trim(u8, part, " \t");
-        if (std.mem.startsWith(u8, kv, cookie_name ++ "=")) {
-            return kv[cookie_name.len + 1 ..];
+        if (kv.len > name.len and kv[name.len] == '=' and std.mem.eql(u8, kv[0..name.len], name)) {
+            return kv[name.len + 1 ..];
         }
     }
     return null;
+}
+
+fn sessionCookieName(comptime Session: type) []const u8 {
+    return if (@hasDecl(Session, "cookie_name")) Session.cookie_name else cookie_name;
 }
 
 /// Cross-origin POST guard: if an Origin header is present its host must
@@ -127,18 +151,24 @@ const Action = struct {
     fields: ?std.json.Value = null,
 };
 
-fn statusOf(err: todo.ActionError) std.http.Status {
+fn statusOf(err: anyerror) std.http.Status {
     return switch (err) {
-        error.TodoNotFound => .not_found,
+        error.TodoNotFound, error.PostNotFound, error.CommentNotFound, error.NotFound => .not_found,
         else => .bad_request,
     };
 }
 
-fn renderIndex(s: *todo.Session, out: anytype) !void {
+fn renderHead(comptime Session: type, s: *Session, out: anytype) !void {
+    const title = if (@hasDecl(Session, "page_title")) Session.page_title else "zforest";
+    const pclass = if (@hasDecl(Session, "page_class")) Session.page_class else "app";
     try out.writeAll(
         \\<!doctype html><html lang="en"><head><meta charset="utf-8">
         \\<meta name="viewport" content="width=device-width,initial-scale=1">
-        \\<title>zforest todos</title><link rel="stylesheet" href="/style.css">
+        \\<title>
+    );
+    try out.writeAll(title);
+    try out.writeAll(
+        \\</title><link rel="stylesheet" href="/style.css">
         \\<meta name="zforest-csrf" content="
     );
     try out.writeAll(s.csrf_token);
@@ -146,16 +176,21 @@ fn renderIndex(s: *todo.Session, out: anytype) !void {
     var rbuf: [24]u8 = undefined;
     try out.writeAll(std.fmt.bufPrint(&rbuf, "{d}", .{s.seq.get()}) catch unreachable);
     try out.writeAll(
-        \\"></head>
-        \\<body><main class="app">
+        "\"></head>\n<body><main class=\"",
     );
-    // Declarative view: h1 + add form + filters + keyed list + count.
-    try s.writeView(out);
+    try out.writeAll(pclass);
+    try out.writeAll(
+        "\">\n",
+    );
+}
+
+fn renderTail(out: anytype) !void {
     try out.writeAll("</main><script src=\"/client.js?v=1\"></script></body></html>");
 }
 
 fn handle(
-    srv: *Server,
+    comptime Session: type,
+    srv: *Server(Session),
     arena: std.mem.Allocator,
     req: *std.http.Server.Request,
     out_body: *std.ArrayListUnmanaged(u8),
@@ -163,6 +198,7 @@ fn handle(
 ) std.http.Status {
     const method = req.head.method;
     const path = requestPath(req.head.target);
+    const cname = sessionCookieName(Session);
 
     var cookie_hdr: ?[]const u8 = null;
     var host_hdr: ?[]const u8 = null;
@@ -182,9 +218,9 @@ fn handle(
         {
             srv.mutex.lockUncancelable(srv.io);
             defer srv.mutex.unlock(srv.io);
-            const pre = if (cookieValue(cookie_hdr)) |tok| srv.store.lookup(tok) else null;
+            const pre = if (cookieValue(cookie_hdr, cname)) |tok| srv.store.lookup(tok) else null;
             const ps = pre orelse return .forbidden;
-            const pre_ok = csrf_hdr != null and std.mem.eql(u8, csrf_hdr.?, ps.s.csrf_token);
+            const pre_ok = csrf_hdr != null and std.mem.eql(u8, csrf_hdr.?, ps.csrf_token);
             if (!pre_ok and !sameOrigin(origin_hdr, host_hdr)) return .forbidden;
         }
 
@@ -201,15 +237,18 @@ fn handle(
         // apply + serialize + publish + clear. No network I/O inside.
         srv.mutex.lockUncancelable(srv.io);
         defer srv.mutex.unlock(srv.io);
-        const entry = if (cookieValue(cookie_hdr)) |tok| srv.store.lookup(tok) else null;
-        const e = entry orelse return .forbidden;
-        const s = e.s;
+        const entry = if (cookieValue(cookie_hdr, cname)) |tok| srv.store.lookup(tok) else null;
+        const s = entry orelse return .forbidden;
         // CSRF: accept when the custom X-Zforest-CSRF header matches the
         // per-session token (browsers can't set custom headers cross-origin
         // without CORS, which we never grant), OR when Origin matches Host.
         // Everything else — cross-origin or no token — is rejected.
         const token_ok = csrf_hdr != null and std.mem.eql(u8, csrf_hdr.?, s.csrf_token);
         if (!token_ok and !sameOrigin(origin_hdr, host_hdr)) return .forbidden;
+
+        // Let the session pick up auxiliary cookies (board's `zfxu`) before
+        // the action runs — identity is established inside dispatch.
+        if (@hasDecl(Session, "readCookies")) s.readCookies(cookie_hdr);
 
         const body_v = parsed.value;
         const fields: ?*const std.json.ObjectMap = if (body_v.fields) |*f| switch (f.*) {
@@ -224,8 +263,14 @@ fn handle(
         defer jaw.deinit();
         s.log.writeJson(&jaw.writer) catch @panic("OOM");
         const rev = s.seq.get();
-        e.history.publish(rev, jaw.toOwnedSlice() catch @panic("OOM"));
+        s.history.publish(rev, jaw.toOwnedSlice() catch @panic("OOM"));
         s.log.clear();
+
+        // Per-action Set-Cookie hook (e.g. minted on first POST) — the
+        // value stays valid in `extra` because the session owns it.
+        if (s.out_cookie.len != 0) {
+            extra.append(arena, .{ .name = "set-cookie", .value = s.out_cookie }) catch @panic("OOM");
+        }
 
         var ack: std.Io.Writer.Allocating = .init(arena);
         ack.writer.print("{{\"rev\":{d}}}", .{rev}) catch @panic("OOM");
@@ -234,31 +279,7 @@ fn handle(
         return .ok;
     }
 
-    // GETs below need the session state; keep the lock span tight —
-    // rendering happens into the per-request arena, not the socket.
-    if (method == .GET and (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/index.html"))) {
-        srv.mutex.lockUncancelable(srv.io);
-        defer srv.mutex.unlock(srv.io);
-        var token: []const u8 = undefined;
-        const entry = if (cookieValue(cookie_hdr)) |tok| srv.store.lookup(tok) else null;
-        const e = entry orelse blk: {
-            token = srv.store.create();
-            break :blk srv.store.lookup(token).?;
-        };
-        if (entry == null) {
-            extra.append(arena, .{
-                .name = "set-cookie",
-                .value = std.fmt.allocPrint(arena, "{s}={s}; HttpOnly; SameSite=Strict; Path=/", .{ cookie_name, token }) catch @panic("OOM"),
-            }) catch @panic("OOM");
-        }
-        e.s.seedDom();
-        extra.append(arena, .{ .name = "content-type", .value = "text/html; charset=utf-8" }) catch @panic("OOM");
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        renderIndex(e.s, &aw.writer) catch @panic("OOM");
-        out_body.appendSlice(arena, aw.writer.buffered()) catch @panic("OOM");
-        return .ok;
-    }
-
+    // Static assets — never session routes.
     if (method == .GET and std.mem.eql(u8, path, "/client.js")) {
         extra.append(arena, .{ .name = "content-type", .value = "text/javascript; charset=utf-8" }) catch @panic("OOM");
         out_body.appendSlice(arena, index_js) catch @panic("OOM");
@@ -267,6 +288,37 @@ fn handle(
     if (method == .GET and std.mem.eql(u8, path, "/style.css")) {
         extra.append(arena, .{ .name = "content-type", .value = "text/css; charset=utf-8" }) catch @panic("OOM");
         out_body.appendSlice(arena, style_css) catch @panic("OOM");
+        return .ok;
+    }
+
+    // Every other GET is a page route resolved by the session type.
+    if (method == .GET) {
+        // "/index.html" is an alias for "/" on every app.
+        const rpath = if (std.mem.eql(u8, path, "/index.html")) "/" else path;
+        // Optional pure route check keeps bogus paths from minting sessions.
+        if (@hasDecl(Session, "validPath") and !Session.validPath(rpath)) return .not_found;
+        srv.mutex.lockUncancelable(srv.io);
+        defer srv.mutex.unlock(srv.io);
+        var token: []const u8 = undefined;
+        const entry = if (cookieValue(cookie_hdr, cname)) |tok| srv.store.lookup(tok) else null;
+        const e = entry orelse blk: {
+            token = srv.store.create();
+            break :blk srv.store.lookup(token).?;
+        };
+        extra.append(arena, .{ .name = "content-type", .value = "text/html; charset=utf-8" }) catch @panic("OOM");
+        // Render into the request arena; servePage decides route validity.
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        renderHead(Session, e, &aw.writer) catch @panic("OOM");
+        const ok = e.servePage(rpath, &aw.writer) catch @panic("OOM");
+        if (!ok) return .not_found;
+        renderTail(&aw.writer) catch @panic("OOM");
+        if (entry == null) {
+            extra.append(arena, .{
+                .name = "set-cookie",
+                .value = std.fmt.allocPrint(arena, "{s}={s}; HttpOnly; SameSite=Strict; Path=/", .{ cname, token }) catch @panic("OOM"),
+            }) catch @panic("OOM");
+        }
+        out_body.appendSlice(arena, aw.writer.buffered()) catch @panic("OOM");
         return .ok;
     }
 
@@ -290,13 +342,13 @@ fn writeChunk(out: *std.Io.Writer, data: []const u8) !void {
 /// Every poll re-acquires the model mutex, copies owned payload out, and
 /// releases the lock before writing to the socket — a session can be
 /// evicted between iterations, so no session pointer is retained.
-fn serveEvents(srv: *Server, req: *std.http.Server.Request) !void {
+fn serveEvents(comptime Session: type, srv: *Server(Session), req: *std.http.Server.Request) !void {
     var cookie_hdr: ?[]const u8 = null;
     var it = req.iterateHeaders();
     while (it.next()) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "cookie")) cookie_hdr = h.value;
     }
-    const token = try srv.gpa.dupe(u8, cookieValue(cookie_hdr) orelse "");
+    const token = try srv.gpa.dupe(u8, cookieValue(cookie_hdr, sessionCookieName(Session)) orelse "");
     defer srv.gpa.free(token);
 
     const out = req.server.out;
@@ -315,22 +367,33 @@ fn serveEvents(srv: *Server, req: *std.http.Server.Request) !void {
         {
             srv.mutex.lockUncancelable(srv.io);
             defer srv.mutex.unlock(srv.io);
-            const entry = srv.store.lookup(token);
-            if (entry) |e| {
+            const s = srv.store.lookup(token);
+            if (s) |sess| {
                 if (!connected) {
                     connected = true;
-                    cursor = e.s.seq.get();
+                    cursor = sess.seq.get();
                     fw.writer.writeAll("event: snapshot\ndata: ") catch @panic("OOM");
-                    stream_mod.writeSnapshotJson(e.s, &fw.writer) catch @panic("OOM");
+                    stream_mod.writeSnapshotJson(sess, &fw.writer) catch @panic("OOM");
                     fw.writer.writeAll("\n\n") catch @panic("OOM");
                 } else {
-                    const f = e.history.fetch(cursor, srv.gpa) catch @panic("OOM");
+                    // Shared-model sessions (board) re-render when the
+                    // global mutation counter moved; publish any produced
+                    // batch (even patch-empty — keeps cursors contiguous).
+                    sess.syncPull();
+                    if (sess.seq.get() > sess.history.latest_rev) {
+                        var jaw: std.Io.Writer.Allocating = .init(srv.gpa);
+                        defer jaw.deinit();
+                        sess.log.writeJson(&jaw.writer) catch @panic("OOM");
+                        sess.history.publish(sess.seq.get(), jaw.toOwnedSlice() catch @panic("OOM"));
+                        sess.log.clear();
+                    }
+                    const f = sess.history.fetch(cursor, srv.gpa) catch @panic("OOM");
                     defer History.freeFetch(srv.gpa, f);
                     switch (f) {
                         .gap => {
-                            cursor = e.s.seq.get();
+                            cursor = sess.seq.get();
                             fw.writer.writeAll("event: snapshot\ndata: ") catch @panic("OOM");
-                            stream_mod.writeSnapshotJson(e.s, &fw.writer) catch @panic("OOM");
+                            stream_mod.writeSnapshotJson(sess, &fw.writer) catch @panic("OOM");
                             fw.writer.writeAll("\n\n") catch @panic("OOM");
                         },
                         .batches => |batches| {
@@ -361,7 +424,7 @@ fn serveEvents(srv: *Server, req: *std.http.Server.Request) !void {
     out.flush() catch {};
 }
 
-fn connTask(srv: *Server, stream: std.Io.net.Stream) void {
+fn connTask(comptime Session: type, srv: *Server(Session), stream: std.Io.net.Stream) void {
     defer _ = srv.conns.fetchSub(1, .acq_rel);
     defer stream.close(srv.io);
 
@@ -379,7 +442,7 @@ fn connTask(srv: *Server, stream: std.Io.net.Stream) void {
 
     const path = requestPath(req.head.target);
     if (req.head.method == .GET and std.mem.eql(u8, path, "/events")) {
-        serveEvents(srv, &req) catch {};
+        serveEvents(Session, srv, &req) catch {};
         return;
     }
 
@@ -389,7 +452,7 @@ fn connTask(srv: *Server, stream: std.Io.net.Stream) void {
     // Session HTML and action responses are per-session — never cache.
     extra.append(arena, .{ .name = "cache-control", .value = "no-store" }) catch @panic("OOM");
 
-    const status = handle(srv, arena, &req, &body, &extra);
+    const status = handle(Session, srv, arena, &req, &body, &extra);
     if (body.items.len == 0 and status != .ok) {
         body.appendSlice(arena, @tagName(status)) catch @panic("OOM");
     }
@@ -405,20 +468,19 @@ fn connTask(srv: *Server, stream: std.Io.net.Stream) void {
 /// simple but not scalable like an event loop). Admissions beyond the cap
 /// are closed before any HTTP headers are read. All session/model state is
 /// serialized by `Server.mutex`, never held across network I/O.
-/// Loopback only.
-pub fn serve(gpa: std.mem.Allocator, io: std.Io, port: u16) !void {
-    var srv: Server = .{
+pub fn serve(gpa: std.mem.Allocator, io: std.Io, bind: std.Io.net.Ip4Address, comptime Session: type) !void {
+    var srv: Server(Session) = .{
         .gpa = gpa,
         .io = io,
-        .store = SessionStore.init(gpa, io),
+        .store = SessionStore(Session).init(gpa, io),
     };
     defer srv.store.deinit();
 
-    var addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+    var addr: std.Io.net.IpAddress = .{ .ip4 = bind };
     var listener = try addr.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
 
-    std.debug.print("zforest todo listening on http://127.0.0.1:{d}\n", .{port});
+    std.debug.print("listening on http://{f}\n", .{bind});
 
     var group: std.Io.Group = .init;
     defer group.cancel(io);
@@ -434,7 +496,14 @@ pub fn serve(gpa: std.mem.Allocator, io: std.Io, port: u16) !void {
             stream.close(io);
             continue;
         }
-        group.concurrent(io, connTask, .{ &srv, stream }) catch {
+        // `connTask` is generic over Session — instantiate it locally so
+        // group.concurrent sees a fully-typed function pointer.
+        const Task = struct {
+            fn run(srvp: *Server(Session), st: std.Io.net.Stream) void {
+                connTask(Session, srvp, st);
+            }
+        };
+        group.concurrent(io, Task.run, .{ &srv, stream }) catch {
             // Never serve inline — a long-lived SSE stream would freeze
             // the accept loop forever. Drop and release the reservation.
             _ = srv.conns.fetchSub(1, .acq_rel);

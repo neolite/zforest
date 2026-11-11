@@ -23,6 +23,15 @@ pub const Dom = struct {
         return .{ .gpa = gpa };
     }
 
+    /// Drop all tracked state (keys/values owned strings freed) and leave
+    /// the Dom empty and usable — for SSR paths that ship a fresh page and
+    /// then reseed, e.g. a navigating client on a multi-route app.
+    pub fn reset(self: *Dom) void {
+        const gpa = self.gpa;
+        self.deinit();
+        self.* = Dom.init(gpa);
+    }
+
     pub fn deinit(self: *Dom) void {
         var ti = self.texts.iterator();
         while (ti.next()) |e| {

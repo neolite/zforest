@@ -8,7 +8,8 @@ const todo = @import("../todo_app.zig");
 /// become `html` ops, bound nodes become attr/text ops. Reads model
 /// state only — never touches the pending patch log, so a snapshot can
 /// never consume an unpublished action's patches.
-pub fn writeSnapshotJson(s: *todo.Session, writer: *std.Io.Writer) !void {
+/// `s` is duck-typed: `seq.get()`, `render_arena`, `buildViewNodes(a)`.
+pub fn writeSnapshotJson(s: anytype, writer: *std.Io.Writer) !void {
     try writer.print("{{\"rev\":{d},\"ops\":", .{s.seq.get()});
     _ = s.render_arena.reset(.retain_capacity);
     const a = s.render_arena.allocator();
