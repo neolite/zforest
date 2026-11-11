@@ -1,8 +1,10 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-`zforest` is a server-driven Todo demo: the `zefx` reactive core plus a
-`forest` fine-grained DOM patch layer and a minimal std.http server.
+`zforest` hosts two server-driven apps on one transport: the `zefx`
+reactive core plus a `forest` fine-grained DOM patch layer and a minimal
+generic `std.http` server. `zforest` is the Todo demo (per-session
+model); `zboard` is an anonymous board (shared SQLite-backed model).
 
 - `src/zefx/root.zig`: public API surface exported as module `zefx`.
 - `src/zefx/engine.zig`, `event.zig`, `store.zig`, `sample.zig`, `shape.zig`, `effect.zig`: reactive graph primitives and operators.
@@ -10,7 +12,11 @@
 - `src/forest/dom.zig`: server-side DOM state tracking, text/attr bindings, keyed list diff, `when_states` branch keys for `z-when` anchors.
 - `src/forest/view.zig`: declarative view tree (`el`/`text`/`raw`/`eachOf`/`fragment`/`computed`/`variant`/`when`) — one tree drives SSR (`writeHtml`), the DOM-patch `diff`, and the full-state snapshot (`writeSnapshotOps`). Attrs and `.text` accept duck-typed `*T.get()` store pointers and `computed` wrappers resolved lazily; `.on`/`.arg` emit `data-on-<event>`/`data-arg` DOM-event attrs; `variant`/`when` mount/unmount subtrees between `<!--z-when:ID-->` comment pairs via idempotent `when` ops.
 - `src/todo_app.zig`: per-browser-session Todo model wired through the zefx graph; `Session.dispatch` is the whitelisted action entry (`{action, arg?, value?, fields?}`).
-- `src/server/http.zig`: loopback HTTP server (cookie sessions, POST /action → ACK, GET /events → SSE stream).
+- `src/board.zig`: shared `BoardModel` — static board whitelist, in-memory posts/comments/users, write-through SQLite, one shared `next_id` (`#N` display ids), and the `global_seq` atomic every session polls for fan-out.
+- `src/db.zig`: typed wrapper over the vendored sqlite3 amalgamation (`vendor/sqlite3`, official 3.54.1; flags `-DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_LOAD_EXTENSION`). Linked only into `zboard` and test binaries — never the `zforest` exe.
+- `src/board_app.zig`: zboard session/view — routes (`/`, `/b/<slug>`, `/t/<post>`, `/t/<post>/c/<comment>`), sidebar nav, post/comment forms, nested keyed comment trees, `w-rep-N` inline reply anchors, `zfxu` anonymous identity cookie, per-session `reply_to`.
+- `src/board_main.zig`: `zboard` executable entry point (`zboard [port] [bind-ip] [db-path]`).
+- `src/server/http.zig`: generic-over-`Session` HTTP/SSE server (cookie sessions, POST /action → ACK, GET /events → SSE stream, `Ip4Address` bind, `setRoute`/`servePage`/`syncPull`/`out_cookie`/`readCookies` hooks, per-action `Set-Cookie`).
 - `src/server/history.zig`: bounded per-session ring of serialized patch batches for SSE subscribers.
 - `src/server/stream.zig`: `{rev,ops}` snapshot serialization for SSE snapshot events.
 - `src/client.js`: app-agnostic DOM patch renderer + delegated `data-on-*` event → action POST plumbing; `src/style.css`: app styling.
@@ -32,6 +38,10 @@
   `view.zig` tree that is diffed via `Dom` into `PatchLog`; the same tree
   renders the SSR page (`writeView`) and the snapshot `ops`
   (`buildViewNodes` → `writeSnapshotOps`).
+- zboard's model is shared across sessions while each session keeps its
+  own graph/DOM state: mutations bump `BoardModel.global_seq`, and each
+  SSE worker's `syncPull()` re-renders (publishing the batch) when the
+  counter moved — cross-tab fan-out through the normal patch pipeline.
 - The server spawns one worker task per accepted connection
   (`std.Io.Group.concurrent`, thread-per-connection; beyond 128 concurrent
   connections the socket is closed before any headers are read — no inline
@@ -43,9 +53,10 @@
 - Generated artifacts: `.zig-cache/` and `zig-out/` (do not edit manually).
 
 ## Build, Test, and Development Commands
-- `zig build`: compile and install the demo artifact.
+- `zig build`: compile and install both executables (`zforest`, `zboard`).
 - `zig build run`: run the todo server on 127.0.0.1:8080 (port arg optional).
-- `zig build test`: run module + executable test targets (currently mostly compile/behavior checks; add `test` blocks as features grow).
+- `zig build run-board`: run the board server (`zboard [port] [bind-ip] [db-path]`).
+- `zig build test`: run module + executable test targets for both apps.
 - `zig build -Doptimize=ReleaseFast`: build with release optimization.
 - `zig fmt src/**/*.zig build.zig`: format code before committing.
 

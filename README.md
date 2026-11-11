@@ -1,17 +1,54 @@
 # zforest
 
-Server-driven Todo UI in Zig: the `zefx` reactive graph core plus `forest`, a
+Server-driven UIs in Zig: the `zefx` reactive graph core plus `forest`, a
 fine-grained DOM patch layer, served by a minimal `std.http` server with a
-~300-line vanilla JS patch client. No database, no framework, no build step.
+vanilla JS patch client. Two apps share the transport:
+
+- **`zforest`** — the Todo demo (per-session model, no database).
+- **`zboard`** — an anonymous message board (static boards, threads,
+  nested tree comments) over a shared SQLite-backed model.
 
 ## Run
 
 ```sh
-zig build        # produces zig-out/bin/zforest
-zig build run    # serves http://127.0.0.1:8080
-./zig-out/bin/zforest 8081  # custom port
-zig build test   # engine, forest, and session tests
+zig build        # produces zig-out/bin/zforest and zig-out/bin/zboard
+zig build run    # serves the todo app on http://127.0.0.1:8080
+zig build run-board 8081 127.0.0.1 board.db  # board on :8081, file db
+./zig-out/bin/zforest [port] [bind-ip]
+./zig-out/bin/zboard   [port] [bind-ip] [db-path]   # db-path default ":memory:"
+zig build test   # engine, forest, session, db, and board tests
 ```
+
+## zboard
+
+Routes: `/` (board list + latest posts), `/b/<slug>` (post form + keyed
+post list), `/t/<post>` (post card + comment form + nested comment tree),
+`/t/<post>/c/<comment>` (breadcrumbs + focused comment subtree). Unknown
+paths and dangling ids return 404.
+
+- `src/board.zig` — `BoardModel`: static board whitelist, in-memory
+  post/comment/user arrays, write-through SQLite inserts, one shared
+  `next_id` across posts and comments (display `#N`), and
+  `global_seq`, an atomic bumped on every mutation.
+- `src/db.zig` + `vendor/sqlite3/` — the official SQLite 3.54.1
+  amalgamation, compiled only into `zboard` and its test target.
+- `src/board_app.zig` — the session/view layer. Every browser session
+  still owns an isolated zefx graph + DOM state, but all sessions share
+  the one model: each SSE worker calls `syncPull()` every 50 ms, which
+  re-renders when `global_seq` moved and publishes the resulting patch
+  batch — so a post in one tab appears live in every other tab (and a
+  no-op diff for sessions on unrelated routes).
+- Identity is anonymous: the first `POST /action` without a `zfxu`
+  cookie mints a `users` row and returns `Set-Cookie: zfxu=<token>`
+  (one-shot — later POSTs don't re-send it); posts display as
+  `Anon#<base36(rownum)>`, stable across restarts. The session cookie
+  stays `zfxb` so the two apps can share a host.
+- Inline replies mount via `when("w-rep-N")` anchors inside each comment
+  row; `reply_to` is per-session, cleared on navigation and after a
+  successful comment.
+
+File databases persist everything: `zboard 8081 127.0.0.1 board.db`
+restarts with posts/comments/users intact (`:memory:` is ephemeral).
 
 ## How it works
 

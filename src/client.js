@@ -123,10 +123,12 @@
     el.hidden = !msg;
   }
 
-  // The stashed draft lives in the first named input of a [data-on-submit]
-  // form — generic, and enough to preserve the pre-reload behaviour.
+  // The stashed draft lives in the first editable named input of a
+  // [data-on-submit] form — generic, and enough to preserve the
+  // pre-reload behaviour. Hidden inputs carry fixed payload values
+  // (board slug, post id), never user drafts.
   function draftInput() {
-    return document.querySelector("[data-on-submit] [name]");
+    return document.querySelector("[data-on-submit] [name]:not([type=hidden])");
   }
 
   function stashDraft() {
@@ -277,13 +279,15 @@
       fields[inputs[i].getAttribute("name")] = inputs[i].value;
     }
     send(form.getAttribute("data-on-submit"), { fields: fields }).then(function () {
-      // Clear only fields still equal to what was sent, then refocus the
-      // form's [autofocus] control (or its first input).
+      // Clear only editable fields still equal to what was sent — hidden
+      // inputs hold fixed payload values (board/post/parent ids) that
+      // must survive for the next submit.
       for (var i = 0; i < inputs.length; i++) {
+        if (inputs[i].type === "hidden") continue;
         var n = inputs[i].getAttribute("name");
         if (inputs[i].value === fields[n]) inputs[i].value = "";
       }
-      var af = form.querySelector("[autofocus]") || form.querySelector("input");
+      var af = form.querySelector("[autofocus]") || form.querySelector("input:not([type=hidden]), textarea");
       if (af) af.focus();
     }).catch(fail);
   });

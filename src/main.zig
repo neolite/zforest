@@ -28,4 +28,5 @@ test {
     _ = @import("todo_app.zig");
     _ = @import("db.zig");
     _ = @import("board.zig");
+    _ = @import("board_app.zig");
 }

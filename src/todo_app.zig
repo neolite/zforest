@@ -77,7 +77,9 @@ pub const Session = struct {
     /// Set by dispatch when minting the session user; owned by the server.
     out_cookie: []const u8 = &.{},
 
-    pub fn create(gpa: std.mem.Allocator) *Session {
+    /// Session contract ctor — `io` is unused (todo mints no user tokens).
+    pub fn create(gpa: std.mem.Allocator, io: std.Io) *Session {
+        _ = io;
         return createSession(gpa);
     }
 

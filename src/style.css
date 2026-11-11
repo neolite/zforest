@@ -96,3 +96,96 @@ footer { margin-top: .9rem; color: var(--muted); font-size: .85rem; }
   #error { background: #3a2222; color: #e0a8a8; border-color: #5c3535; }
 }
 #error[hidden] { display: none; }
+
+/* ── zboard ─────────────────────────────────────────────── */
+.app-board { max-width: 60rem; }
+.app-board .bnav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .9rem;
+  align-items: baseline;
+  margin-bottom: 1.2rem;
+  padding-bottom: .6rem;
+  border-bottom: 1px solid var(--line);
+}
+.app-board .bnav a { color: var(--ink); text-decoration: none; }
+.app-board .bnav a:hover { color: var(--accent); }
+.app-board .bnav a.on { color: var(--accent); font-weight: 650; }
+.app-board .bnav .who { margin-left: auto; color: var(--muted); font-size: .85rem; }
+.app-board .bmain { max-width: 44rem; }
+.app-board .crumbs { font-size: .85rem; color: var(--muted); margin-bottom: .8rem; }
+.app-board .crumbs a { color: var(--muted); }
+.app-board .crumbs a:hover { color: var(--accent); }
+.app-board .crumbs .cid { color: var(--ink); }
+.app-board .boards-label { color: var(--muted); margin: 0 0 .3rem; }
+.app-board .board-list { list-style: none; margin: 0 0 1.2rem; padding: 0; }
+.app-board .board-list a { color: var(--accent); text-decoration: none; }
+.app-board .board-list a:hover { text-decoration: underline; }
+.app-board h2 { font-size: 1rem; color: var(--muted); font-weight: 600; margin: 0 0 .6rem; }
+.app-board .posts { list-style: none; margin: 0; padding: 0; }
+.app-board .post {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: .45rem;
+  padding: .55rem .8rem;
+  margin-bottom: .5rem;
+}
+.app-board .post .meta, .app-board .comment .cmeta {
+  font-size: .8rem;
+  color: var(--muted);
+  margin-bottom: .25rem;
+}
+.app-board .post .pid, .app-board .comment .plink { color: var(--accent); font-weight: 600; text-decoration: none; }
+.app-board .post .plink:hover, .app-board .comment .plink:hover { text-decoration: underline; }
+.app-board .post .bref { color: var(--muted); }
+.app-board .post .bref:hover { color: var(--accent); }
+.app-board .post .who, .app-board .comment .who { color: var(--ink); }
+.app-board .post .ts, .app-board .comment .ts { color: var(--muted); }
+.app-board .ptext, .app-board .ctext {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.app-board .post .actions { margin-top: .35rem; font-size: .85rem; }
+.app-board .post .actions a { color: var(--accent); text-decoration: none; }
+.app-board .post .actions a:hover { text-decoration: underline; }
+.app-board form.post-form, .app-board form.comment-form, .app-board form.reply-form {
+  display: flex;
+  flex-direction: column;
+  gap: .45rem;
+  margin-bottom: .9rem;
+}
+.app-board form.reply-form { margin: .4rem 0 .2rem; }
+.app-board textarea, .app-board input[type="text"], .app-board form input:not([type]) {
+  width: 100%;
+  padding: .5rem .65rem;
+  border: 1px solid var(--line);
+  border-radius: .45rem;
+  background: var(--panel);
+  color: var(--ink);
+  font: inherit;
+  resize: vertical;
+}
+.app-board textarea:focus, .app-board input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+.app-board .comments, .app-board .kids { list-style: none; margin: 0; padding: 0; }
+.app-board .kids { margin: .3rem 0 .2rem 1.4rem; padding-left: .8rem; border-left: 2px solid var(--line); }
+.app-board .comment {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: .45rem;
+  padding: .45rem .7rem;
+  margin-bottom: .4rem;
+}
+.app-board .reply-btn {
+  border: none;
+  background: none;
+  color: var(--accent);
+  font-size: .8rem;
+  padding: 0 .2rem;
+}
+.app-board .reply-btn:hover { text-decoration: underline; }
+.app-board button.mini { padding: .2rem .55rem; font-size: .85rem; align-self: flex-start; }
+.app-board button.mini.cancel { color: var(--muted); }
+.app-board .empty { color: var(--muted); font-size: .9rem; }

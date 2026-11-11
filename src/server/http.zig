@@ -15,7 +15,8 @@ const sse_heartbeat_ticks = 200; // 200 * 50ms ≈ 10s
 
 /// Session contract for the generic server. A session type provides:
 ///
-///   - `pub fn create(gpa: std.mem.Allocator) *Self` — wired constructor.
+///   - `pub fn create(gpa: std.mem.Allocator, io: std.Io) *Self` — wired
+///     constructor (`io` is for entropy: session/user token minting).
 ///   - `deinit()`, `csrf_token: []u8`, `setCsrf(token: []u8)`.
 ///   - `history: History` — retained patch batches for SSE replay.
 ///   - `seq: *zefx.Store(u64)` (or anything exposing `.get()`) — revision.
@@ -78,7 +79,7 @@ pub fn SessionStore(comptime Session: type) type {
             var rand_bytes: [16]u8 = undefined;
             self.io.random(&rand_bytes);
             const token = std.fmt.allocPrint(self.gpa, "{x:0>16}", .{std.mem.readInt(u64, rand_bytes[0..8], .little)}) catch @panic("OOM");
-            const s = Session.create(self.gpa);
+            const s = Session.create(self.gpa, self.io);
             s.setCsrf(std.fmt.allocPrint(self.gpa, "{x:0>32}", .{std.mem.readInt(u128, &rand_bytes, .little)}) catch @panic("OOM"));
             self.by_token.put(self.gpa, token, s) catch @panic("OOM");
             self.order.append(self.gpa, token) catch @panic("OOM");
@@ -306,6 +307,9 @@ fn handle(
             break :blk srv.store.lookup(token).?;
         };
         extra.append(arena, .{ .name = "content-type", .value = "text/html; charset=utf-8" }) catch @panic("OOM");
+        // Auxiliary cookies (board's `zfxu`) also apply to page loads —
+        // identity survives reloads, not just POSTs.
+        if (@hasDecl(Session, "readCookies")) e.readCookies(cookie_hdr);
         // Render into the request arena; servePage decides route validity.
         var aw: std.Io.Writer.Allocating = .init(arena);
         renderHead(Session, e, &aw.writer) catch @panic("OOM");
