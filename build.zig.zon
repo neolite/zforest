@@ -1,0 +1,14 @@
+.{
+    .name = .zforest,
+    .version = "0.2.0",
+    .fingerprint = 0xcceba20c7ae9f47f, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}
