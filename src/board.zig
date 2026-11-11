@@ -13,8 +13,11 @@ pub const Board = struct { slug: []const u8, title: []const u8 };
 /// Static board whitelist — slugs are URL path segments.
 pub const boards = [_]Board{
     .{ .slug = "b", .title = "/b/ — random" },
-    .{ .slug = "tech", .title = "/tech/ — технологии" },
+    .{ .slug = "emp", .title = "/emp/ — эмпатия и Мерсер" },
+    .{ .slug = "sheep", .title = "/sheep/ — электроживотные" },
+    .{ .slug = "nexus", .title = "/nexus/ — железо и прошивки" },
     .{ .slug = "meta", .title = "/meta/ — о борде" },
+    .{ .slug = "tech", .title = "/tech/ — технологии" },
 };
 
 pub fn boardIndex(slug: []const u8) ?usize {

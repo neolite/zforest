@@ -699,7 +699,7 @@ test "route parsing covers home/board/thread/comment and rejects junk" {
     }
     const tt = parseRoute("/b/tech") orelse return error.TestUnexpectedResult;
     switch (tt) {
-        .board => |i| try std.testing.expectEqual(@as(usize, 1), i),
+        .board => |i| try std.testing.expectEqual(board.boardIndex("tech").?, i),
         else => return error.TestUnexpectedResult,
     }
     const th = parseRoute("/t/7") orelse return error.TestUnexpectedResult;
