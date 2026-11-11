@@ -1,5 +1,20 @@
 const std = @import("std");
 
+const sqlite_c = "vendor/sqlite3/sqlite3.c";
+const sqlite_flags = [_][]const u8{ "-DSQLITE_THREADSAFE=1", "-DSQLITE_OMIT_LOAD_EXTENSION" };
+
+/// Attach the vendored sqlite3 amalgamation (SQLite 3.54.1) to a module:
+/// link libc, compile sqlite3.c with the documented flags. Only modules
+/// that actually link the db get this — the todo exe never sees C.
+fn addSqlite(m: *std.Build.Module, b: *std.Build) void {
+    m.link_libc = true;
+    m.addIncludePath(b.path("vendor/sqlite3"));
+    m.addCSourceFile(.{
+        .file = b.path(sqlite_c),
+        .flags = &sqlite_flags,
+    });
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -14,25 +29,43 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
-    const exe = b.addExecutable(.{
-        .name = "zforest",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "zefx", .module = zefx_mod },
-                .{ .name = "forest", .module = forest_mod },
-            },
-        }),
+    const app_imports = [_]std.Build.Module.Import{
+        .{ .name = "zefx", .module = zefx_mod },
+        .{ .name = "forest", .module = forest_mod },
+    };
+
+    const exe_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &app_imports,
     });
+    const exe = b.addExecutable(.{ .name = "zforest", .root_module = exe_mod });
 
     b.installArtifact(exe);
+
+    // The board app: shares the zefx/forest modules plus sqlite via db.zig.
+    const zboard_mod = b.createModule(.{
+        .root_source_file = b.path("src/board_main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &app_imports,
+    });
+    addSqlite(zboard_mod, b);
+
+    const zboard = b.addExecutable(.{ .name = "zboard", .root_module = zboard_mod });
+
+    b.installArtifact(zboard);
 
     const run_step = b.step("run", "Run the todo server");
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
+
+    const run_board_step = b.step("run-board", "Run the board server");
+    const run_board_cmd = b.addRunArtifact(zboard);
+    run_board_step.dependOn(&run_board_cmd.step);
+    run_board_cmd.step.dependOn(b.getInstallStep());
 
     const zefx_tests = b.addTest(.{ .root_module = zefx_mod });
     const run_zefx_tests = b.addRunArtifact(zefx_tests);
@@ -40,11 +73,25 @@ pub fn build(b: *std.Build) void {
     const forest_tests = b.addTest(.{ .root_module = forest_mod });
     const run_forest_tests = b.addRunArtifact(forest_tests);
 
-    const exe_tests = b.addTest(.{ .root_module = exe.root_module });
+    // exe tests pull db.zig/board.zig via main.zig's test block — the
+    // amalgamation is compiled into this test binary only, never into the
+    // zforest exe artifact.
+    const exe_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &app_imports,
+    });
+    addSqlite(exe_test_mod, b);
+    const exe_tests = b.addTest(.{ .root_module = exe_test_mod });
     const run_exe_tests = b.addRunArtifact(exe_tests);
+
+    const zboard_tests = b.addTest(.{ .root_module = zboard_mod });
+    const run_zboard_tests = b.addRunArtifact(zboard_tests);
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_zefx_tests.step);
     test_step.dependOn(&run_forest_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_zboard_tests.step);
 }

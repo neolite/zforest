@@ -19,9 +19,13 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test {
-    // Pull server/session modules into the test binary so their colocated
-    // test blocks are discovered by `zig build test` (the modules are only
-    // reachable through serve(), which alone does not pull test decls).
+    // Pull server/session/model modules into the test binary so their
+    // colocated test blocks are discovered by `zig build test` (the
+    // modules are only reachable through serve(), which alone does not
+    // pull test decls). db.zig/board.zig pull the sqlite amalgamation —
+    // compiled into this test binary only, never the zforest exe.
     _ = @import("server/http.zig");
     _ = @import("todo_app.zig");
+    _ = @import("db.zig");
+    _ = @import("board.zig");
 }
