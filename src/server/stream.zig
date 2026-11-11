@@ -9,7 +9,7 @@ pub fn writeSnapshotJson(s: *todo.Session, writer: *std.Io.Writer) !void {
     try writer.print("{{\"rev\":{d},\"html\":", .{s.seq.get()});
     var rows: std.Io.Writer.Allocating = .init(s.gpa);
     defer rows.deinit();
-    try s.writeRowsHtml(&rows.writer);
+    try s.writeListRows(&rows.writer);
     try std.json.Stringify.encodeJsonString(rows.writer.buffered(), .{}, writer);
     var buf: [64]u8 = undefined;
     const rem = s.remaining.get();

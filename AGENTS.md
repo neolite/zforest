@@ -8,6 +8,7 @@
 - `src/zefx/engine.zig`, `event.zig`, `store.zig`, `sample.zig`, `shape.zig`, `effect.zig`: reactive graph primitives and operators.
 - `src/forest/patch.zig`: HTML escaping + `Patch`/`PatchLog` (owned strings, JSON batch).
 - `src/forest/dom.zig`: server-side DOM state tracking, text/attr bindings, keyed list diff.
+- `src/forest/view.zig`: declarative view tree (`el`/`text`/`raw`/`each`) — one tree drives both SSR (`writeHtml`) and the DOM-patch `diff`.
 - `src/todo_app.zig`: per-browser-session Todo model wired through the zefx graph.
 - `src/server/http.zig`: loopback HTTP server (cookie sessions, POST /action → ACK, GET /events → SSE stream).
 - `src/server/history.zig`: bounded per-session ring of serialized patch batches for SSE subscribers.
@@ -27,7 +28,9 @@
 - Store updates happen in the pure phase; derived stores (`map`/`sample`/
   `combine`) propagate via a settle loop that runs before view watchers.
   Watchers that re-dirty a store re-queue it for the same tick.
-- Rendering happens in an engine after-flush hook (`Dom` diff → `PatchLog`).
+- Rendering happens in an engine after-flush hook: `buildView` produces a
+  `view.zig` tree that is diffed via `Dom` into `PatchLog`; the same tree
+  renders the SSR page (`writeView`) and snapshot rows (`writeListRows`).
 - The server spawns one worker task per accepted connection
   (`std.Io.Group.concurrent`, thread-per-connection; beyond 128 concurrent
   connections the socket is closed before any headers are read — no inline

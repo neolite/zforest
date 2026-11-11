@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub const patch = @import("patch.zig");
 pub const dom = @import("dom.zig");
+pub const view = @import("view.zig");
 
 pub const Patch = patch.Patch;
 pub const PatchLog = patch.PatchLog;
@@ -9,8 +10,20 @@ pub const escapeHtml = patch.escapeHtml;
 pub const escapeHtmlInto = patch.escapeHtmlInto;
 pub const Dom = dom.Dom;
 pub const Row = dom.Row;
+pub const Node = view.Node;
+pub const Element = view.Element;
+pub const Attr = view.Attr;
+pub const Children = view.Children;
+pub const Tag = view.Tag;
+pub const el = view.el;
+pub const text = view.text;
+pub const raw = view.raw;
+pub const each = view.each;
+pub const writeHtml = view.writeHtml;
+pub const diff = view.diff;
 
 test {
     _ = patch;
     _ = dom;
+    _ = view;
 }

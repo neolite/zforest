@@ -70,6 +70,35 @@ pub const Dom = struct {
         gop.value_ptr.* = if (value) |v| self.gpa.dupe(u8, v) catch @panic("OOM") else null;
     }
 
+    /// Record a text binding without emitting — for seeding tracked state
+    /// that matches markup already shipped in a create patch or SSR page.
+    pub fn seedText(self: *Dom, id: []const u8, value: []const u8) void {
+        const new_key = self.gpa.dupe(u8, id) catch @panic("OOM");
+        const gop = self.texts.getOrPut(self.gpa, new_key) catch @panic("OOM");
+        if (gop.found_existing) {
+            self.gpa.free(new_key);
+            self.gpa.free(gop.value_ptr.*);
+        }
+        gop.value_ptr.* = self.gpa.dupe(u8, value) catch @panic("OOM");
+    }
+
+    /// Record the child order for `parent_id` without emitting — used when
+    /// a keyed list's markup was already shipped inside a create patch.
+    pub fn seedOrder(self: *Dom, parent_id: []const u8, ids: []const []const u8) void {
+        const new_key = self.gpa.dupe(u8, parent_id) catch @panic("OOM");
+        const gop = self.orders.getOrPut(self.gpa, new_key) catch @panic("OOM");
+        if (gop.found_existing) {
+            self.gpa.free(new_key);
+            for (gop.value_ptr.items) |id| self.gpa.free(id);
+            gop.value_ptr.clearRetainingCapacity();
+        } else {
+            gop.value_ptr.* = .empty;
+        }
+        for (ids) |id| {
+            gop.value_ptr.append(self.gpa, self.gpa.dupe(u8, id) catch @panic("OOM")) catch @panic("OOM");
+        }
+    }
+
     /// Emit an attribute patch only when the tracked value differs.
     /// `value == null` removes the attribute.
     pub fn setAttr(self: *Dom, log: *PatchLog, id: []const u8, name: []const u8, value: ?[]const u8) void {

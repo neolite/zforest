@@ -28,7 +28,11 @@ zig build test   # engine, forest, and session tests
    only — patches are never in the response body.
 4. Actions emit a zefx event; reducers mutate the model in the **pure
    phase**, a settle loop propagates derived stores (`seq` → `remaining`),
-   and an after-flush hook diffs the view into a `PatchLog`. Under the
+   and an after-flush hook rebuilds the declarative view tree
+   (`src/forest/view.zig`: `el`/`text`/`each` nodes) and diffs it against
+   the tracked DOM into a `PatchLog`. The same tree also renders the SSR
+   page and the snapshot `html` field — one description, both outputs.
+   Under the
    model mutex the batch is serialized once, published into the session's
    bounded history (64 batches / 2 MiB, oldest evicted), and every SSE
    subscriber of that session receives its own copy.

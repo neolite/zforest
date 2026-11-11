@@ -53,6 +53,8 @@ pub const Session = struct {
 
     dom: forest.Dom,
     log: forest.PatchLog,
+    /// Scratch space for the per-render view tree; reset each render.
+    render_arena: std.heap.ArenaAllocator,
     /// Per-session CSRF token rendered into the page and verified on POST.
     /// Owned by the session; set by the server at creation.
     csrf_token: []u8 = &.{},
@@ -63,6 +65,7 @@ pub const Session = struct {
         self.todos.deinit(self.gpa);
         self.dom.deinit();
         self.log.deinit();
+        self.render_arena.deinit();
         self.app.deinit();
         self.gpa.destroy(self);
     }
@@ -208,92 +211,112 @@ pub const Session = struct {
     }
 
     // ── rendering ───────────────────────────────────────────────────
+    // One declarative tree drives both SSR (`writeHtml`) and the
+    // post-flush DOM-patch diff (`forest.diff`). The view lives in
+    // `render_arena`, reset at the top of every render.
 
-    fn writeRowHtml(self: *Session, writer: anytype, t: Todo) !void {
-        _ = self;
-        try writer.print("<li id=\"row-{d}\" class=\"todo{s}\"><input id=\"row-{d}/cb\" type=\"checkbox\" data-toggle=\"{d}\"{s}><span class=\"title\">", .{
-            t.id, if (t.done) " done" else "", t.id, t.id, if (t.done) " checked" else "",
-        });
-        try forest.escapeHtmlInto(writer, t.title);
-        try writer.print("</span><button class=\"del\" data-delete=\"{d}\" aria-label=\"delete\">×</button></li>", .{t.id});
-    }
-
-    /// Write the current row markup (used for the initial page).
-    pub fn writeRowsHtml(self: *Session, writer: anytype) !void {
-        for (self.todos.items) |t| {
-            if (self.visible(t)) try self.writeRowHtml(writer, t);
-        }
-    }
-
-    /// Diff current model into DOM patches. Runs post-settle (after-flush).
+    /// Diff the view into DOM patches. Runs post-settle (after-flush).
     fn render(self: *Session) void {
-        var rows: std.ArrayListUnmanaged(forest.Row) = .empty;
-        defer rows.deinit(self.gpa);
-        var aw: std.Io.Writer.Allocating = .init(self.gpa);
-        defer aw.deinit();
-
-        for (self.todos.items) |t| {
-            if (!self.visible(t)) continue;
-            _ = aw.writer.consumeAll();
-            self.writeRowHtml(&aw.writer, t) catch @panic("OOM");
-            rows.append(self.gpa, .{
-                .id = std.fmt.allocPrint(self.gpa, "row-{d}", .{t.id}) catch @panic("OOM"),
-                .html = self.gpa.dupe(u8, aw.writer.buffered()) catch @panic("OOM"),
-            }) catch @panic("OOM");
-        }
-        defer for (rows.items) |r| {
-            self.gpa.free(@constCast(r.id));
-            self.gpa.free(@constCast(r.html));
-        };
-
-        var created: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer created.deinit(self.gpa);
-        self.dom.syncKeyedList(&self.log, "list", rows.items, &created);
-
-        // Row bindings: tracked state survives across renders; rows created
-        // this pass are seeded to match their markup (no patch).
-        for (self.todos.items) |t| {
-            if (!self.visible(t)) continue;
-            var row_buf: [32]u8 = undefined;
-            const row_id = std.fmt.bufPrint(&row_buf, "row-{d}", .{t.id}) catch unreachable;
-            var cb_buf: [40]u8 = undefined;
-            const cb_id = std.fmt.bufPrint(&cb_buf, "{s}/cb", .{row_id}) catch unreachable;
-            const class: []const u8 = if (t.done) "todo done" else "todo";
-            var was_created = false;
-            for (created.items) |cid| {
-                if (std.mem.eql(u8, cid, row_id)) was_created = true;
-            }
-            if (was_created) {
-                self.dom.seedAttr(cb_id, "checked", if (t.done) "" else null);
-                self.dom.seedAttr(row_id, "class", class);
-            } else {
-                self.dom.setChecked(&self.log, cb_id, t.done);
-                self.dom.setAttr(&self.log, row_id, "class", class);
-            }
-        }
-
-        var buf: [64]u8 = undefined;
-        const rem = self.remaining.get();
-        const count_txt = std.fmt.bufPrint(&buf, "{d} item{s} left", .{ rem, if (rem == 1) "" else "s" }) catch unreachable;
-        self.dom.setText(&self.log, "count", count_txt);
-
-        inline for (.{ Filter.all, Filter.active, Filter.completed }) |f| {
-            self.dom.setAttr(&self.log, comptime "flt-" ++ f.name(), "data-active", if (self.filter == f) "1" else null);
-        }
-
+        _ = self.render_arena.reset(.retain_capacity);
+        const a = self.render_arena.allocator();
+        forest.diff(a, buildView(a, self), &self.dom, &self.log);
         self.log.revision = self.seq.get();
+    }
+
+    /// Render the `<main>` inner content — used by the initial page.
+    pub fn writeView(self: *Session, writer: anytype) !void {
+        _ = self.render_arena.reset(.retain_capacity);
+        const a = self.render_arena.allocator();
+        try forest.writeHtml(a, buildView(a, self), writer);
+    }
+
+    /// Render only the visible `<li>` rows — the snapshot `html` field.
+    pub fn writeListRows(self: *Session, writer: anytype) !void {
+        _ = self.render_arena.reset(.retain_capacity);
+        const a = self.render_arena.allocator();
+        try forest.writeHtml(a, buildRows(a, self), writer);
     }
 
     /// Seed tracked DOM state to match markup already emitted in the page,
     /// so the first diff renders only real changes.
     pub fn seedDom(self: *Session) void {
-        var dummy = forest.PatchLog.init(self.gpa);
-        defer dummy.deinit();
         self.render();
         // Keep tracked state, drop the patches — the page ships full HTML.
         self.log.clear();
     }
 };
+
+fn countText(a: std.mem.Allocator, s: *Session) []const u8 {
+    const rem = s.remaining.get();
+    return std.fmt.allocPrint(a, "{d} item{s} left", .{ rem, if (rem == 1) "" else "s" }) catch @panic("OOM");
+}
+
+fn buildRow(a: std.mem.Allocator, t: Todo) forest.Node {
+    return forest.el(a, .li, .{
+        .id = std.fmt.allocPrint(a, "row-{d}", .{t.id}) catch @panic("OOM"),
+        .class = if (t.done) "todo done" else "todo",
+    }, .{
+        forest.el(a, .input, .{
+            .lid = "cb",
+            .type = "checkbox",
+            .@"data-toggle" = t.id,
+            .checked = t.done,
+        }, .{}),
+        forest.el(a, .span, .{ .class = "title" }, t.title),
+        forest.el(a, .button, .{
+            .class = "del",
+            .@"data-delete" = t.id,
+            .@"aria-label" = "delete",
+        }, "×"),
+    });
+}
+
+fn buildRows(a: std.mem.Allocator, s: *Session) []const forest.Node {
+    var rows: std.ArrayListUnmanaged(forest.Node) = .empty;
+    for (s.todos.items) |t| {
+        if (!s.visible(t)) continue;
+        rows.append(a, buildRow(a, t)) catch @panic("OOM");
+    }
+    return rows.toOwnedSlice(a) catch @panic("OOM");
+}
+
+/// The `<main>` inner content: static chrome (h1, form), bound filter
+/// buttons (`flt-*` / `data-active`), the keyed todo list, and the bound
+/// `count` text.
+fn buildView(a: std.mem.Allocator, s: *Session) []const forest.Node {
+    var nodes: std.ArrayListUnmanaged(forest.Node) = .empty;
+    nodes.append(a, forest.el(a, .h1, .{}, .{
+        forest.text("zforest "),
+        forest.el(a, .span, .{}, "todos"),
+    })) catch @panic("OOM");
+    nodes.append(a, forest.el(a, .form, .{
+        .id = "add-form",
+        .autocomplete = "off",
+    }, .{
+        forest.el(a, .input, .{
+            .id = "new-title",
+            .name = "title",
+            .placeholder = "What needs to be done?",
+            .maxlength = max_title_len,
+            .autofocus = true,
+        }, .{}),
+        forest.el(a, .button, .{ .type = "submit" }, "Add"),
+    })) catch @panic("OOM");
+    var btns: std.ArrayListUnmanaged(forest.Node) = .empty;
+    inline for (.{ Filter.all, Filter.active, Filter.completed }) |f| {
+        btns.append(a, forest.el(a, .button, .{
+            .id = comptime "flt-" ++ f.name(),
+            .@"data-filter" = f.name(),
+            .@"data-active" = if (s.filter == f) "1" else null,
+        }, f.name())) catch @panic("OOM");
+    }
+    nodes.append(a, forest.el(a, .div, .{ .class = "filters" }, btns.toOwnedSlice(a) catch @panic("OOM"))) catch @panic("OOM");
+    nodes.append(a, forest.el(a, .ul, .{ .id = "list" }, forest.each(buildRows(a, s)))) catch @panic("OOM");
+    nodes.append(a, forest.el(a, .footer, .{}, .{
+        forest.el(a, .span, .{ .id = "count", .text = countText(a, s) }, .{}),
+    })) catch @panic("OOM");
+    return nodes.toOwnedSlice(a) catch @panic("OOM");
+}
 
 /// Wired session constructor (separate so `wire` can reference self).
 pub fn createSession(gpa: std.mem.Allocator) *Session {
@@ -306,6 +329,7 @@ pub fn createSession(gpa: std.mem.Allocator) *Session {
         .remaining = undefined,
         .dom = forest.Dom.init(gpa),
         .log = forest.PatchLog.init(gpa),
+        .render_arena = std.heap.ArenaAllocator.init(gpa),
         .filter = .all,
     };
     s.mutate = s.app.createEvent(Mutation);

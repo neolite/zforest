@@ -143,23 +143,10 @@ fn renderIndex(s: *todo.Session, out: anytype) !void {
     try out.writeAll(
         \\"></head>
         \\<body><main class="app">
-        \\<h1>zforest <span>todos</span></h1>
-        \\<form id="add-form" autocomplete="off"><input id="new-title" name="title" placeholder="What needs to be done?" maxlength="500" autofocus><button type="submit">Add</button></form>
-        \\<div class="filters">
     );
-    inline for (.{ todo.Filter.all, todo.Filter.active, todo.Filter.completed }) |f| {
-        try out.print("<button id=\"flt-{s}\" data-filter=\"{s}\"{s}>{s}</button>", .{
-            f.name(),                                        f.name(),
-            if (s.filter == f) " data-active=\"1\"" else "", f.name(),
-        });
-    }
-    try out.writeAll("</div><ul id=\"list\">");
-    try s.writeRowsHtml(out);
-    try out.writeAll("</ul><footer><span id=\"count\">");
-    var buf: [64]u8 = undefined;
-    const rem = s.remaining.get();
-    try out.writeAll(std.fmt.bufPrint(&buf, "{d} item{s} left", .{ rem, if (rem == 1) "" else "s" }) catch unreachable);
-    try out.writeAll("</span></footer></main><script src=\"/client.js?v=1\"></script></body></html>");
+    // Declarative view: h1 + add form + filters + keyed list + count.
+    try s.writeView(out);
+    try out.writeAll("</main><script src=\"/client.js?v=1\"></script></body></html>");
 }
 
 fn handle(
