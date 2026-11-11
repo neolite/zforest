@@ -89,37 +89,57 @@ pub const Session = struct {
         };
     }
 
-    /// Whitelisted action entry point. Emits into the graph; the flush applies
-    /// the mutation (pure phase), settles derived stores, and the after-flush
-    /// hook renders DOM patches into `self.log`.
-    pub fn apply(self: *Session, action: []const u8, id: ?u32, value: ?[]const u8) ActionError!void {
+    /// Whitelisted action entry point — the DOM event protocol: `action`
+    /// is the `data-on-<event>` value, `arg` the `data-arg` payload,
+    /// `value` a change event's new value, and `fields` the named inputs
+    /// of a submitted form. Maps to a Mutation and emits into the graph;
+    /// the flush applies it (pure phase), settles derived stores, and the
+    /// after-flush hook renders DOM patches into `self.log`.
+    pub fn dispatch(
+        self: *Session,
+        action: []const u8,
+        arg: ?[]const u8,
+        value: ?[]const u8,
+        fields: ?*const std.json.ObjectMap,
+    ) ActionError!void {
         if (std.mem.eql(u8, action, "add")) {
-            const raw = value orelse return error.InvalidAction;
+            const m = fields orelse return error.InvalidAction;
+            const fv = m.get("title") orelse return error.InvalidAction;
+            const raw = switch (fv) {
+                .string => |t| t,
+                else => return error.InvalidAction,
+            };
             const title = std.mem.trim(u8, raw, " \t\r\n");
             if (title.len == 0 or title.len > max_title_len) return error.InvalidTitle;
             if (self.todos.items.len >= max_todos) return error.TooManyTodos;
             self.mutate.emit(.{ .add = title });
         } else if (std.mem.eql(u8, action, "toggle")) {
-            const tid = id orelse return error.InvalidAction;
-            if (self.findIdx(tid) == null) return error.TodoNotFound;
+            const tid = try self.argId(arg);
             self.mutate.emit(.{ .toggle = tid });
         } else if (std.mem.eql(u8, action, "set_checked")) {
-            const tid = id orelse return error.InvalidAction;
-            if (self.findIdx(tid) == null) return error.TodoNotFound;
+            const tid = try self.argId(arg);
             const v = value orelse return error.InvalidAction;
             const done = if (std.mem.eql(u8, v, "true")) true else if (std.mem.eql(u8, v, "false")) false else return error.InvalidAction;
             self.mutate.emit(.{ .set_checked = .{ .id = tid, .done = done } });
         } else if (std.mem.eql(u8, action, "delete")) {
-            const tid = id orelse return error.InvalidAction;
-            if (self.findIdx(tid) == null) return error.TodoNotFound;
+            const tid = try self.argId(arg);
             self.mutate.emit(.{ .delete = tid });
         } else if (std.mem.eql(u8, action, "filter")) {
-            const v = value orelse return error.InvalidAction;
+            const v = arg orelse return error.InvalidAction;
             const f = Filter.parse(v) orelse return error.InvalidAction;
             self.mutate.emit(.{ .filter = f });
         } else {
             return error.InvalidAction;
         }
+    }
+
+    /// Parse a `data-arg` todo id: missing/invalid → InvalidAction,
+    /// unknown → TodoNotFound.
+    fn argId(self: *Session, arg: ?[]const u8) ActionError!u32 {
+        const a = arg orelse return error.InvalidAction;
+        const tid = std.fmt.parseInt(u32, a, 10) catch return error.InvalidAction;
+        if (self.findIdx(tid) == null) return error.TodoNotFound;
+        return tid;
     }
 
     // ── graph wiring (called once per session) ──────────────────────
@@ -230,11 +250,10 @@ pub const Session = struct {
         try forest.writeHtml(a, buildView(a, self), writer);
     }
 
-    /// Render only the visible `<li>` rows — the snapshot `html` field.
-    pub fn writeListRows(self: *Session, writer: anytype) !void {
-        _ = self.render_arena.reset(.retain_capacity);
-        const a = self.render_arena.allocator();
-        try forest.writeHtml(a, buildRows(a, self), writer);
+    /// The session's current view nodes, built into `a` — the SSE
+    /// snapshot writer serializes them via `forest.writeSnapshotOps`.
+    pub fn buildViewNodes(self: *Session, a: std.mem.Allocator) []const forest.Node {
+        return buildView(a, self);
     }
 
     /// Seed tracked DOM state to match markup already emitted in the page,
@@ -265,9 +284,9 @@ fn headerView(a: std.mem.Allocator) forest.Node {
         forest.el(a, .form, .{
             .id = "add-form",
             .autocomplete = "off",
+            .on = .{ .submit = "add" },
         }, .{
             forest.el(a, .input, .{
-                .id = "new-title",
                 .name = "title",
                 .placeholder = "What needs to be done?",
                 .maxlength = max_title_len,
@@ -285,8 +304,9 @@ fn filtersView(a: std.mem.Allocator, s: *Session) forest.Node {
     inline for (.{ Filter.all, Filter.active, Filter.completed }) |f| {
         btns.append(a, forest.el(a, .button, .{
             .id = comptime "flt-" ++ f.name(),
-            .@"data-filter" = f.name(),
             .@"data-active" = if (s.filter == f) "1" else null,
+            .on = .{ .click = "filter" },
+            .arg = f.name(),
         }, f.name())) catch @panic("OOM");
     }
     return forest.el(a, .div, .{
@@ -320,14 +340,16 @@ fn buildRow(a: std.mem.Allocator, t: Todo) forest.Node {
         forest.el(a, .input, .{
             .lid = "cb",
             .type = "checkbox",
-            .@"data-toggle" = t.id,
             .checked = t.done,
+            .on = .{ .change = "set_checked" },
+            .arg = t.id,
         }, .{}),
         forest.el(a, .span, .{ .class = "title" }, t.title),
         forest.el(a, .button, .{
             .class = "del",
-            .@"data-delete" = t.id,
             .@"aria-label" = "delete",
+            .on = .{ .click = "delete" },
+            .arg = t.id,
         }, "×"),
     });
 }
@@ -337,15 +359,6 @@ fn buildRow(a: std.mem.Allocator, t: Todo) forest.Node {
 fn rowOrNull(a: std.mem.Allocator, s: *Session, t: Todo) ?forest.Node {
     if (!s.visible(t)) return null;
     return buildRow(a, t);
-}
-
-fn buildRows(a: std.mem.Allocator, s: *Session) []const forest.Node {
-    var rows: std.ArrayListUnmanaged(forest.Node) = .empty;
-    for (s.todos.items) |t| {
-        if (!s.visible(t)) continue;
-        rows.append(a, buildRow(a, t)) catch @panic("OOM");
-    }
-    return rows.toOwnedSlice(a) catch @panic("OOM");
 }
 
 /// The `<main>` inner content: static chrome (h1, form), bound filter
@@ -392,13 +405,22 @@ fn patchJson(s: *Session, alloc: std.mem.Allocator) []u8 {
     return aw.toOwnedSlice() catch @panic("OOM");
 }
 
+/// A form-fields map as POSTed by the client for an "add" action.
+fn titleFields(alloc: std.mem.Allocator, title: []const u8) std.json.ObjectMap {
+    var m: std.json.ObjectMap = .empty;
+    m.put(alloc, "title", .{ .string = title }) catch @panic("OOM");
+    return m;
+}
+
 test "session add/toggle/delete/filter produces patches" {
     const alloc = std.testing.allocator;
     const s = createSession(alloc);
     defer s.deinit();
     s.seedDom();
 
-    try s.apply("add", null, "write <b>docs</b>");
+    var f1 = titleFields(alloc, "write <b>docs</b>");
+    defer f1.deinit(alloc);
+    try s.dispatch("add", null, null, &f1);
     const j1 = patchJson(s, alloc);
     defer alloc.free(j1);
     try std.testing.expect(std.mem.indexOf(u8, j1, "\"op\":\"create\"") != null);
@@ -406,10 +428,13 @@ test "session add/toggle/delete/filter produces patches" {
     try std.testing.expect(std.mem.indexOf(u8, j1, "\\u0026lt;b\\u0026gt;docs\\u0026lt;/b\\u0026gt;") != null);
     try std.testing.expect(std.mem.indexOf(u8, j1, "1 item left") != null);
 
-    try s.apply("add", null, "second");
+    var f2 = titleFields(alloc, "second");
+    defer f2.deinit(alloc);
+    try s.dispatch("add", null, null, &f2);
     alloc.free(patchJson(s, alloc));
 
-    try s.apply("toggle", s.todos.items[0].id, null);
+    var idbuf: [16]u8 = undefined;
+    try s.dispatch("toggle", std.fmt.bufPrint(&idbuf, "{d}", .{s.todos.items[0].id}) catch unreachable, null, null);
     const j2 = patchJson(s, alloc);
     defer alloc.free(j2);
     try std.testing.expectEqual(@as(usize, 1), s.remaining.get());
@@ -419,14 +444,14 @@ test "session add/toggle/delete/filter produces patches" {
     try std.testing.expect(std.mem.indexOf(u8, j2, "\"name\":\"class\",\"value\":\"todo done\"") != null);
 
     // filter to active: done row removed
-    try s.apply("filter", null, "active");
+    try s.dispatch("filter", "active", null, null);
     const j3 = patchJson(s, alloc);
     defer alloc.free(j3);
     try std.testing.expect(std.mem.indexOf(u8, j3, "\"op\":\"remove\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, j3, "data-active") != null);
 
     // delete visible row
-    try s.apply("delete", s.todos.items[1].id, null);
+    try s.dispatch("delete", std.fmt.bufPrint(&idbuf, "{d}", .{s.todos.items[1].id}) catch unreachable, null, null);
     const j4 = patchJson(s, alloc);
     defer alloc.free(j4);
     try std.testing.expectEqual(@as(usize, 1), s.todos.items.len);
@@ -441,13 +466,17 @@ test "two sessions are isolated" {
     a.seedDom();
     b.seedDom();
 
-    try a.apply("add", null, "only in A");
+    var fa = titleFields(alloc, "only in A");
+    defer fa.deinit(alloc);
+    try a.dispatch("add", null, null, &fa);
     alloc.free(patchJson(a, alloc));
 
     try std.testing.expectEqual(@as(usize, 0), b.todos.items.len);
     try std.testing.expectEqual(@as(usize, 1), a.todos.items.len);
     // stable ids: both sessions start at 1 but stay independent
-    try b.apply("add", null, "only in B");
+    var fb = titleFields(alloc, "only in B");
+    defer fb.deinit(alloc);
+    try b.dispatch("add", null, null, &fb);
     try std.testing.expectEqual(@as(usize, 1), b.todos.items.len);
     try std.testing.expectEqualStrings("only in A", a.todos.items[0].title);
     try std.testing.expectEqualStrings("only in B", b.todos.items[0].title);
@@ -460,17 +489,36 @@ test "action validation rejects bad input" {
     defer s.deinit();
     s.seedDom();
 
-    try std.testing.expectError(error.InvalidAction, s.apply("hack", null, null));
-    try std.testing.expectError(error.InvalidAction, s.apply("add", null, null));
-    try std.testing.expectError(error.InvalidTitle, s.apply("add", null, "   "));
-    try std.testing.expectError(error.TodoNotFound, s.apply("toggle", 999, null));
-    try std.testing.expectError(error.TodoNotFound, s.apply("delete", 999, null));
-    try std.testing.expectError(error.InvalidAction, s.apply("filter", null, "bogus"));
+    try std.testing.expectError(error.InvalidAction, s.dispatch("hack", null, null, null));
+    try std.testing.expectError(error.InvalidAction, s.dispatch("add", null, null, null)); // no fields
+
+    var no_title: std.json.ObjectMap = .empty;
+    defer no_title.deinit(alloc);
+    try std.testing.expectError(error.InvalidAction, s.dispatch("add", null, null, &no_title));
+
+    var nonstring = titleFields(alloc, "x");
+    defer nonstring.deinit(alloc);
+    _ = nonstring.swapRemove("title");
+    nonstring.put(alloc, "title", .{ .integer = 3 }) catch @panic("OOM");
+    try std.testing.expectError(error.InvalidAction, s.dispatch("add", null, null, &nonstring));
+
+    var spaces = titleFields(alloc, "   ");
+    defer spaces.deinit(alloc);
+    try std.testing.expectError(error.InvalidTitle, s.dispatch("add", null, null, &spaces));
+
+    try std.testing.expectError(error.InvalidAction, s.dispatch("toggle", "abc", null, null));
+    try std.testing.expectError(error.InvalidAction, s.dispatch("toggle", null, null, null));
+    try std.testing.expectError(error.TodoNotFound, s.dispatch("toggle", "999", null, null));
+    try std.testing.expectError(error.TodoNotFound, s.dispatch("delete", "999", null, null));
+    try std.testing.expectError(error.InvalidAction, s.dispatch("filter", "bogus", null, null));
+    try std.testing.expectError(error.InvalidAction, s.dispatch("filter", null, null, null));
 
     const long = try alloc.alloc(u8, max_title_len + 1);
     defer alloc.free(long);
     @memset(long, 'x');
-    try std.testing.expectError(error.InvalidTitle, s.apply("add", null, long));
+    var too_long = titleFields(alloc, long);
+    defer too_long.deinit(alloc);
+    try std.testing.expectError(error.InvalidTitle, s.dispatch("add", null, null, &too_long));
 
     // nothing leaked into the model
     try std.testing.expectEqual(@as(usize, 0), s.todos.items.len);

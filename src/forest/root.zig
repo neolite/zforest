@@ -25,6 +25,7 @@ pub const eachOf = view.eachOf;
 pub const fragment = view.fragment;
 pub const computed = view.computed;
 pub const writeHtml = view.writeHtml;
+pub const writeSnapshotOps = view.writeSnapshotOps;
 pub const diff = view.diff;
 
 test {

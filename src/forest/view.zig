@@ -201,6 +201,15 @@ pub fn eachOf(a: std.mem.Allocator, items: anytype, ctx: anytype, render: anytyp
 ///
 /// `children` accepts `[]const Node`, a single `Node`, a string (a text
 /// child), a tuple of nodes, or `each`/`eachOf(...)` for a keyed list.
+///
+/// Two attr fields declare DOM events instead of plain attributes:
+///   `.on = .{ .click = "delete" }` — field names are DOM event types
+///     (comptime-whitelisted: click/change/input/submit/keydown); each
+///     emits `data-on-<ev>="<value>"`, which the delegated client-side
+///     listener turns into an action POST.
+///   `.arg = v` — emits `data-arg` (string or int), the action's payload.
+/// Both render through the normal attr path: written into SSR/create
+/// markup and treated as ordinary attrs by diff (self-diff → no churn).
 pub fn el(a: std.mem.Allocator, comptime tag: Tag, attrs: anytype, children: anytype) Node {
     var e: Element = .{ .tag = tag };
     const sinfo = @typeInfo(@TypeOf(attrs)).@"struct";
@@ -213,6 +222,13 @@ pub fn el(a: std.mem.Allocator, comptime tag: Tag, attrs: anytype, children: any
             e.lid = resolveValue(a, v);
         } else if (comptime std.mem.eql(u8, name, "text")) {
             e.text = valueFor(a, v);
+        } else if (comptime std.mem.eql(u8, name, "on")) {
+            inline for (@typeInfo(@TypeOf(v)).@"struct".field_names) |ev| {
+                comptime assertDomEvent(ev);
+                list.append(a, attrOf(a, "data-on-" ++ ev, @field(v, ev))) catch @panic("OOM");
+            }
+        } else if (comptime std.mem.eql(u8, name, "arg")) {
+            list.append(a, attrOf(a, "data-arg", v)) catch @panic("OOM");
         } else {
             list.append(a, attrOf(a, name, v)) catch @panic("OOM");
         }
@@ -241,6 +257,24 @@ pub fn writeHtml(a: std.mem.Allocator, nodes: []const Node, writer: anytype) !vo
 /// emits only real changes. Static elements only recurse.
 pub fn diff(a: std.mem.Allocator, nodes: []const Node, dom: *Dom, log: *PatchLog) void {
     for (nodes) |n| diffNode(a, n, "", dom, log);
+}
+
+/// Serialize `nodes` as a full-state ops array — the SSE snapshot
+/// payload. Keyed parents emit `{"op":"html","id":pid,"html":<children>}`
+/// (an idempotent innerHTML state dump whose markup fully covers the
+/// subtree); bound nodes emit one attr op per attr plus a text op for
+/// `.text`. Op order is irrelevant: this is a state dump, not a diff.
+/// `a` is scratch space for resolved ids and row markup.
+pub fn writeSnapshotOps(a: std.mem.Allocator, nodes: []const Node, writer: anytype) !void {
+    var ops: std.ArrayListUnmanaged(patch_mod.Patch) = .empty;
+    defer ops.deinit(a);
+    for (nodes) |n| try snapshotOps(a, n, "", &ops);
+    try writer.writeByte('[');
+    for (ops.items, 0..) |p, i| {
+        if (i != 0) try writer.writeByte(',');
+        try patch_mod.writeOpJson(writer, p);
+    }
+    try writer.writeByte(']');
 }
 
 // ── internals ───────────────────────────────────────────────────
@@ -370,6 +404,17 @@ fn presenceOf(comptime T: type) bool {
         .pointer => getReturnsBool(U),
         else => false,
     };
+}
+
+/// DOM event types allowed in `.on` — anything else is almost certainly
+/// a typo that would produce a dead listener, so it fails at comptime.
+const dom_events = .{ "click", "change", "input", "submit", "keydown" };
+
+fn assertDomEvent(comptime ev: [:0]const u8) void {
+    inline for (dom_events) |allowed| {
+        if (comptime std.mem.eql(u8, ev, allowed)) return;
+    }
+    @compileError("unsupported .on event type: " ++ ev);
 }
 
 fn attrOf(a: std.mem.Allocator, name: []const u8, v: anytype) Attr {
@@ -546,6 +591,45 @@ fn diffKeyed(a: std.mem.Allocator, parent_id: []const u8, kids: []const Node, do
     }
 }
 
+/// Collect the full-state ops for `node` into `ops` — the walk behind
+/// `writeSnapshotOps`. Keyed children are not recursed into: the parent
+/// `html` op already ships their markup.
+fn snapshotOps(a: std.mem.Allocator, node: Node, parent_path: []const u8, ops: *std.ArrayListUnmanaged(patch_mod.Patch)) !void {
+    switch (node) {
+        .text, .raw => {},
+        .fragment => |kids| for (kids) |k| try snapshotOps(a, k, parent_path, ops),
+        .element => |e| {
+            const id = resolvedId(a, e, parent_path);
+            if (id) |nid| {
+                for (e.attrs) |at| {
+                    ops.append(a, .{ .attr = .{
+                        .id = nid,
+                        .name = at.name,
+                        .value = resolveValue(a, at.value),
+                    } }) catch @panic("OOM");
+                }
+                if (e.text) |tv| {
+                    if (resolveValue(a, tv)) |t| {
+                        ops.append(a, .{ .text = .{ .id = nid, .text = t } }) catch @panic("OOM");
+                    }
+                }
+            }
+            const path = id orelse parent_path;
+            if (e.text != null) return;
+            switch (e.children) {
+                .nodes => |kids| for (kids) |k| try snapshotOps(a, k, path, ops),
+                .keyed => |kids| {
+                    const pid = id orelse @panic("keyed children require a bound parent (.id/.lid)");
+                    var aw: std.Io.Writer.Allocating = .init(a);
+                    defer aw.deinit();
+                    writeHtml(a, kids, &aw.writer) catch @panic("OOM");
+                    ops.append(a, .{ .html = .{ .id = pid, .html = aw.toOwnedSlice() catch @panic("OOM") } }) catch @panic("OOM");
+                },
+            }
+        },
+    }
+}
+
 /// Record all bound state under `node` (attrs, `.text`, keyed orders) as
 /// already-on-the-page truth — no patches.
 fn seedNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, dom: *Dom) void {
@@ -602,14 +686,16 @@ fn testView(a: std.mem.Allocator, rows: []const TRow, filt: TFilt, remaining: us
             el(a, .input, .{
                 .lid = "cb",
                 .type = "checkbox",
-                .@"data-toggle" = t.id,
                 .checked = t.done,
+                .on = .{ .change = "set_checked" },
+                .arg = t.id,
             }, .{}),
             el(a, .span, .{ .class = "title" }, t.title),
             el(a, .button, .{
                 .class = "del",
-                .@"data-delete" = t.id,
                 .@"aria-label" = "delete",
+                .on = .{ .click = "delete" },
+                .arg = t.id,
             }, "×"),
         })) catch @panic("OOM");
     }
@@ -619,8 +705,9 @@ fn testView(a: std.mem.Allocator, rows: []const TRow, filt: TFilt, remaining: us
     inline for (.{ TFilt.all, TFilt.active, TFilt.completed }) |f| {
         btns.append(a, el(a, .button, .{
             .id = comptime "flt-" ++ @tagName(f),
-            .@"data-filter" = @tagName(f),
             .@"data-active" = if (filt == f) "1" else null,
+            .on = .{ .click = "filter" },
+            .arg = @tagName(f),
         }, @tagName(f))) catch @panic("OOM");
     }
     top.append(a, el(a, .div, .{ .class = "filters" }, btns.toOwnedSlice(a) catch @panic("OOM"))) catch @panic("OOM");
@@ -830,6 +917,63 @@ test "fragment renders siblings without a wrapper" {
     );
 }
 
+test ".on and .arg emit data-on-* and data-arg attributes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const v = el(a, .button, .{
+        .class = "del",
+        .on = .{ .click = "delete" },
+        .arg = @as(u32, 7),
+    }, "×");
+    try std.testing.expectEqualStrings(
+        "<button class=\"del\" data-on-click=\"delete\" data-arg=\"7\">×</button>",
+        renderStr(a, &.{v}),
+    );
+
+    const form = el(a, .form, .{ .on = .{ .submit = "add" } }, .{});
+    try std.testing.expectEqualStrings(
+        "<form data-on-submit=\"add\"></form>",
+        renderStr(a, &.{form}),
+    );
+
+    const cb = el(a, .input, .{
+        .type = "checkbox",
+        .on = .{ .change = "set_checked", .input = "typing" },
+        .arg = "row-1",
+    }, .{});
+    try std.testing.expectEqualStrings(
+        "<input type=\"checkbox\" data-on-change=\"set_checked\" data-on-input=\"typing\" data-arg=\"row-1\">",
+        renderStr(a, &.{cb}),
+    );
+}
+
+test "writeSnapshotOps dumps html op for keyed parent plus bound node ops" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const rows = [2]TRow{
+        .{ .id = 1, .title = "one", .done = false },
+        .{ .id = 2, .title = "two", .done = true },
+    };
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try writeSnapshotOps(a, testView(a, &rows, .all, 1), &aw.writer);
+    const json = aw.writer.buffered();
+
+    // keyed parent → html state dump covering the whole list (JSON-escaped markup)
+    try std.testing.expect(std.mem.indexOf(u8, json, "{\"op\":\"html\",\"id\":\"list\",\"html\":\"\\u003cli id=\\\"row-1\\\"") != null);
+    // bound filter buttons → data-active attr ops
+    try std.testing.expect(std.mem.indexOf(u8, json, "{\"op\":\"attr\",\"id\":\"flt-all\",\"name\":\"data-active\",\"value\":\"1\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "{\"op\":\"attr\",\"id\":\"flt-active\",\"name\":\"data-active\",\"value\":null}") != null);
+    // bound count → text op
+    try std.testing.expect(std.mem.indexOf(u8, json, "{\"op\":\"text\",\"id\":\"count\",\"text\":\"1 item left\"}") != null);
+    // no diff ops leak into a state dump
+    try std.testing.expect(std.mem.indexOf(u8, json, "create") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "remove") == null);
+}
+
 fn expectAttr(p: patch_mod.Patch, id: []const u8, name: []const u8, value: ?[]const u8) !void {
     try std.testing.expect(p == .attr);
     const at = p.attr;
@@ -889,7 +1033,7 @@ test "diff add emits create with full row html plus count" {
     try std.testing.expect(c.before_id == null);
     try std.testing.expectEqualStrings("row-1", c.id);
     try std.testing.expectEqualStrings(
-        "<li id=\"row-1\" class=\"todo\"><input id=\"row-1/cb\" type=\"checkbox\" data-toggle=\"1\"><span class=\"title\">say &quot;&lt;b&gt;hi&lt;/b&gt;&quot;</span><button class=\"del\" data-delete=\"1\" aria-label=\"delete\">×</button></li>",
+        "<li id=\"row-1\" class=\"todo\"><input id=\"row-1/cb\" type=\"checkbox\" data-on-change=\"set_checked\" data-arg=\"1\"><span class=\"title\">say &quot;&lt;b&gt;hi&lt;/b&gt;&quot;</span><button class=\"del\" aria-label=\"delete\" data-on-click=\"delete\" data-arg=\"1\">×</button></li>",
         c.html,
     );
     try expectText(log.patches.items[1], "count", "1 item left");
@@ -1011,8 +1155,8 @@ test "created row seeds bindings so toggle emits only real diffs" {
     log.clear();
 
     // Create row-7, then toggle it in the very next render: the bindings
-    // seeded at create time must absorb type/data-toggle so only the real
-    // class/checked/count changes are emitted.
+    // seeded at create time must absorb type/data-on-change so only the
+    // real class/checked/count changes are emitted.
     const created = [1]TRow{.{ .id = 7, .title = "new", .done = false }};
     diff(a, testView(a, &created, .all, 1), &dom, &log);
     log.clear();

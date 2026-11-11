@@ -61,6 +61,9 @@ pub const Patch = union(enum) {
     text: struct { id: []const u8, text: []const u8 },
     /// Set/remove an attribute. `value == null` removes it.
     attr: struct { id: []const u8, name: []const u8, value: ?[]const u8 },
+    /// Replace an element's innerHTML — the full-state snapshot op
+    /// (client uses innerHTML on trusted server-generated markup).
+    html: struct { id: []const u8, html: []const u8 },
 };
 
 /// Ordered patch batch for one revision. Strings are duplicated into an
@@ -136,6 +139,12 @@ pub const PatchLog = struct {
         } });
     }
 
+    /// Queue an innerHTML replacement — used by snapshot/state-dump
+    /// producers, not by the diffing path.
+    pub fn setHtml(self: *PatchLog, id: []const u8, html: []const u8) void {
+        self.push(.{ .html = .{ .id = self.dupe(id), .html = self.dupe(html) } });
+    }
+
     /// Serialize as `{"rev":N,"patches":[...]}`.
     pub fn writeJson(self: *const PatchLog, writer: anytype) !void {
         try writer.writeAll("{\"rev\":");
@@ -143,61 +152,74 @@ pub const PatchLog = struct {
         try writer.writeAll(",\"patches\":[");
         for (self.patches.items, 0..) |p, i| {
             if (i != 0) try writer.writeByte(',');
-            switch (p) {
-                .create => |c| {
-                    try writer.writeAll("{\"op\":\"create\",\"parent\":");
-                    try writeJsonStringInto(writer, c.parent_id);
-                    try writer.writeAll(",\"id\":");
-                    try writeJsonStringInto(writer, c.id);
-                    try writer.writeAll(",\"before\":");
-                    try writeOptJsonString(writer, c.before_id);
-                    try writer.writeAll(",\"html\":");
-                    try writeJsonStringInto(writer, c.html);
-                    try writer.writeByte('}');
-                },
-                .remove => |r| {
-                    try writer.writeAll("{\"op\":\"remove\",\"id\":");
-                    try writeJsonStringInto(writer, r.id);
-                    try writer.writeByte('}');
-                },
-                .move => |m| {
-                    try writer.writeAll("{\"op\":\"move\",\"parent\":");
-                    try writeJsonStringInto(writer, m.parent_id);
-                    try writer.writeAll(",\"id\":");
-                    try writeJsonStringInto(writer, m.id);
-                    try writer.writeAll(",\"before\":");
-                    try writeOptJsonString(writer, m.before_id);
-                    try writer.writeByte('}');
-                },
-                .text => |t| {
-                    try writer.writeAll("{\"op\":\"text\",\"id\":");
-                    try writeJsonStringInto(writer, t.id);
-                    try writer.writeAll(",\"text\":");
-                    try writeJsonStringInto(writer, t.text);
-                    try writer.writeByte('}');
-                },
-                .attr => |a| {
-                    try writer.writeAll("{\"op\":\"attr\",\"id\":");
-                    try writeJsonStringInto(writer, a.id);
-                    try writer.writeAll(",\"name\":");
-                    try writeJsonStringInto(writer, a.name);
-                    try writer.writeAll(",\"value\":");
-                    try writeOptJsonString(writer, a.value);
-                    try writer.writeByte('}');
-                },
-            }
+            try writeOpJson(writer, p);
         }
         try writer.writeAll("]}");
     }
-
-    fn writeOptJsonString(writer: anytype, s: ?[]const u8) !void {
-        if (s) |v| {
-            try writeJsonStringInto(writer, v);
-        } else {
-            try writer.writeAll("null");
-        }
-    }
 };
+
+fn writeOptJsonString(writer: anytype, s: ?[]const u8) !void {
+    if (s) |v| {
+        try writeJsonStringInto(writer, v);
+    } else {
+        try writer.writeAll("null");
+    }
+}
+
+/// Serialize one patch op as a JSON object — shared by `PatchLog.writeJson`
+/// batches and `view.writeSnapshotOps` state dumps.
+pub fn writeOpJson(writer: anytype, p: Patch) !void {
+    switch (p) {
+        .create => |c| {
+            try writer.writeAll("{\"op\":\"create\",\"parent\":");
+            try writeJsonStringInto(writer, c.parent_id);
+            try writer.writeAll(",\"id\":");
+            try writeJsonStringInto(writer, c.id);
+            try writer.writeAll(",\"before\":");
+            try writeOptJsonString(writer, c.before_id);
+            try writer.writeAll(",\"html\":");
+            try writeJsonStringInto(writer, c.html);
+            try writer.writeByte('}');
+        },
+        .remove => |r| {
+            try writer.writeAll("{\"op\":\"remove\",\"id\":");
+            try writeJsonStringInto(writer, r.id);
+            try writer.writeByte('}');
+        },
+        .move => |m| {
+            try writer.writeAll("{\"op\":\"move\",\"parent\":");
+            try writeJsonStringInto(writer, m.parent_id);
+            try writer.writeAll(",\"id\":");
+            try writeJsonStringInto(writer, m.id);
+            try writer.writeAll(",\"before\":");
+            try writeOptJsonString(writer, m.before_id);
+            try writer.writeByte('}');
+        },
+        .text => |t| {
+            try writer.writeAll("{\"op\":\"text\",\"id\":");
+            try writeJsonStringInto(writer, t.id);
+            try writer.writeAll(",\"text\":");
+            try writeJsonStringInto(writer, t.text);
+            try writer.writeByte('}');
+        },
+        .attr => |a| {
+            try writer.writeAll("{\"op\":\"attr\",\"id\":");
+            try writeJsonStringInto(writer, a.id);
+            try writer.writeAll(",\"name\":");
+            try writeJsonStringInto(writer, a.name);
+            try writer.writeAll(",\"value\":");
+            try writeOptJsonString(writer, a.value);
+            try writer.writeByte('}');
+        },
+        .html => |h| {
+            try writer.writeAll("{\"op\":\"html\",\"id\":");
+            try writeJsonStringInto(writer, h.id);
+            try writer.writeAll(",\"html\":");
+            try writeJsonStringInto(writer, h.html);
+            try writer.writeByte('}');
+        },
+    }
+}
 
 test "escapeHtml escapes markup characters" {
     const got = try escapeHtml(std.testing.allocator, "<b>&\"'x</b>");

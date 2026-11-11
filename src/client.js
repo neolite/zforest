@@ -1,7 +1,12 @@
-// zforest client — minimal DOM patch renderer over SSE. No framework.
+// zforest client — app-agnostic DOM patch renderer over SSE. No framework.
+// The server drives the DOM with a declarative view: elements declare an
+// action via data-on-<event> attributes and a payload via data-arg. This
+// file contains no app knowledge — only the wire protocol below.
 (function () {
   "use strict";
 
+  // Only these attributes may be patched by attr ops; data-on-*/data-arg
+  // and friends are static markup and never appear here.
   var ATTR_WHITELIST = {
     checked: true,
     value: true,
@@ -40,6 +45,10 @@
         el = document.getElementById(p.id);
         if (el) el.textContent = p.text;
         break;
+      case "html":
+        el = document.getElementById(p.id);
+        if (el) el.innerHTML = p.html; // trusted server-generated, data escaped
+        break;
       case "attr":
         el = document.getElementById(p.id);
         if (!el || !ATTR_WHITELIST[p.name]) return;
@@ -55,10 +64,8 @@
     }
   }
 
-  function applyBatch(resp) {
-    if (resp && resp.patches) {
-      for (var i = 0; i < resp.patches.length; i++) applyPatch(resp.patches[i]);
-    }
+  function applyOps(ops) {
+    if (ops) for (var i = 0; i < ops.length; i++) applyPatch(ops[i]);
   }
 
   function showError(msg) {
@@ -74,9 +81,15 @@
     el.hidden = !msg;
   }
 
+  // The stashed draft lives in the first named input of a [data-on-submit]
+  // form — generic, and enough to preserve the pre-reload behaviour.
+  function draftInput() {
+    return document.querySelector("[data-on-submit] [name]");
+  }
+
   function stashDraft() {
     try {
-      var inp = document.getElementById("new-title");
+      var inp = draftInput();
       if (inp && inp.value) sessionStorage.setItem("zforest-draft", inp.value);
     } catch (_) {}
   }
@@ -102,29 +115,23 @@
   var lastRev = revMeta ? Number(revMeta.getAttribute("content")) || 0 : 0;
   var ready = false;
 
-  var input = document.getElementById("new-title");
-  var addBtn = document.querySelector("#add-form button");
-  // Actions are disabled until the first SSE snapshot confirms the stream.
-  input.disabled = true;
-  addBtn.disabled = true;
+  // Controls inside [data-on-submit] forms stay disabled until the first
+  // SSE snapshot confirms the stream.
+  function gatedControls() {
+    return document.querySelectorAll("[data-on-submit] input, [data-on-submit] button");
+  }
+  var gated = gatedControls();
+  for (var gi = 0; gi < gated.length; gi++) gated[gi].disabled = true;
 
   function applySnapshot(d) {
-    document.getElementById("list").innerHTML = d.html; // trusted, escaped
-    document.getElementById("count").textContent = d.count;
-    var btns = document.querySelectorAll("[data-filter]");
-    for (var i = 0; i < btns.length; i++) {
-      if (btns[i].getAttribute("data-filter") === d.filter) {
-        btns[i].setAttribute("data-active", "1");
-      } else {
-        btns[i].removeAttribute("data-active");
-      }
-    }
+    applyOps(d.ops); // full-state dump: html + attr + text ops
     lastRev = d.rev;
     if (!ready) {
       ready = true;
-      input.disabled = false;
-      addBtn.disabled = false;
-      input.focus();
+      var ctrls = gatedControls();
+      for (var i = 0; i < ctrls.length; i++) ctrls[i].disabled = false;
+      var af = document.querySelector("[data-on-submit] [autofocus]");
+      if (af) af.focus();
     }
   }
 
@@ -135,7 +142,7 @@
   es.addEventListener("patch", function (ev) {
     var d = JSON.parse(ev.data);
     if (d.rev > lastRev) { // ignore obsolete batches
-      applyBatch(d);
+      applyOps(d.patches);
       lastRev = d.rev;
     }
   });
@@ -152,7 +159,9 @@
 
   function send(action, extra) {
     var payload = { action: action };
-    if (extra) for (var k in extra) payload[k] = extra[k];
+    if (extra) for (var k in extra) {
+      if (extra[k] !== null && extra[k] !== undefined) payload[k] = extra[k];
+    }
     var job = queue.then(function () {
       return fetch("/action", {
         method: "POST",
@@ -193,55 +202,59 @@
     if (revert) revert();
   }
 
-  document.addEventListener("DOMContentLoaded", function () {
-    var form = document.getElementById("add-form");
-    var list = document.getElementById("list");
+  // Delegated listeners: any element may declare data-on-<event> plus an
+  // optional data-arg payload; the listener turns it into an action POST.
+  document.addEventListener("click", function (ev) {
+    var el = ev.target.closest("[data-on-click]");
+    if (!el) return;
+    send(el.getAttribute("data-on-click"), { arg: el.getAttribute("data-arg") }).catch(fail);
+  });
 
-    // Restore a draft stashed before a session-loss reload.
+  document.addEventListener("change", function (ev) {
+    var el = ev.target.closest("[data-on-change]");
+    if (!el) return;
+    var isBox = el.type === "checkbox";
+    // Explicit desired state for checkboxes, not a blind toggle.
+    var desired = isBox ? el.checked : undefined;
+    send(el.getAttribute("data-on-change"), {
+      arg: el.getAttribute("data-arg"),
+      value: isBox ? String(el.checked) : el.value,
+    }).catch(function (e) {
+      fail(e, function () { if (isBox) el.checked = !desired; });
+    });
+  });
+
+  document.addEventListener("submit", function (ev) {
+    var form = ev.target.closest("[data-on-submit]");
+    if (!form) return;
+    ev.preventDefault();
+    if (!ready) return;
+    var inputs = form.querySelectorAll("[name]");
+    var fields = {};
+    for (var i = 0; i < inputs.length; i++) {
+      fields[inputs[i].getAttribute("name")] = inputs[i].value;
+    }
+    send(form.getAttribute("data-on-submit"), { fields: fields }).then(function () {
+      // Clear only fields still equal to what was sent, then refocus the
+      // form's [autofocus] control (or its first input).
+      for (var i = 0; i < inputs.length; i++) {
+        var n = inputs[i].getAttribute("name");
+        if (inputs[i].value === fields[n]) inputs[i].value = "";
+      }
+      var af = form.querySelector("[autofocus]") || form.querySelector("input");
+      if (af) af.focus();
+    }).catch(fail);
+  });
+
+  // Restore a draft stashed before a session-loss reload.
+  document.addEventListener("DOMContentLoaded", function () {
     try {
       var draft = sessionStorage.getItem("zforest-draft");
       if (draft) {
-        input.value = draft;
+        var inp = draftInput();
+        if (inp) inp.value = draft;
         sessionStorage.removeItem("zforest-draft");
       }
     } catch (_) {}
-
-    form.addEventListener("submit", function (ev) {
-      ev.preventDefault();
-      if (!ready) return;
-      var v = input.value;
-      if (!v.trim()) return;
-      send("add", { value: v })
-        .then(function () {
-          // Clear only on success, and only if the user hasn't typed more.
-          if (input.value === v) input.value = "";
-          input.focus();
-        })
-        .catch(function (e) {
-          fail(e); // rejected: draft stays in the input
-        });
-    });
-
-    list.addEventListener("click", function (ev) {
-      var btn = ev.target.closest("[data-delete]");
-      if (btn) send("delete", { id: Number(btn.getAttribute("data-delete")) }).catch(function (e) { fail(e); });
-    });
-
-    list.addEventListener("change", function (ev) {
-      var cb = ev.target.closest("[data-toggle]");
-      if (!cb) return;
-      // Explicit desired state, not a blind toggle.
-      var want = cb.checked;
-      send("set_checked", { id: Number(cb.getAttribute("data-toggle")), value: want ? "true" : "false" }).catch(function (e) {
-        fail(e, function () {
-          cb.checked = !want;
-        });
-      });
-    });
-
-    document.querySelector(".filters").addEventListener("click", function (ev) {
-      var b = ev.target.closest("[data-filter]");
-      if (b) send("filter", { value: b.getAttribute("data-filter") }).catch(function (e) { fail(e); });
-    });
   });
 })();

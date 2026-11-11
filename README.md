@@ -19,28 +19,37 @@ zig build test   # engine, forest, and session tests
    `HttpOnly; SameSite=Strict`) and returns fully rendered HTML plus a
    per-session CSRF token in a `<meta>` tag.
 2. The client opens `GET /events` (Server-Sent Events, cookie auth) and
-   waits for the first `event: snapshot` before enabling the form. Each
-   snapshot is `{"rev","html","count","filter"}`; each `event: patch`
-   (with `id: rev`) is `{"rev","patches"}`.
-3. The client sends whitelisted actions as `POST /action` JSON
-   (`add` / `set_checked` / `toggle` / `delete` / `filter`) with an
-   `X-Zforest-CSRF` header; the server replies with an ACK `{"rev":N}`
-   only — patches are never in the response body.
-4. Actions emit a zefx event; reducers mutate the model in the **pure
+   waits for the first `event: snapshot` before enabling any
+   `data-on-submit` controls. Each snapshot is `{"rev","ops"}` — the
+   declarative view serialized as a full-state ops array
+   (`forest.writeSnapshotOps`): keyed parents as `html` ops, bound nodes
+   as `attr`/`text` ops. Each `event: patch` (with `id: rev`) is
+   `{"rev","patches"}`.
+3. Interactions are declared in the view: `.on = .{ .click = "delete" }`
+   emits `data-on-click="delete"` and `.arg` emits `data-arg`. Delegated
+   document listeners in `client.js` (which has zero app knowledge) turn
+   them into `POST /action` JSON — `{action, arg?, value?, fields?}`
+   with an `X-Zforest-CSRF` header; `fields` carries a submitted form's
+   named inputs. The server replies with an ACK `{"rev":N}` only —
+   patches are never in the response body.
+4. `Session.dispatch` validates the whitelisted action and emits a zefx
+   event; reducers mutate the model in the **pure
    phase**, a settle loop propagates derived stores (`seq` → `remaining`),
    and an after-flush hook rebuilds the declarative view tree
-   (`src/forest/view.zig`: `el`/`text`/`each` nodes) and diffs it against
+   (`src/forest/view.zig`: `el`/`text`/`eachOf`/`computed` nodes, with
+   store-pointer bindings resolved lazily) and diffs it against
    the tracked DOM into a `PatchLog`. The same tree also renders the SSR
-   page and the snapshot `html` field — one description, both outputs.
+   page and the snapshot `ops` — one description, all outputs.
    Under the
    model mutex the batch is serialized once, published into the session's
    bounded history (64 batches / 2 MiB, oldest evicted), and every SSE
    subscriber of that session receives its own copy.
-5. The client applies ops (`create`/`remove`/`move`/`text`/`attr`) with
-   `<template>` parsing + `insertBefore` for creates (trusted
-   server-generated HTML with escaped data), `textContent` for text, and an
+5. The client applies ops (`create`/`remove`/`move`/`text`/`attr`/`html`)
+   with `<template>` parsing + `insertBefore` for creates (trusted
+   server-generated HTML with escaped data), `textContent` for text,
+   `innerHTML` for `html` state dumps, and an
    attribute whitelist for `attr` ops. Patch batches with `rev <= lastRev`
-   are ignored; a `snapshot` event resets the list wholesale.
+   are ignored; a `snapshot` event resets state wholesale.
 
 ## Scope notes (deliberate)
 

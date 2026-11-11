@@ -6,14 +6,14 @@
 
 - `src/zefx/root.zig`: public API surface exported as module `zefx`.
 - `src/zefx/engine.zig`, `event.zig`, `store.zig`, `sample.zig`, `shape.zig`, `effect.zig`: reactive graph primitives and operators.
-- `src/forest/patch.zig`: HTML escaping + `Patch`/`PatchLog` (owned strings, JSON batch).
+- `src/forest/patch.zig`: HTML escaping + `Patch`/`PatchLog` (owned strings, JSON batch; `writeOpJson` serializes one op).
 - `src/forest/dom.zig`: server-side DOM state tracking, text/attr bindings, keyed list diff.
-- `src/forest/view.zig`: declarative view tree (`el`/`text`/`raw`/`each`) — one tree drives both SSR (`writeHtml`) and the DOM-patch `diff`.
-- `src/todo_app.zig`: per-browser-session Todo model wired through the zefx graph.
+- `src/forest/view.zig`: declarative view tree (`el`/`text`/`raw`/`eachOf`/`fragment`/`computed`) — one tree drives SSR (`writeHtml`), the DOM-patch `diff`, and the full-state snapshot (`writeSnapshotOps`). Attrs and `.text` accept duck-typed `*T.get()` store pointers and `computed` wrappers resolved lazily; `.on`/`.arg` emit `data-on-<event>`/`data-arg` DOM-event attrs.
+- `src/todo_app.zig`: per-browser-session Todo model wired through the zefx graph; `Session.dispatch` is the whitelisted action entry (`{action, arg?, value?, fields?}`).
 - `src/server/http.zig`: loopback HTTP server (cookie sessions, POST /action → ACK, GET /events → SSE stream).
 - `src/server/history.zig`: bounded per-session ring of serialized patch batches for SSE subscribers.
-- `src/server/stream.zig`: snapshot JSON serialization for SSE snapshot events.
-- `src/client.js`: minimal DOM patch renderer; `src/style.css`: app styling.
+- `src/server/stream.zig`: `{rev,ops}` snapshot serialization for SSE snapshot events.
+- `src/client.js`: app-agnostic DOM patch renderer + delegated `data-on-*` event → action POST plumbing; `src/style.css`: app styling.
 - `src/main.zig`: executable entry point.
 - `build.zig`: build graph, run step, and test step definitions.
 - `build.zig.zon`: package metadata (`minimum_zig_version = 0.17.1`).
@@ -30,7 +30,8 @@
   Watchers that re-dirty a store re-queue it for the same tick.
 - Rendering happens in an engine after-flush hook: `buildView` produces a
   `view.zig` tree that is diffed via `Dom` into `PatchLog`; the same tree
-  renders the SSR page (`writeView`) and snapshot rows (`writeListRows`).
+  renders the SSR page (`writeView`) and the snapshot `ops`
+  (`buildViewNodes` → `writeSnapshotOps`).
 - The server spawns one worker task per accepted connection
   (`std.Io.Group.concurrent`, thread-per-connection; beyond 128 concurrent
   connections the socket is closed before any headers are read — no inline

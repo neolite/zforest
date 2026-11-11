@@ -116,10 +116,15 @@ fn requestPath(target: []const u8) []const u8 {
     return path[0 .. std.mem.indexOfScalar(u8, path, '?') orelse path.len];
 }
 
+/// The DOM event protocol posted to /action: `action` is the
+/// `data-on-<event>` attribute, `arg` the `data-arg` payload, `value`
+/// the changed element's new value, and `fields` an object of a
+/// submitted form's named inputs. `unknown_fields` stay ignored.
 const Action = struct {
     action: []const u8,
-    id: ?u32 = null,
+    arg: ?[]const u8 = null,
     value: ?[]const u8 = null,
+    fields: ?std.json.Value = null,
 };
 
 fn statusOf(err: todo.ActionError) std.http.Status {
@@ -206,7 +211,12 @@ fn handle(
         const token_ok = csrf_hdr != null and std.mem.eql(u8, csrf_hdr.?, s.csrf_token);
         if (!token_ok and !sameOrigin(origin_hdr, host_hdr)) return .forbidden;
 
-        s.apply(parsed.value.action, parsed.value.id, parsed.value.value) catch |err| return statusOf(err);
+        const body_v = parsed.value;
+        const fields: ?*const std.json.ObjectMap = if (body_v.fields) |*f| switch (f.*) {
+            .object => |*m| m,
+            else => null,
+        } else null;
+        s.dispatch(body_v.action, body_v.arg, body_v.value, fields) catch |err| return statusOf(err);
 
         // Publish the serialized batch to this session's history for SSE
         // replay; the response itself is only an ACK.
@@ -271,8 +281,9 @@ fn writeChunk(out: *std.Io.Writer, data: []const u8) !void {
 /// Persistent Server-Sent Events stream, one per connection task.
 ///
 /// Protocol:
-///   event: snapshot — {"rev","html","count","filter"} on connect and
-///     whenever the subscriber's cursor fell behind retained history.
+///   event: snapshot — {"rev","ops"} on connect and whenever the
+///     subscriber's cursor fell behind retained history. `ops` is the
+///     declarative view serialized as a state dump (html/attr/text ops).
 ///   event: patch, id: {rev} — {"rev","patches"} for each mutation batch.
 ///   event: session_expired — once, then the connection closes.
 ///
