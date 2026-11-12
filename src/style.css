@@ -278,6 +278,13 @@ footer { margin-top: .9rem; color: var(--muted); font-size: .85rem; }
   margin-top: .6rem; padding: .55rem .8rem; border-radius: .6rem;
   background: var(--panel); border: 1px solid var(--accent); font-weight: 600;
 }
+.dbg { border-top: 1px dashed var(--line); padding-top: .8rem; }
+.state-json {
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--panel); border: 1px solid var(--line); border-radius: .55rem;
+  padding: .6rem .8rem; margin: 0; max-height: 15rem; overflow: auto;
+  white-space: pre-wrap; word-break: break-all; color: var(--muted);
+}
 .svc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr)); gap: .45rem; }
 .svc {
   display: flex; flex-direction: column; gap: .15rem; padding: .5rem .7rem;

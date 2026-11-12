@@ -700,8 +700,93 @@ fn bookingsView(a: std.mem.Allocator, s: *Session) forest.Node {
     }));
 }
 
+// ── debug state dump ──────────────────────────────────────────────
+
+fn jwStr(w: anytype, s: []const u8) void {
+    forest.patch.writeJsonStringInto(w, s) catch @panic("OOM");
+}
+
+fn jwNum(w: anytype, n: anytype) void {
+    w.print("{d}", .{n}) catch @panic("OOM");
+}
+
+/// Serializable snapshot of the whole backend model — the same state the
+/// view reads, emitted as JSON for the on-page debug block. Bound via
+/// `.text`, so every flush ships a `text` op when anything changed.
+fn stateJson(a: std.mem.Allocator, s: *Session) []const u8 {
+    var aw: std.Io.Writer.Allocating = .init(a);
+    const w = &aw.writer;
+    w.writeByte('{') catch @panic("OOM");
+    w.writeAll("\"rev\":") catch @panic("OOM");
+    jwNum(w, s.seq.get());
+    w.writeAll(",\"vehicle\":") catch @panic("OOM");
+    if (s.brand != null and s.model != null and s.year != null) {
+        const b = CarData.brandAt(s.brand.?).?;
+        const m = CarData.modelAt(s.brand.?, s.model.?).?;
+        w.writeByte('{') catch @panic("OOM");
+        w.writeAll("\"brand\":") catch @panic("OOM");
+        jwStr(w, b.name);
+        w.writeAll(",\"model\":") catch @panic("OOM");
+        jwStr(w, m.name);
+        w.writeAll(",\"year\":") catch @panic("OOM");
+        jwNum(w, s.year.?);
+        w.writeByte('}') catch @panic("OOM");
+    } else {
+        w.writeAll("null") catch @panic("OOM");
+    }
+    w.writeAll(",\"services\":[") catch @panic("OOM");
+    const ids = s.cartIds(a);
+    for (ids, 0..) |id, i| {
+        if (i != 0) w.writeByte(',') catch @panic("OOM");
+        jwNum(w, id);
+    }
+    w.writeByte(']') catch @panic("OOM");
+    w.writeAll(",\"subtotal\":") catch @panic("OOM");
+    jwNum(w, s.subtotal());
+    w.writeAll(",\"discounts\":[") catch @panic("OOM");
+    var dbuf: [3]Session.Discount = undefined;
+    for (s.discounts(&dbuf), 0..) |d, i| {
+        if (i != 0) w.writeByte(',') catch @panic("OOM");
+        w.writeByte('{') catch @panic("OOM");
+        w.writeAll("\"label\":") catch @panic("OOM");
+        jwStr(w, d.label);
+        w.writeAll(",\"amount\":") catch @panic("OOM");
+        jwNum(w, d.amount);
+        w.writeByte('}') catch @panic("OOM");
+    }
+    w.writeByte(']') catch @panic("OOM");
+    w.writeAll(",\"total\":") catch @panic("OOM");
+    jwNum(w, s.total());
+    w.writeAll(",\"bookings\":[") catch @panic("OOM");
+    for (s.bookings.items, 0..) |b, i| {
+        if (i != 0) w.writeByte(',') catch @panic("OOM");
+        w.writeByte('{') catch @panic("OOM");
+        w.writeAll("\"id\":") catch @panic("OOM");
+        jwNum(w, b.id);
+        w.writeAll(",\"name\":") catch @panic("OOM");
+        jwStr(w, b.name);
+        w.writeAll(",\"car\":") catch @panic("OOM");
+        jwStr(w, b.car);
+        w.writeAll(",\"items\":") catch @panic("OOM");
+        jwNum(w, b.items);
+        w.writeAll(",\"total\":") catch @panic("OOM");
+        jwNum(w, b.total);
+        w.writeByte('}') catch @panic("OOM");
+    }
+    w.writeByte(']') catch @panic("OOM");
+    w.writeByte('}') catch @panic("OOM");
+    return aw.toOwnedSlice() catch @panic("OOM");
+}
+
+fn stateView(a: std.mem.Allocator, s: *Session) forest.Node {
+    return forest.el(a, .section, .{ .class = "vsec dbg" }, .{
+        forest.el(a, .h2, .{ .class = "sec" }, "Состояние сервера"),
+        forest.el(a, .pre, .{ .id = "state-json", .class = "state-json", .text = stateJson(a, s) }, .{}),
+    });
+}
+
 fn buildView(a: std.mem.Allocator, s: *Session) []const forest.Node {
-    const nodes = a.alloc(forest.Node, 6) catch @panic("OOM");
+    const nodes = a.alloc(forest.Node, 7) catch @panic("OOM");
     nodes[0] = forest.fragment(a, .{
         forest.el(a, .h1, .{}, .{
             forest.text("zcar "),
@@ -714,6 +799,7 @@ fn buildView(a: std.mem.Allocator, s: *Session) []const forest.Node {
     nodes[3] = upsellsView(a, s);
     nodes[4] = summaryView(a, s);
     nodes[5] = bookingsView(a, s);
+    nodes[6] = stateView(a, s);
     return nodes;
 }
 
