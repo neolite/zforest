@@ -205,3 +205,26 @@ footer { margin-top: .9rem; color: var(--muted); font-size: .85rem; }
 .app-board button.mini { padding: .2rem .55rem; font-size: .85rem; align-self: flex-start; }
 .app-board button.mini.cancel { color: var(--muted); }
 .app-board .empty { color: var(--muted); font-size: .9rem; }
+
+/* ── zmon dashboard ─────────────────────────────────────────── */
+.app-mon { max-width: 52rem; }
+.mon { display: flex; flex-direction: column; gap: .75rem; }
+.mon-head { display: flex; align-items: baseline; justify-content: space-between; }
+.mon-title { font-size: 1.25rem; font-weight: 650; }
+.mon-status { font: 600 .85rem/1 ui-monospace, Menlo, monospace; padding: .2rem .55rem; border-radius: .4rem; background: var(--line); }
+.mon-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr)); gap: .6rem; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: .6rem; padding: .6rem .8rem; }
+.clabel { font-size: .72rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.cval { font: 700 1.5rem/1.2 ui-monospace, Menlo, monospace; margin-top: .2rem; }
+.feed {
+  margin: 0; padding: .7rem .9rem; max-height: 12rem; overflow: auto;
+  background: var(--panel); border: 1px solid var(--line); border-radius: .6rem;
+  font: .8rem/1.45 ui-monospace, Menlo, monospace; white-space: pre-wrap;
+}
+.mon-actions { display: flex; gap: .5rem; }
+.btn {
+  font: 600 .85rem/1 inherit; padding: .5rem .9rem; border-radius: .5rem;
+  border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+  cursor: pointer;
+}
+.btn:hover { border-color: var(--accent); }
