@@ -700,16 +700,29 @@ fn diffNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, dom: *Dom
 }
 
 fn diffKeyed(a: std.mem.Allocator, parent_id: []const u8, kids: []const Node, dom: *Dom, log: *PatchLog) void {
+    // Row html is consumed ONLY by create patches inside syncKeyedList —
+    // existing rows diff their bound state via diffNode instead. Build
+    // the tracked-id set once so per-row HTML serialization is skipped
+    // for rows already on the page (the common case: O(dirty) instead
+    // of O(all) serialization per flush).
+    var existing: std.StringHashMapUnmanaged(void) = .empty;
+    defer existing.deinit(a);
+    for (dom.keyedOrder(parent_id)) |id| {
+        existing.put(a, id, {}) catch @panic("OOM");
+    }
+
     var rows: std.ArrayListUnmanaged(Row) = .empty;
     defer rows.deinit(a);
     for (kids) |k| {
-        var aw: std.Io.Writer.Allocating = .init(a);
-        defer aw.deinit();
-        writeNode(a, k, parent_id, &aw.writer) catch @panic("OOM");
-        rows.append(a, .{
-            .id = keyedChildId(k),
-            .html = aw.toOwnedSlice() catch @panic("OOM"),
-        }) catch @panic("OOM");
+        const kid_id = keyedChildId(k);
+        var html: []const u8 = &.{};
+        if (!existing.contains(kid_id)) {
+            var aw: std.Io.Writer.Allocating = .init(a);
+            defer aw.deinit();
+            writeNode(a, k, parent_id, &aw.writer) catch @panic("OOM");
+            html = aw.toOwnedSlice() catch @panic("OOM");
+        }
+        rows.append(a, .{ .id = kid_id, .html = html }) catch @panic("OOM");
     }
 
     // `created` is allocated with the Dom's gpa (see syncKeyedList).

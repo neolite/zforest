@@ -99,6 +99,14 @@ pub const Dom = struct {
         gop.value_ptr.* = self.gpa.dupe(u8, value) catch @panic("OOM");
     }
 
+    /// The tracked child ids of keyed parent `parent_id`, in DOM order.
+    /// Borrowed slice — valid until the next mutation of this Dom's
+    /// `orders` map. Empty when the parent has no recorded order.
+    pub fn keyedOrder(self: *Dom, parent_id: []const u8) []const []const u8 {
+        const gop = self.orders.getPtr(parent_id) orelse return &.{};
+        return gop.items;
+    }
+
     /// Record the child order for `parent_id` without emitting — used when
     /// a keyed list's markup was already shipped inside a create patch.
     pub fn seedOrder(self: *Dom, parent_id: []const u8, ids: []const []const u8) void {
