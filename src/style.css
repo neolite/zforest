@@ -267,14 +267,13 @@ footer { margin-top: .9rem; color: var(--muted); font-size: .85rem; }
 .cat { font-size: .8rem; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); margin: .9rem 0 .4rem; }
 .fld { display: flex; flex-direction: column; gap: .35rem; margin-bottom: .7rem; }
 .flabel { font-size: .75rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
-.chips { display: flex; flex-wrap: wrap; gap: .35rem; }
-.chip {
-  font: 600 .82rem/1 inherit; padding: .42rem .8rem; border-radius: 999px;
+.sel {
+  font: inherit; padding: .45rem .6rem; border-radius: .55rem;
   border: 1px solid var(--line); background: var(--panel); color: var(--ink);
-  cursor: pointer;
+  max-width: 16rem; cursor: pointer;
 }
-.chip:hover { border-color: var(--accent); }
-.chip.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.sel:disabled { opacity: .45; cursor: default; }
+.sel:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
 .spec {
   margin-top: .6rem; padding: .55rem .8rem; border-radius: .6rem;
   background: var(--panel); border: 1px solid var(--accent); font-weight: 600;

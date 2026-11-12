@@ -252,15 +252,14 @@ pub const Session = struct {
         value: ?[]const u8,
         fields: ?*const std.json.ObjectMap,
     ) ActionError!void {
-        _ = value;
         if (std.mem.eql(u8, action, "set_brand")) {
-            const i = try self.argIdx(arg, CarData.brands.len);
+            const i = try self.argIdx(value orelse arg, CarData.brands.len);
             self.mutate.emit(.{ .set_brand = i });
         } else if (std.mem.eql(u8, action, "set_model")) {
-            const i = try self.argIdx(arg, if (self.brand) |b| CarData.brandAt(b).?.models.len else 0);
+            const i = try self.argIdx(value orelse arg, if (self.brand) |b| CarData.brandAt(b).?.models.len else 0);
             self.mutate.emit(.{ .set_model = i });
         } else if (std.mem.eql(u8, action, "set_year")) {
-            const a_str = arg orelse return error.InvalidAction;
+            const a_str = value orelse arg orelse return error.InvalidAction;
             const y = std.fmt.parseInt(u16, a_str, 10) catch return error.InvalidChoice;
             const m = if (self.brand != null and self.model != null)
                 CarData.modelAt(self.brand.?, self.model.?)
@@ -441,86 +440,107 @@ fn idxSlice(a: std.mem.Allocator, n: usize) []usize {
 
 // ── view components ───────────────────────────────────────────────
 
-const ChipCtx = struct {
-    s: *Session,
-    sel: ?usize,
-    action: []const u8,
-    prefix: []const u8,
+/// One `<option>` in a linked select: `key` is the stable keyed-list
+/// id suffix, `val` the payload sent back on change (the select's
+/// `el.value`), `label` the visible text.
+const OptItem = struct {
+    key: []const u8,
+    val: []const u8,
+    label: []const u8,
+    sel: bool,
+    dis: bool = false,
 };
 
-fn chip(a: std.mem.Allocator, prefix: []const u8, i: usize, sel: ?usize, action: []const u8, label: []const u8) forest.Node {
-    const on = sel != null and sel.? == i;
-    return forest.el(a, .button, .{
-        .id = std.fmt.allocPrint(a, "chip-{s}-{d}", .{ prefix, i }) catch @panic("OOM"),
-        .class = if (on) "chip on" else "chip",
-        .on = .{ .click = action },
-        .arg = std.fmt.allocPrint(a, "{d}", .{i}) catch @panic("OOM"),
-    }, label);
+const OptCtx = struct { which: []const u8 };
+
+fn optOrNull(a: std.mem.Allocator, ctx: OptCtx, item: OptItem) ?forest.Node {
+    return forest.el(a, .option, .{
+        .id = std.fmt.allocPrint(a, "opt-{s}-{s}", .{ ctx.which, item.key }) catch @panic("OOM"),
+        .value = item.val,
+        .selected = item.sel,
+        .disabled = item.dis,
+        .text = item.label,
+    }, .{});
 }
 
-fn brandChip(a: std.mem.Allocator, ctx: ChipCtx, i: usize) ?forest.Node {
-    const b = CarData.brandAt(i) orelse return null;
-    return chip(a, "brand", i, ctx.sel, ctx.action, b.name);
+fn numStr(a: std.mem.Allocator, n: anytype) []const u8 {
+    return std.fmt.allocPrint(a, "{d}", .{n}) catch @panic("OOM");
 }
 
-fn modelChip(a: std.mem.Allocator, ctx: ChipCtx, i: usize) ?forest.Node {
-    const b = ctx.s.brand orelse return null;
-    const m = CarData.modelAt(b, i) orelse return null;
-    return chip(a, "model", i, ctx.sel, ctx.action, m.name);
+/// A `<select>` whose options are a keyed list. `value` binds the
+/// select's current payload (attr op → `el.value` picks the option);
+/// `disabled` is a presence attr gated on the upstream selection.
+fn selectEl(
+    a: std.mem.Allocator,
+    id: []const u8,
+    action: []const u8,
+    value: []const u8,
+    disabled: bool,
+    which: []const u8,
+    items: []const OptItem,
+) forest.Node {
+    return forest.el(a, .select, .{
+        .id = id,
+        .class = "sel",
+        .on = .{ .change = action },
+        .value = value,
+        .disabled = disabled,
+    }, forest.eachOf(a, items, OptCtx{ .which = which }, optOrNull));
 }
 
-fn yearChip(a: std.mem.Allocator, ctx: ChipCtx, i: usize) ?forest.Node {
-    const b = ctx.s.brand orelse return null;
-    const m = ctx.s.model orelse return null;
-    const md = CarData.modelAt(b, m) orelse return null;
-    const y = md.year_lo + @as(u16, @intCast(i));
-    var ybuf: [8]u8 = undefined;
-    const label = std.fmt.bufPrint(&ybuf, "{d}", .{y}) catch unreachable;
-    // bufPrint result is stack memory — dupe into the render arena.
-    return chip(a, "year", i, ctx.sel, ctx.action, a.dupe(u8, label) catch @panic("OOM"));
-}
-
-fn chipRow(a: std.mem.Allocator, id: []const u8, count: usize, render: anytype, ctx: anytype) forest.Node {
-    return forest.el(a, .div, .{ .class = "chips", .id = id }, forest.eachOf(a, idxSlice(a, count), ctx, render));
+fn fld(a: std.mem.Allocator, label: []const u8, control: forest.Node) forest.Node {
+    return forest.el(a, .div, .{ .class = "fld" }, .{
+        forest.el(a, .span, .{ .class = "flabel" }, label),
+        control,
+    });
 }
 
 fn vehicleView(a: std.mem.Allocator, s: *Session) forest.Node {
-    const bcount = CarData.brands.len;
-    const mcount = if (s.brand) |b| CarData.brandAt(b).?.models.len else 0;
-    const ycount = if (s.brand != null and s.model != null) blk: {
-        const md = CarData.modelAt(s.brand.?, s.model.?).?;
-        break :blk @as(usize, md.year_hi - md.year_lo + 1);
-    } else 0;
-
     var parts = std.ArrayListUnmanaged(forest.Node).empty;
     parts.append(a, forest.el(a, .h2, .{ .class = "sec" }, "1. Автомобиль")) catch @panic("OOM");
-    parts.append(a, forest.el(a, .div, .{ .class = "fld" }, .{
-        forest.el(a, .span, .{ .class = "flabel" }, "Марка"),
-        chipRow(a, "veh-brand", bcount, brandChip, ChipCtx{ .s = s, .sel = s.brand, .action = "set_brand", .prefix = "brand" }),
-    })) catch @panic("OOM");
-    if (mcount > 0) {
-        parts.append(a, forest.el(a, .div, .{ .class = "fld" }, .{
-            forest.el(a, .span, .{ .class = "flabel" }, "Модель"),
-            chipRow(a, "veh-model", mcount, modelChip, ChipCtx{ .s = s, .sel = s.model, .action = "set_model", .prefix = "model" }),
-        })) catch @panic("OOM");
+
+    var bitems = std.ArrayListUnmanaged(OptItem).empty;
+    bitems.append(a, .{ .key = "x", .val = "", .label = "— марка —", .sel = s.brand == null, .dis = true }) catch @panic("OOM");
+    for (CarData.brands, 0..) |b, i| {
+        const v = numStr(a, i);
+        bitems.append(a, .{ .key = v, .val = v, .label = b.name, .sel = s.brand != null and s.brand.? == i }) catch @panic("OOM");
     }
-    const year_sel: ?usize = if (s.year) |y| blk: {
+    parts.append(a, fld(a, "Марка", selectEl(a, "sel-brand", "set_brand", if (s.brand) |b| numStr(a, b) else "", false, "brand", bitems.items))) catch @panic("OOM");
+
+    var mitems = std.ArrayListUnmanaged(OptItem).empty;
+    mitems.append(a, .{ .key = "x", .val = "", .label = "— модель —", .sel = s.model == null, .dis = true }) catch @panic("OOM");
+    if (s.brand) |bi| {
+        const br = CarData.brandAt(bi).?;
+        for (br.models, 0..) |m, i| {
+            const v = numStr(a, i);
+            mitems.append(a, .{ .key = v, .val = v, .label = m.name, .sel = s.model != null and s.model.? == i }) catch @panic("OOM");
+        }
+    }
+    parts.append(a, fld(a, "Модель", selectEl(a, "sel-model", "set_model", if (s.model) |m| numStr(a, m) else "", s.brand == null, "model", mitems.items))) catch @panic("OOM");
+
+    var yitems = std.ArrayListUnmanaged(OptItem).empty;
+    yitems.append(a, .{ .key = "x", .val = "", .label = "— год —", .sel = s.year == null, .dis = true }) catch @panic("OOM");
+    if (s.brand != null and s.model != null) {
         const md = CarData.modelAt(s.brand.?, s.model.?).?;
-        break :blk @as(usize, y - md.year_lo);
-    } else null;
-    if (ycount > 0) {
-        parts.append(a, forest.el(a, .div, .{ .class = "fld" }, .{
-            forest.el(a, .span, .{ .class = "flabel" }, "Год"),
-            chipRow(a, "veh-year", ycount, yearChip, ChipCtx{ .s = s, .sel = year_sel, .action = "set_year", .prefix = "year" }),
-        })) catch @panic("OOM");
+        var y = md.year_lo;
+        while (y <= md.year_hi) : (y += 1) {
+            const v = numStr(a, y);
+            yitems.append(a, .{ .key = v, .val = v, .label = v, .sel = s.year != null and s.year.? == y }) catch @panic("OOM");
+        }
     }
+    parts.append(a, fld(a, "Год", selectEl(a, "sel-year", "set_year", if (s.year) |y| numStr(a, y) else "", s.brand == null or s.model == null, "year", yitems.items))) catch @panic("OOM");
+
     if (s.vehicleComplete()) {
         const b = CarData.brandAt(s.brand.?).?;
         const m = CarData.modelAt(s.brand.?, s.model.?).?;
         const spec = std.fmt.allocPrint(a, "{s} {s} · {d} г. · {s} · {s} · {s} привод", .{
             b.name, m.name, s.year.?, m.spec.engine, m.spec.gearbox, m.spec.drivetrain,
         }) catch @panic("OOM");
-        parts.append(a, forest.el(a, .div, .{ .id = "car-spec", .class = "spec" }, spec)) catch @panic("OOM");
+        // Mounted through a when-anchor: non-keyed children can't appear
+        // or disappear via diff — only bound leaves and branch swaps can.
+        parts.append(a, forest.when(a, .{ .id = "w-spec" }, true, forest.el(a, .div, .{ .id = "car-spec", .class = "spec", .text = spec }, .{}))) catch @panic("OOM");
+    } else {
+        parts.append(a, forest.when(a, .{ .id = "w-spec" }, false, forest.el(a, .div, .{ .id = "car-spec", .class = "spec" }, .{}))) catch @panic("OOM");
     }
     return forest.el(a, .section, .{ .class = "vsec" }, parts.items);
 }
@@ -578,18 +598,20 @@ fn upsellOrNull(a: std.mem.Allocator, ctx: UpsellCtx, i: usize) ?forest.Node {
         .class = "upsell",
     }, .{
         forest.el(a, .div, .{ .class = "upsell-txt" }, .{
-            forest.el(a, .span, .{ .class = "upsell-name" }, sv.name),
-            forest.el(a, .span, .{ .class = "upsell-why" }, sug.reason),
+            forest.el(a, .span, .{ .lid = "nm", .class = "upsell-name", .text = sv.name }, .{}),
+            forest.el(a, .span, .{ .lid = "why", .class = "upsell-why", .text = sug.reason }, .{}),
         }),
-        forest.el(a, .span, .{ .class = "upsell-price" }, fmtPrice(a, sv.price)),
-        if (in_cart)
+        forest.el(a, .span, .{ .lid = "pr", .class = "upsell-price", .text = fmtPrice(a, sv.price) }, .{}),
+        // Tag swap (span ↔ button) needs a branch anchor — plain
+        // non-keyed children can't replace each other via diff.
+        forest.variant(a, .{ .lid = "act" }, if (in_cart) "in" else "add", if (in_cart)
             forest.el(a, .span, .{ .class = "upsell-in" }, "в заказе")
         else
             forest.el(a, .button, .{
                 .class = "btn mini",
                 .on = .{ .click = "add_svc" },
                 .arg = std.fmt.allocPrint(a, "{d}", .{sv.id}) catch @panic("OOM"),
-            }, "+"),
+            }, "+")),
     });
 }
 
@@ -603,8 +625,8 @@ fn upsellsView(a: std.mem.Allocator, s: *Session) forest.Node {
 
 fn sumLine(a: std.mem.Allocator, id: []const u8, name: []const u8, price_text: []const u8, cls: []const u8) forest.Node {
     return forest.el(a, .div, .{ .id = id, .class = cls }, .{
-        forest.el(a, .span, .{ .class = "sum-name" }, name),
-        forest.el(a, .span, .{ .class = "sum-price" }, price_text),
+        forest.el(a, .span, .{ .lid = "nm", .class = "sum-name", .text = name }, .{}),
+        forest.el(a, .span, .{ .lid = "pr", .class = "sum-price", .text = price_text }, .{}),
     });
 }
 
@@ -639,8 +661,8 @@ fn summaryView(a: std.mem.Allocator, s: *Session) forest.Node {
             )) catch @panic("OOM");
         }
         kids.append(a, forest.el(a, .div, .{ .id = "sum-total", .class = "sum-total" }, .{
-            forest.el(a, .span, .{}, "Итого"),
-            forest.el(a, .span, .{}, std.fmt.allocPrint(a, "{s} ₽", .{fmtPrice(a, s.total())}) catch @panic("OOM")),
+            forest.el(a, .span, .{ .lid = "lbl", .text = "Итого" }, .{}),
+            forest.el(a, .span, .{ .lid = "val", .text = std.fmt.allocPrint(a, "{s} ₽", .{fmtPrice(a, s.total())}) catch @panic("OOM") }, .{}),
         })) catch @panic("OOM");
         kids.append(a, forest.el(a, .form, .{
             .class = "book-form",
