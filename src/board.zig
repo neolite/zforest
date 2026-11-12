@@ -115,6 +115,9 @@ pub const BoardModel = struct {
     comments: std.ArrayListUnmanaged(Comment) = .empty,
     /// zfxu token -> display name ("Anon#<base36(rownum)>").
     users: std.StringHashMapUnmanaged([]u8) = .empty,
+    /// post id -> comment count, maintained on load/addComment so
+    /// `commentCount` is O(1) instead of a full scan per post card.
+    post_counts: std.AutoHashMapUnmanaged(u64, u32) = .empty,
     /// Shared id space across posts+comments: display "#N".
     next_id: u64 = 1,
     /// Bumped on every mutation; sessions poll it for cross-session fan-out.
@@ -152,6 +155,7 @@ pub const BoardModel = struct {
             self.gpa.free(e.value_ptr.*);
         }
         self.users.deinit(self.gpa);
+        self.post_counts.deinit(self.gpa);
         self.db.close();
         self.gpa.destroy(self);
     }
@@ -223,6 +227,7 @@ pub const BoardModel = struct {
                 }
                 try self.comments.append(self.gpa, c);
                 self.next_id = @max(self.next_id, c.id + 1);
+                self.noteComment(c.post);
             }
         }
     }
@@ -319,12 +324,14 @@ pub const BoardModel = struct {
         return out.toOwnedSlice(a);
     }
 
+    fn noteComment(self: *BoardModel, post_id: u64) void {
+        const gop = self.post_counts.getOrPut(self.gpa, post_id) catch @panic("OOM");
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
+    }
+
     pub fn commentCount(self: *const BoardModel, post_id: u64) usize {
-        var n: usize = 0;
-        for (self.comments.items) |c| {
-            if (c.post == post_id) n += 1;
-        }
-        return n;
+        return self.post_counts.get(post_id) orelse 0;
     }
 
     /// Insert a post: validate, write-through INSERT, append, bump seq.
@@ -386,6 +393,7 @@ pub const BoardModel = struct {
         };
         self.comments.append(self.gpa, c) catch @panic("OOM");
         self.next_id += 1;
+        self.noteComment(post_id);
         self.bump();
         return c;
     }

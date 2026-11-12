@@ -779,8 +779,9 @@ fn stateJson(a: std.mem.Allocator, s: *Session) []const u8 {
 }
 
 fn stateView(a: std.mem.Allocator, s: *Session) forest.Node {
-    return forest.el(a, .section, .{ .class = "vsec dbg" }, .{
-        forest.el(a, .h2, .{ .class = "sec" }, "Состояние сервера"),
+    // Native <details> accordion — collapsible without any client JS.
+    return forest.el(a, .details, .{ .class = "dbg" }, .{
+        forest.el(a, .summary, .{ .class = "dbg-sum" }, "Состояние сервера (JSON)"),
         forest.el(a, .pre, .{ .id = "state-json", .class = "state-json", .text = stateJson(a, s) }, .{}),
     });
 }

@@ -279,6 +279,8 @@ footer { margin-top: .9rem; color: var(--muted); font-size: .85rem; }
   background: var(--panel); border: 1px solid var(--accent); font-weight: 600;
 }
 .dbg { border-top: 1px dashed var(--line); padding-top: .8rem; }
+.dbg-sum { cursor: pointer; font-size: .8rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.dbg-sum:hover { color: var(--ink); }
 .state-json {
   font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
   background: var(--panel); border: 1px solid var(--line); border-radius: .55rem;

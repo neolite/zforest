@@ -482,9 +482,7 @@ fn commentNode(a: std.mem.Allocator, s: *Session, c: *const board.Comment, post_
     const rep_id = std.fmt.allocPrint(a, "w-rep-{d}", .{c.id}) catch @panic("OOM");
     const replying = s.reply_to != null and s.reply_to.? == c.id;
     const num = u64str(a, c.id);
-    const hash = a.alloc(u8, num.len + 1) catch @panic("OOM");
-    hash[0] = '#';
-    @memcpy(hash[1..], num);
+    const hash = std.fmt.allocPrint(a, "#{d}", .{c.id}) catch @panic("OOM");
 
     var kids: std.ArrayListUnmanaged(forest.Node) = .empty;
     kids.append(a, forest.el(a, .div, .{ .class = "cmeta" }, .{
