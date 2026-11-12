@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zforest vs htmx / LiveView / Hotwire / Livewire</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --ink: #1c2330; --muted: #66707f;
+    --line: #dde2ea; --accent: #3b62d6; --accent-soft: #e8edfb;
+    --ok: #1f8a4c; --warn: #b45309; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.55 -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .wrap { max-width: 1060px; margin: 0 auto; padding: 40px 24px 80px; }
+  h1 { font-size: 26px; margin: 0 0 6px; }
+  h2 { font-size: 19px; margin: 44px 0 12px; padding-top: 20px;
+       border-top: 2px solid var(--line); }
+  .sub { color: var(--muted); margin: 0 0 8px; }
+  .card { background: var(--card); border: 1px solid var(--line);
+          border-radius: 12px; padding: 18px 20px; margin: 14px 0;
+          box-shadow: 0 1px 2px rgba(20,30,50,.04); }
+  .card h3 { margin: 0 0 4px; font-size: 16px; }
+  .tag { display: inline-block; font: 600 11px/1 var(--mono); padding: 3px 8px;
+         border-radius: 99px; background: var(--accent-soft); color: var(--accent);
+         vertical-align: middle; margin-left: 8px; }
+  ul { margin: 8px 0 0; padding-left: 20px; }
+  li { margin: 3px 0; }
+  code { font: 12.5px var(--mono); background: #eef1f6; padding: 1px 5px;
+         border-radius: 4px; }
+  pre { font: 12px/1.5 var(--mono); background: #0f1626; color: #d7e0f0;
+        border-radius: 10px; padding: 14px 16px; overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; background: var(--card);
+          border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
+          font-size: 13.5px; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line);
+           vertical-align: top; }
+  th { background: #f0f3f8; font-size: 12px; text-transform: uppercase;
+       letter-spacing: .04em; color: var(--muted); }
+  tr:last-child td { border-bottom: 0; }
+  td:first-child { font-weight: 600; white-space: nowrap; }
+  .zf td:first-child { color: var(--accent); }
+  svg { display: block; width: 100%; height: auto; }
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; font-size: 12.5px;
+            color: var(--muted); margin: 6px 0 0; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px;
+              margin-right: 5px; vertical-align: -1px; }
+  .note { border-left: 3px solid var(--accent); background: var(--accent-soft);
+          padding: 10px 14px; border-radius: 0 8px 8px 0; margin: 12px 0;
+          font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>zforest — server-driven UI на Zig</h1>
+<p class="sub">Как устроен наш пайплайн и чем он отличается от htmx, Phoenix LiveView,
+Hotwire (Rails) и Laravel Livewire.</p>
+
+<h2>1. zforest: единый пайплайн «событие → граф → дерево → DOM-опы»</h2>
+
+<div class="card">
+<svg viewBox="0 0 1000 300" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,Menlo,monospace" font-size="11">
+  <defs>
+    <marker id="a" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 z" fill="#66707f"/>
+    </marker>
+  </defs>
+  <!-- browser -->
+  <rect x="10" y="20" width="180" height="250" rx="10" fill="#eef4ff" stroke="#3b62d6" stroke-width="1.5"/>
+  <text x="100" y="42" text-anchor="middle" font-weight="bold" fill="#1c2330">Browser</text>
+  <rect x="24" y="56" width="152" height="46" rx="6" fill="#fff" stroke="#3b62d6"/>
+  <text x="100" y="74" text-anchor="middle" fill="#1c2330">SSR HTML</text>
+  <text x="100" y="90" text-anchor="middle" fill="#66707f" font-size="10">то же view-дерево</text>
+  <rect x="24" y="114" width="152" height="46" rx="6" fill="#fff" stroke="#3b62d6"/>
+  <text x="100" y="132" text-anchor="middle" fill="#1c2330">client.js</text>
+  <text x="100" y="148" text-anchor="middle" fill="#66707f" font-size="10">create/remove/move/</text>
+  <text x="100" y="160" text-anchor="middle" fill="#66707f" font-size="10">text/attr/when</text>
+  <rect x="24" y="172" width="152" height="40" rx="6" fill="#fff" stroke="#3b62d6"/>
+  <text x="100" y="190" text-anchor="middle" fill="#1c2330">EventSource</text>
+  <text x="100" y="204" text-anchor="middle" fill="#66707f" font-size="10">GET /events (SSE)</text>
+  <rect x="24" y="224" width="152" height="32" rx="6" fill="#fff" stroke="#3b62d6"/>
+  <text x="100" y="244" text-anchor="middle" fill="#1c2330">POST /action</text>
+
+  <!-- server -->
+  <rect x="330" y="20" width="330" height="250" rx="10" fill="#f0fdf4" stroke="#1f8a4c" stroke-width="1.5"/>
+  <text x="495" y="42" text-anchor="middle" font-weight="bold" fill="#1c2330">zforest server (Zig)</text>
+  <rect x="344" y="54" width="302" height="34" rx="6" fill="#fff" stroke="#1f8a4c"/>
+  <text x="495" y="76" text-anchor="middle" fill="#1c2330">Session.dispatch — whitelist действий</text>
+  <rect x="344" y="96" width="302" height="34" rx="6" fill="#fff" stroke="#1f8a4c"/>
+  <text x="495" y="118" text-anchor="middle" fill="#1c2330">zefx: event → reducers → derived settle → watchers</text>
+  <rect x="344" y="138" width="302" height="34" rx="6" fill="#fff" stroke="#1f8a4c"/>
+  <text x="495" y="160" text-anchor="middle" fill="#1c2330">after-flush: buildView → forest.diff → PatchLog</text>
+  <rect x="344" y="180" width="302" height="34" rx="6" fill="#fff" stroke="#1f8a4c"/>
+  <text x="495" y="202" text-anchor="middle" fill="#1c2330">history ring (bounded) + revision</text>
+  <rect x="344" y="222" width="302" height="34" rx="6" fill="#fff" stroke="#1f8a4c"/>
+  <text x="495" y="244" text-anchor="middle" fill="#1c2330">model: stores / SQLite write-through</text>
+
+  <!-- arrows -->
+  <line x1="234" y1="240" x2="326" y2="240" stroke="#66707f" stroke-width="1.6" marker-end="url(#a)"/>
+  <text x="280" y="232" text-anchor="middle" fill="#66707f" font-size="10">action</text>
+  <line x1="700" y1="240" x2="800" y2="240" stroke="#66707f" stroke-width="1.6" marker-end="url(#a)"/>
+  <text x="750" y="232" text-anchor="middle" fill="#66707f" font-size="10">ops</text>
+
+  <!-- third column: same tree -->
+  <rect x="810" y="56" width="180" height="60" rx="8" fill="#fff7ed" stroke="#b45309"/>
+  <text x="900" y="80" text-anchor="middle" font-weight="bold" fill="#1c2330">одно view-дерево</text>
+  <text x="900" y="98" text-anchor="middle" fill="#66707f" font-size="10">SSR · diff · snapshot</text>
+  <line x1="646" y1="155" x2="806" y2="96" stroke="#b45309" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#a)"/>
+  <text x="726" y="118" text-anchor="middle" fill="#b45309" font-size="10">buildView</text>
+</svg>
+<ul>
+  <li><b>Состояние — на сервере:</b> zefx-граф (события, сторы, derived) + модель приложения. У сессии свой граф и свой <code>Dom</code>-трекинг.</li>
+  <li><b>Три представления из одного дерева:</b> SSR-страница, инкрементальный diff и SSE-снапшот строятся из одного <code>buildView</code> — рассинхрон невозможен по построению.</li>
+  <li><b>Транспорт асимметричный:</b> клиент→сервер — обычный <code>POST /action</code> (ACK <code>{rev}</code>), сервер→клиент — SSE-поток <code>patch</code>-батчей. Никакого WebSocket.</li>
+  <li><b>Fine-grained:</b> патчи — атомарные DOM-опы (<code>text</code>/<code>attr</code>/<code>when</code>/<code>create</code>/<code>move</code>), а в zmon bound-листья подписаны на сторы напрямую — обновление без rebuild дерева.</li>
+  <li><b>Кросс-таб fan-out:</b> zboard бампает <code>global_seq</code>, каждая SSE-сессия поллит и догоняет патчами — как PubSub, но поверх той же patch-машины.</li>
+</ul>
+</div>
+
+<h2>2. Как работают остальные</h2>
+
+<div class="card">
+<h3>Phoenix LiveView<span class="tag">Elixir</span></h3>
+<svg viewBox="0 0 1000 150" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,Menlo,monospace" font-size="11">
+  <defs><marker id="b" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#66707f"/></marker></defs>
+  <rect x="10" y="30" width="200" height="90" rx="10" fill="#eef4ff" stroke="#3b62d6" stroke-width="1.5"/>
+  <text x="110" y="52" text-anchor="middle" font-weight="bold">Browser</text>
+  <text x="110" y="72" text-anchor="middle" fill="#66707f" font-size="10">phx socket + morphdom</text>
+  <text x="110" y="88" text-anchor="middle" fill="#66707f" font-size="10">apply HTML diff</text>
+  <rect x="330" y="30" width="330" height="90" rx="10" fill="#f0fdf4" stroke="#1f8a4c" stroke-width="1.5"/>
+  <text x="495" y="52" text-anchor="middle" font-weight="bold">LiveView process</text>
+  <text x="495" y="72" text-anchor="middle" fill="#66707f" font-size="10">handle_event → assigns → render HEEx</text>
+  <text x="495" y="90" text-anchor="middle" fill="#66707f" font-size="10">template diff → HTML patch</text>
+  <rect x="760" y="30" width="230" height="90" rx="10" fill="#fff" stroke="#66707f"/>
+  <text x="875" y="52" text-anchor="middle" font-weight="bold">Postgres / PubSub</text>
+  <text x="875" y="72" text-anchor="middle" fill="#66707f" font-size="10">опционально: broadcast</text>
+  <text x="875" y="90" text-anchor="middle" fill="#66707f" font-size="10">через PubSub в процессы</text>
+  <line x1="214" y1="75" x2="326" y2="75" stroke="#66707f" stroke-width="1.6" marker-end="url(#b)"/>
+  <text x="270" y="66" text-anchor="middle" fill="#66707f" font-size="10">WS ⇄</text>
+  <line x1="664" y1="75" x2="756" y2="75" stroke="#66707f" stroke-width="1.6" marker-end="url(#b)"/>
+</svg>
+<ul>
+  <li>Состояние — <code>assigns</code> (плоская map) в процессе LiveView; <b>реактивного графа нет</b> — любой event → полный re-render шаблона → diff HEEx-фингерпринтов → HTML-патч.</li>
+  <li>Один WebSocket bidirectional: события и патчи в обе стороны. Клиент — «тупой» рендерер + morphdom.</li>
+  <li>Кросс-клиент — через PubSub вручную (вещание assigns всем процессам), не из коробки.</li>
+</ul>
+</div>
+
+<div class="card">
+<h3>htmx<span class="tag">HTML over HTTP</span></h3>
+<svg viewBox="0 0 1000 130" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,Menlo,monospace" font-size="11">
+  <defs><marker id="c" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#66707f"/></marker></defs>
+  <rect x="60" y="30" width="220" height="80" rx="10" fill="#eef4ff" stroke="#3b62d6" stroke-width="1.5"/>
+  <text x="170" y="62" text-anchor="middle" font-weight="bold">Browser</text>
+  <text x="170" y="82" text-anchor="middle" fill="#66707f" font-size="10">hx-get/post → swap</text>
+  <rect x="560" y="30" width="220" height="80" rx="10" fill="#f0fdf4" stroke="#1f8a4c" stroke-width="1.5"/>
+  <text x="670" y="62" text-anchor="middle" font-weight="bold">Any backend</text>
+  <text x="670" y="82" text-anchor="middle" fill="#66707f" font-size="10">HTML fragment</text>
+  <line x1="284" y1="62" x2="556" y2="62" stroke="#66707f" stroke-width="1.6" marker-end="url(#c)"/>
+  <text x="420" y="52" text-anchor="middle" fill="#66707f" font-size="10">HTTP (нет соединения)</text>
+  <line x1="556" y1="80" x2="288" y2="80" stroke="#66707f" stroke-width="1.6" marker-end="url(#c)"/>
+  <text x="420" y="98" text-anchor="middle" fill="#66707f" font-size="10">fragment</text>
+  <rect x="830" y="30" width="160" height="80" rx="10" fill="#fff" stroke="#66707f" stroke-dasharray="4 3"/>
+  <text x="910" y="62" text-anchor="middle" font-weight="bold" fill="#66707f">Server state</text>
+  <text x="910" y="82" text-anchor="middle" fill="#66707f" font-size="10">нет / cookie</text>
+</svg>
+<ul>
+  <li>Чистый hypermedia: атрибуты <code>hx-*</code> на обычных элементах, сервер отдаёт <b>HTML-фрагмент</b>, htmx меняет DOM через swap.</li>
+  <li>Нет персистентного соединения и нет серверного состояния UI — каждый запрос stateless. Обновления только по действию пользователя.</li>
+  <li>14 КБ JS, ноль фреймворка — но и ноль реактивности: нет derived-состояния, нет автовещания, нет fine-grained патчей.</li>
+</ul>
+</div>
+
+<div class="card">
+<h3>Hotwire / Turbo<span class="tag">Rails 7+</span> + Stimulus</h3>
+<svg viewBox="0 0 1000 160" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,Menlo,monospace" font-size="11">
+  <defs><marker id="d" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#66707f"/></marker></defs>
+  <rect x="30" y="30" width="180" height="100" rx="10" fill="#eef4ff" stroke="#3b62d6" stroke-width="1.5"/>
+  <text x="120" y="60" text-anchor="middle" font-weight="bold">Browser</text>
+  <text x="120" y="80" text-anchor="middle" fill="#66707f" font-size="10">Turbo Drive/Frames</text>
+  <text x="120" y="96" text-anchor="middle" fill="#66707f" font-size="10">Stimulus controllers</text>
+  <rect x="340" y="20" width="300" height="55" rx="8" fill="#fff" stroke="#66707f"/>
+  <text x="490" y="42" text-anchor="middle" font-weight="bold">Turbo Drive</text>
+  <text x="490" y="58" text-anchor="middle" fill="#66707f" font-size="10">fetch страницы → replace/morph body</text>
+  <rect x="340" y="85" width="300" height="55" rx="8" fill="#fff" stroke="#66707f"/>
+  <text x="490" y="107" text-anchor="middle" font-weight="bold">Turbo Streams</text>
+  <text x="490" y="123" text-anchor="middle" fill="#66707f" font-size="10">SSE/WS → broadcast HTML-фрагменты</text>
+  <rect x="750" y="30" width="220" height="100" rx="10" fill="#f0fdf4" stroke="#1f8a4c" stroke-width="1.5"/>
+  <text x="860" y="60" text-anchor="middle" font-weight="bold">Rails app</text>
+  <text x="860" y="80" text-anchor="middle" fill="#66707f" font-size="10">HTML + Turbo Stream tags</text>
+  <text x="860" y="98" text-anchor="middle" fill="#66707f" font-size="10">(&lt;turbo-stream action=…&gt;)</text>
+  <line x1="214" y1="60" x2="336" y2="47" stroke="#66707f" stroke-width="1.4" marker-end="url(#d)"/>
+  <line x1="214" y1="95" x2="336" y2="112" stroke="#66707f" stroke-width="1.4" marker-end="url(#d)"/>
+  <line x1="644" y1="47" x2="746" y2="70" stroke="#66707f" stroke-width="1.4" marker-end="url(#d)"/>
+  <line x1="644" y1="112" x2="746" y2="95" stroke="#66707f" stroke-width="1.4" marker-end="url(#d)"/>
+</svg>
+<ul>
+  <li>SPA-навигация без JS-фреймворка: перехват ссылок/форм → fetch → подмена <code>&lt;body&gt;</code> или morph; Frames — точечная замена регионов.</li>
+  <li><b>Turbo Streams</b> — ближайший аналог нашего SSE: сервер вещает HTML-фрагменты (<code>append</code>/<code>replace</code>/<code>remove</code>) по SSE/WS. Но фрагмент — императивная команда, а не diff от состояния: сервер должен сам решить, ЧТО прислать.</li>
+  <li>Stimulus — императивные JS-контроллеры для поведения; состояние по-прежнему в DOM/сессии, реактивного ядра нет.</li>
+</ul>
+</div>
+
+<div class="card">
+<h3>Laravel Livewire<span class="tag">PHP</span> (+ Reverb для WS)</h3>
+<svg viewBox="0 0 1000 150" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,Menlo,monospace" font-size="11">
+  <defs><marker id="e" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#66707f"/></marker></defs>
+  <rect x="10" y="30" width="200" height="90" rx="10" fill="#eef4ff" stroke="#3b62d6" stroke-width="1.5"/>
+  <text x="110" y="60" text-anchor="middle" font-weight="bold">Browser</text>
+  <text x="110" y="80" text-anchor="middle" fill="#66707f" font-size="10">wire:click/model →</text>
+  <text x="110" y="96" text-anchor="middle" fill="#66707f" font-size="10">morphdom patch</text>
+  <rect x="330" y="30" width="330" height="90" rx="10" fill="#f0fdf4" stroke="#1f8a4c" stroke-width="1.5"/>
+  <text x="495" y="52" text-anchor="middle" font-weight="bold">Livewire component (server)</text>
+  <text x="495" y="72" text-anchor="middle" fill="#66707f" font-size="10">public props = state → re-render Blade</text>
+  <text x="495" y="90" text-anchor="middle" fill="#66707f" font-size="10">HTML diff → effects JSON</text>
+  <rect x="760" y="30" width="230" height="90" rx="10" fill="#fff" stroke="#66707f"/>
+  <text x="875" y="52" text-anchor="middle" font-weight="bold">Laravel / DB</text>
+  <text x="875" y="72" text-anchor="middle" fill="#66707f" font-size="10">Eloquent, events,</text>
+  <text x="875" y="90" text-anchor="middle" fill="#66707f" font-size="10">Reverb WS (опц.)</text>
+  <line x1="214" y1="75" x2="326" y2="75" stroke="#66707f" stroke-width="1.6" marker-end="url(e)"/>
+  <line x1="664" y1="75" x2="756" y2="75" stroke="#66707f" stroke-width="1.6" marker-end="url(e)"/>
+</svg>
+<ul>
+  <li>Концептуальный близнец LiveView: состояние компонента на сервере (public properties), клиент шлёт «действие» → сервер ре-рендерит Blade → <b>HTML-diff (morphdom)</b> → клиент патчит DOM.</li>
+  <li>Транспорт: AJAX (классика) или WebSocket через Laravel Reverb; синхронизация по checksum/snapshot.</li>
+  <li>«Реактивность» — computed getters, вычисляемые лениво при рендере. Графа зависимостей, settle-loop и derived-кэша нет — каждый render пересчитывает всё, что шаблон запросил.</li>
+</ul>
+</div>
+
+<h2>3. Сравнительная таблица</h2>
+<table>
+  <tr><th>Ось</th><th class="zf">zforest</th><th>Phoenix LiveView</th><th>htmx</th><th>Hotwire/Turbo</th><th>Laravel Livewire</th></tr>
+  <tr><td>Где состояние</td><td class="zf">Сервер: zefx-граф + модель</td><td>Сервер: assigns в процессе</td><td>Клиент: DOM + cookie-сессия</td><td>Клиент: DOM + сессия</td><td>Сервер: props компонента</td></tr>
+  <tr><td>Транспорт</td><td class="zf">POST /action + SSE /events</td><td>WebSocket (bidirectional)</td><td>HTTP request/response</td><td>HTTP + SSE/WS streams</td><td>AJAX или WS (Reverb)</td></tr>
+  <tr><td>Что шлётся клиенту</td><td class="zf">Fine-grained DOM-опы (text/attr/when/move)</td><td>HTML-фрагмент diff</td><td>HTML-фрагмент целиком</td><td>HTML-фрагменты / morph body</td><td>HTML diff (morphdom)</td></tr>
+  <tr><td>Единица обновления</td><td class="zf">Лист дерева / ветка when</td><td>Весь шаблон → минимальный HTML diff</td><td>Swap по hx-swap</td><td>Frame/body/stream target</td><td>Весь компонент → morph</td></tr>
+  <tr><td>Реактивное ядро</td><td class="zf">Да: events/stores/derived/settle</td><td>Нет — явный re-render</td><td>Нет</td><td>Нет</td><td>Частично: computed getters</td></tr>
+  <tr><td>Кросс-таб / fan-out</td><td class="zf">Из коробки: global_seq → патчи всем сессиям</td><td>Через PubSub вручную</td><td>Нет (кроме SSE-ext)</td><td>Turbo Streams broadcast</td><td>Events/broadcast вручную</td></tr>
+  <tr><td>Клиентский JS</td><td class="zf">~200 строк generic patcher</td><td>~1 МБ (JS + hooks + DOMPatch)</td><td>~14 КБ</td><td>~50 КБ + Stimulus</td><td>~сотни КБ</td></tr>
+  <tr><td>Reconnect</td><td class="zf">Snapshot ops + replay history</td><td>Переподключение канала, re-render</td><td>Н/п (stateless)</td><td>Переподписка streams</td><td>Checksum → refresh</td></tr>
+  <tr><td>Серверный рендер</td><td class="zf">Да: то же дерево → HTML</td><td>Да: HEEx → HTML</td><td>Да: фрагменты</td><td>Да: страницы/фрагменты</td><td>Да: Blade → HTML</td></tr>
+</table>
+
+<h2>4. Чем zforest отличается по сути</h2>
+<div class="note">
+<b>Все шесть систем делят одну идею:</b> состояние и «что показывать» — на сервере,
+клиент — тонкий рендерер. Разница — в <b>единице обновления</b> и в наличии
+<b>реактивного ядра</b>.
+</div>
+<ul>
+  <li><b>vs LiveView / Livewire:</b> они шлют <i>HTML-diff</i> — сервер рендерит шаблон и сравнивает разметку. Мы шлём <i>DOM-опы</i>, вычисленные из декларативного дерева: гранулярность ниже (отдельный <code>text</code>-оп на лист, <code>when</code>-оп на ветку), а в live-режиме (zmon) дерево вообще не пересобирается — лист сам подписан на стор.</li>
+  <li><b>vs htmx:</b> htmx — чистый hypermedia без состояния; у нас полное серверное состояние + реактивность + автовещание, но ценой обязательного кастомного клиента (~200 строк, не фреймворк).</li>
+  <li><b>vs Turbo Streams:</b> streams — это императивные HTML-фрагменты («вставь это»), сервер сам решает что слать. У нас патчи — <i>производная от состояния</i>: что бы ни изменилось в графе, diff сам вычислит минимальный набор опов. Не нужно писать «что послать» — только менять сторы.</li>
+  <li><b>Реактивное ядро (zefx):</b> единственная система из шести с графом событий/сторов/derived и settle-loop. LiveView/Livewire пересчитывают всё при render; у нас derived-сторы кэшируются и уведомляют только зависимые листья.</li>
+  <li><b>Плата за это:</b> кастомный протокол (ops вместо HTML), кастомный клиент, и сервер держит per-session DOM-состояние. LiveView/Livewire проще концептуально, htmx — радикально проще, но никто не даёт fine-grained реактивности «из коробки» на сервере.</li>
+</ul>
+
+<h2>5. Где мы на карте «зрелости»</h2>
+<pre>
+stateless hypermedia          server-driven UI              fine-grained client frameworks
+(htmx)                        (LiveView, Livewire, zforest)  (Solid, Svelte, React+fine libs)
+     │                              │                                │
+     └── нет состояния UI            └── состояние на сервере,        └── состояние на клиенте,
+         и нет реактивности              тонкий клиент                  локальная реактивность
+                                        │
+                                        └── zforest: + реактивный граф,
+                                            + DOM-опы вместо HTML-diff,
+                                            + live bindings (zmon)
+</pre>
+<p class="sub">Итого: zforest — это LiveView/Livewire-подход, но с реактивным ядром
+и более низкой гранулярностью обновлений, без WebSocket и без клиентского фреймворка.</p>
+
+</div>
+</body>
+</html>
