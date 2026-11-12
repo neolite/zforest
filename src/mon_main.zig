@@ -10,11 +10,13 @@ fn bindIp(arg: ?[]const u8) std.Io.net.Ip4Address {
     return std.Io.net.Ip4Address.parse(s, 0) catch .loopback(0);
 }
 
-/// Synthetic traffic generator: every 500 ms rotate the stats window and
-/// record a burst of fake requests so every open dashboard moves.
+/// Synthetic traffic generator: every 100 ms rotate the stats window and
+/// record a burst of fake requests so every open dashboard moves. The
+/// SSE workers poll `global_seq` every 50 ms, so ~10 refreshes/sec is
+/// the per-session ceiling — the ticker runs at half that rate.
 fn ticker(model: *mon_model.MonModel, io: std.Io) void {
     while (true) {
-        std.Io.sleep(io, .fromMilliseconds(500), .awake) catch return;
+        std.Io.sleep(io, .fromMilliseconds(100), .awake) catch return;
         model.tick();
     }
 }

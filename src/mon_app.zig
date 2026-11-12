@@ -46,6 +46,8 @@ pub const Session = struct {
     st_total_s: *zefx.Store([]const u8) = undefined,
     st_up_s: *zefx.Store([]const u8) = undefined,
     st_feed: *zefx.Store([]const u8) = undefined,
+    /// Firehose log text — one leaf, rewritten whole each refresh.
+    st_log: *zefx.Store([]const u8) = undefined,
     /// Error rate in basis points (0..10000) — feeds `computed` bindings.
     st_err_bp: *zefx.Store(u64) = undefined,
     /// Derived health flags — drive the `variant` status pills.
@@ -135,11 +137,13 @@ pub const Session = struct {
         self.io.random(&rb);
         const roll = std.mem.readInt(u32, rb[0..4], .little);
         if (std.mem.eql(u8, action, "inject_ok")) {
-            m().record(true, 6.0 + @as(f64, @floatFromInt(roll % 30)));
+            m().record(.{ .ok = true, .lat_ms = 6.0 + @as(f64, @floatFromInt(roll % 30)), .method = "POST", .path = "/inject/ok", .status = 200 });
         } else if (std.mem.eql(u8, action, "inject_err")) {
-            m().record(false, 250.0 + @as(f64, @floatFromInt(roll % 500)));
+            m().record(.{ .ok = false, .lat_ms = 250.0 + @as(f64, @floatFromInt(roll % 500)), .method = "POST", .path = "/inject/err", .status = 500 });
         } else if (std.mem.eql(u8, action, "inject_slow")) {
-            m().record(true, 700.0 + @as(f64, @floatFromInt(roll % 400)));
+            m().record(.{ .ok = true, .lat_ms = 700.0 + @as(f64, @floatFromInt(roll % 400)), .method = "POST", .path = "/inject/slow", .status = 200 });
+        } else if (std.mem.eql(u8, action, "inject_storm")) {
+            m().storm(400);
         } else {
             return error.InvalidAction;
         }
@@ -193,6 +197,8 @@ pub const Session = struct {
         const s = m().snapshot();
         const feed = m().feed(a.alloc(u8, 1400) catch a.alloc(u8, 0) catch return);
         self.st_feed.set(feed);
+        const log = m().logText(a.alloc(u8, 24576) catch a.alloc(u8, 0) catch return);
+        self.st_log.set(log);
         self.st_err_bp.set(@as(u64, @intFromFloat(@round(s.err_pct * 100))));
         self.st_rps_s.set(std.fmt.allocPrint(a, "{d}", .{@as(u64, @intFromFloat(@round(s.rps)))}) catch "");
         self.st_lat_s.set(std.fmt.allocPrint(a, "{d}", .{@as(u64, @intFromFloat(@round(s.avg_lat_ms)))}) catch "");
@@ -290,10 +296,15 @@ fn buildView(a: std.mem.Allocator, s: *Session) []const forest.Node {
             card(a, "mon-status", "status", forest.computed(s.st_err_bp, statusText)),
         }),
         forest.el(a, .div, .{ .id = "feed", .class = "feed", .text = s.st_feed }, .{}),
+        forest.el(a, .div, .{ .class = "mon-logwrap" }, .{
+            forest.el(a, .div, .{ .class = "clabel" }, "request log"),
+            forest.el(a, .div, .{ .id = "mon-log", .class = "mon-log", .text = s.st_log }, .{}),
+        }),
         forest.el(a, .div, .{ .class = "mon-actions" }, .{
             btn(a, "inject_ok", "ok req"),
             btn(a, "inject_err", "err req"),
             btn(a, "inject_slow", "slow req"),
+            btn(a, "inject_storm", "storm ×400"),
         }),
     });
     return nodes;
@@ -321,6 +332,7 @@ pub fn createSession(gpa: std.mem.Allocator, io: std.Io) *Session {
     s.st_total_s = s.app.createStore([]const u8, "");
     s.st_up_s = s.app.createStore([]const u8, "");
     s.st_feed = s.app.createStore([]const u8, "");
+    s.st_log = s.app.createStore([]const u8, "");
     s.st_err_bp = s.app.createStore(u64, 0);
     s.st_ok = s.st_err_bp.map(bool, isOk);
     s.st_bad = s.st_err_bp.map(bool, isBad);

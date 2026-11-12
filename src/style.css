@@ -224,6 +224,15 @@ footer { margin-top: .9rem; color: var(--muted); font-size: .85rem; }
   background: var(--panel); border: 1px solid var(--line); border-radius: .6rem;
   font: .8rem/1.45 ui-monospace, Menlo, monospace; white-space: pre-wrap;
 }
+.mon-logwrap { display: flex; flex-direction: column; gap: .3rem; }
+.mon-log {
+  margin: 0; padding: .6rem .8rem; max-height: 22rem; overflow: auto;
+  background: #10131a; border: 1px solid var(--line); border-radius: .6rem;
+  font: .72rem/1.5 ui-monospace, Menlo, monospace; white-space: pre-wrap;
+  color: #9fb4d8;
+}
+.mon-log::-webkit-scrollbar { width: .5rem; }
+.mon-log::-webkit-scrollbar-thumb { background: var(--line); border-radius: .25rem; }
 .mon-actions { display: flex; gap: .5rem; }
 .btn {
   font: 600 .85rem/1 inherit; padding: .5rem .9rem; border-radius: .5rem;

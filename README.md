@@ -8,10 +8,10 @@ vanilla JS patch client. Three apps share the transport:
 - **`zboard`** — an anonymous message board (static boards, threads,
   nested tree comments) over a shared SQLite-backed model.
 - **`zmon`** — a live ops dashboard (mock request stream, windowed
-  rps/error/latency stats, inject buttons) on **fine-grained live
-  bindings**: the view tree is built once per session and every bound
-  leaf subscribes to its store, so updates emit patch ops with no
-  rebuild+diff (`forest.bindTree`).
+  rps/error/latency stats, 384-line request-log firehose, inject +
+  storm buttons) on **fine-grained live bindings**: the view tree is
+  built once per session and every bound leaf subscribes to its store,
+  so updates emit patch ops with no rebuild+diff (`forest.bindTree`).
 
 <p align="center">
   <img src="docs/architecture.svg" alt="zforest architecture" width="900">
