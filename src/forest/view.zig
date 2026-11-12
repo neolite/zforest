@@ -471,7 +471,7 @@ fn presenceOf(comptime T: type) bool {
 
 /// DOM event types allowed in `.on` — anything else is almost certainly
 /// a typo that would produce a dead listener, so it fails at comptime.
-const dom_events = .{ "click", "change", "input", "submit", "keydown" };
+const dom_events = .{ "click", "dblclick", "change", "input", "submit", "keydown" };
 
 fn assertDomEvent(comptime ev: [:0]const u8) void {
     inline for (dom_events) |allowed| {

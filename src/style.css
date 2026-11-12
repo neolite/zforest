@@ -81,6 +81,22 @@ button:hover { border-color: var(--accent); }
   padding: 0 .3rem;
 }
 .todo .del:hover { color: #c0392b; }
+.todo .title { cursor: default; }
+.todo.editing > input[type="checkbox"],
+.todo.editing > .del { display: none; }
+.edit-form { display: flex; flex: 1; gap: .4rem; }
+.edit-form input[name="text"] {
+  flex: 1;
+  min-width: 0;
+  padding: .4rem .6rem;
+  border: 1px solid var(--accent);
+  border-radius: .45rem;
+  background: var(--panel);
+  color: var(--ink);
+  font: inherit;
+}
+.edit-form button { padding: .3rem .6rem; font-size: .85rem; white-space: nowrap; }
+.edit-form .edit-cancel { border: none; background: none; color: var(--muted); }
 footer { margin-top: .9rem; color: var(--muted); font-size: .85rem; }
 #empty-msg { color: var(--muted); font-size: .9rem; margin: 0 0 .75rem; }
 #error {

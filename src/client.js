@@ -254,6 +254,12 @@
     send(el.getAttribute("data-on-click"), { arg: el.getAttribute("data-arg") }).catch(fail);
   });
 
+  document.addEventListener("dblclick", function (ev) {
+    var el = ev.target.closest("[data-on-dblclick]");
+    if (!el) return;
+    send(el.getAttribute("data-on-dblclick"), { arg: el.getAttribute("data-arg") }).catch(fail);
+  });
+
   document.addEventListener("change", function (ev) {
     var el = ev.target.closest("[data-on-change]");
     if (!el) return;

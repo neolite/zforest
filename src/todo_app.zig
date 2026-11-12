@@ -26,12 +26,23 @@ pub const Filter = enum {
 
 pub const Todo = struct { id: u32, title: []u8, done: bool };
 
+/// Sparse per-item UI state: an entry exists only while the todo is in
+/// an interactive mode (inline editing). Presence in `ui_state` IS the
+/// mode flag — a missing key means all defaults, so idle rows cost zero
+/// allocations. `draft` owns its bytes and is freed with the entry.
+const ItemUi = struct {
+    draft: []u8,
+};
+
 const Mutation = union(enum) {
     add: []const u8,
     toggle: u32,
     set_checked: struct { id: u32, done: bool },
     delete: u32,
     filter: Filter,
+    edit_start: u32,
+    edit_save: struct { id: u32, text: []const u8 },
+    edit_cancel: u32,
 };
 
 pub const max_title_len = 500;
@@ -59,6 +70,8 @@ pub const Session = struct {
     todos: std.ArrayListUnmanaged(Todo) = .empty,
     next_id: u32 = 1,
     filter: Filter = .all,
+    /// Sparse per-item UI state keyed by todo id (see ItemUi).
+    ui_state: std.AutoHashMapUnmanaged(u32, ItemUi) = .empty,
 
     mutate: *zefx.Event(Mutation),
     seq: *zefx.Store(u64),
@@ -87,6 +100,9 @@ pub const Session = struct {
         if (self.csrf_token.len != 0) self.gpa.free(self.csrf_token);
         for (self.todos.items) |t| self.gpa.free(t.title);
         self.todos.deinit(self.gpa);
+        var uiit = self.ui_state.valueIterator();
+        while (uiit.next()) |ui| self.gpa.free(ui.draft);
+        self.ui_state.deinit(self.gpa);
         self.dom.deinit();
         self.log.deinit();
         self.history.deinit();
@@ -133,6 +149,17 @@ pub const Session = struct {
             if (t.id == id) return i;
         }
         return null;
+    }
+
+    /// The item's UI entry, or null when idle — presence means editing.
+    fn uiEntry(self: *Session, id: u32) ?*ItemUi {
+        return self.ui_state.getPtr(id);
+    }
+
+    /// Drop a todo's sparse UI entry, freeing its draft. No-op for idle
+    /// items — the common case is a single hash lookup.
+    fn clearUi(self: *Session, id: u32) void {
+        if (self.ui_state.fetchRemove(id)) |kv| self.gpa.free(kv.value.draft);
     }
 
     fn visible(self: *Session, t: Todo) bool {
@@ -182,6 +209,31 @@ pub const Session = struct {
             const v = arg orelse return error.InvalidAction;
             const f = Filter.parse(v) orelse return error.InvalidAction;
             self.mutate.emit(.{ .filter = f });
+        } else if (std.mem.eql(u8, action, "edit")) {
+            const tid = try self.argId(arg);
+            self.mutate.emit(.{ .edit_start = tid });
+        } else if (std.mem.eql(u8, action, "edit_save")) {
+            const f = fields orelse return error.InvalidAction;
+            const idv = f.get("id") orelse return error.InvalidAction;
+            const id_raw = switch (idv) {
+                .string => |x| x,
+                else => return error.InvalidAction,
+            };
+            const tid = std.fmt.parseInt(u32, id_raw, 10) catch return error.InvalidAction;
+            if (self.findIdx(tid) == null) return error.TodoNotFound;
+            const tv = f.get("text") orelse return error.InvalidAction;
+            const raw = switch (tv) {
+                .string => |t| t,
+                else => return error.InvalidAction,
+            };
+            const text = std.mem.trim(u8, raw, " \t\r\n");
+            // Empty save deletes the todo (TodoMVC behaviour); non-empty
+            // text is length-checked like `add`.
+            if (text.len > max_title_len) return error.InvalidTitle;
+            self.mutate.emit(.{ .edit_save = .{ .id = tid, .text = text } });
+        } else if (std.mem.eql(u8, action, "edit_cancel")) {
+            const tid = try self.argId(arg);
+            self.mutate.emit(.{ .edit_cancel = tid });
         } else {
             return error.InvalidAction;
         }
@@ -273,6 +325,7 @@ pub const Session = struct {
                 self.todos.items[i].done = sc.done;
             },
             .delete => |id| {
+                self.clearUi(id);
                 const i = self.findIdx(id).?;
                 self.gpa.free(self.todos.items[i].title);
                 _ = self.todos.orderedRemove(i);
@@ -280,6 +333,29 @@ pub const Session = struct {
             .filter => |f| {
                 self.filter = f;
             },
+            .edit_start => |id| {
+                const i = self.findIdx(id).?;
+                if (self.ui_state.contains(id)) return;
+                const draft = self.gpa.dupe(u8, self.todos.items[i].title) catch @panic("OOM");
+                self.ui_state.put(self.gpa, id, .{ .draft = draft }) catch {
+                    self.gpa.free(draft);
+                    @panic("OOM");
+                };
+            },
+            .edit_save => |es| {
+                self.clearUi(es.id);
+                const i = self.findIdx(es.id) orelse return;
+                const text = std.mem.trim(u8, es.text, " \t\r\n");
+                if (text.len == 0) {
+                    self.gpa.free(self.todos.items[i].title);
+                    _ = self.todos.orderedRemove(i);
+                    return;
+                }
+                const owned = self.gpa.dupe(u8, text) catch @panic("OOM");
+                self.gpa.free(self.todos.items[i].title);
+                self.todos.items[i].title = owned;
+            },
+            .edit_cancel => |id| self.clearUi(id),
         }
         self.bumpSeq();
     }
@@ -387,10 +463,49 @@ fn footerView(a: std.mem.Allocator, s: *Session) forest.Node {
     }));
 }
 
-fn buildRow(a: std.mem.Allocator, t: Todo) forest.Node {
+/// Idle row branch: the title, which enters edit mode on double-click.
+fn viewBranch(a: std.mem.Allocator, t: Todo) forest.Node {
+    return forest.el(a, .span, .{
+        .class = "title",
+        .on = .{ .dblclick = "edit" },
+        .arg = t.id,
+    }, t.title);
+}
+
+/// Editing row branch: an inline form swapped in through the `row-N/we`
+/// anchor. The hidden `id` input carries the todo id — form submits
+/// serialize named fields only, never `data-arg`.
+fn editBranch(a: std.mem.Allocator, t: Todo, draft: []const u8) forest.Node {
+    return forest.el(a, .form, .{
+        .class = "edit-form",
+        .autocomplete = "off",
+        .on = .{ .submit = "edit_save" },
+    }, .{
+        forest.el(a, .input, .{ .type = "hidden", .name = "id", .value = t.id }, .{}),
+        forest.el(a, .input, .{
+            .name = "text",
+            .value = draft,
+            .maxlength = max_title_len,
+            .autofocus = true,
+        }, .{}),
+        forest.el(a, .button, .{ .type = "submit" }, "Save"),
+        forest.el(a, .button, .{
+            .type = "button",
+            .class = "edit-cancel",
+            .on = .{ .click = "edit_cancel" },
+            .arg = t.id,
+        }, "×"),
+    });
+}
+
+fn buildRow(a: std.mem.Allocator, s: *Session, t: Todo) forest.Node {
+    const ui = s.uiEntry(t.id);
     return forest.el(a, .li, .{
         .id = std.fmt.allocPrint(a, "row-{d}", .{t.id}) catch @panic("OOM"),
-        .class = if (t.done) "todo done" else "todo",
+        .class = std.fmt.allocPrint(a, "{s}{s}", .{
+            if (t.done) "todo done" else "todo",
+            if (ui != null) " editing" else "",
+        }) catch @panic("OOM"),
     }, .{
         forest.el(a, .input, .{
             .lid = "cb",
@@ -399,7 +514,9 @@ fn buildRow(a: std.mem.Allocator, t: Todo) forest.Node {
             .on = .{ .change = "set_checked" },
             .arg = t.id,
         }, .{}),
-        forest.el(a, .span, .{ .class = "title" }, t.title),
+        // One `when` op swaps the whole title/form branch; inside a
+        // branch the diff recurses into bound descendants as usual.
+        forest.variant(a, .{ .lid = "we" }, if (ui != null) "edit" else "view", if (ui) |u| editBranch(a, t, u.draft) else viewBranch(a, t)),
         forest.el(a, .button, .{
             .class = "del",
             .@"aria-label" = "delete",
@@ -413,7 +530,7 @@ fn buildRow(a: std.mem.Allocator, t: Todo) forest.Node {
 /// every survivor is an element carrying `.id`.
 fn rowOrNull(a: std.mem.Allocator, s: *Session, t: Todo) ?forest.Node {
     if (!s.visible(t)) return null;
-    return buildRow(a, t);
+    return buildRow(a, s, t);
 }
 
 /// The `<main>` inner content: static chrome (h1, form), the `w-empty` /
@@ -467,6 +584,14 @@ fn patchJson(s: *Session, alloc: std.mem.Allocator) []u8 {
 fn titleFields(alloc: std.mem.Allocator, title: []const u8) std.json.ObjectMap {
     var m: std.json.ObjectMap = .empty;
     m.put(alloc, "title", .{ .string = title }) catch @panic("OOM");
+    return m;
+}
+
+/// A form-fields map as POSTed by the edit form: hidden `id` + `text`.
+fn editFields(alloc: std.mem.Allocator, id: []const u8, text: []const u8) std.json.ObjectMap {
+    var m: std.json.ObjectMap = .empty;
+    m.put(alloc, "id", .{ .string = id }) catch @panic("OOM");
+    m.put(alloc, "text", .{ .string = text }) catch @panic("OOM");
     return m;
 }
 
@@ -580,6 +705,83 @@ test "action validation rejects bad input" {
 
     // nothing leaked into the model
     try std.testing.expectEqual(@as(usize, 0), s.todos.items.len);
+}
+
+test "inline edit swaps title for a form and back" {
+    const alloc = std.testing.allocator;
+    const s = createSession(alloc);
+    defer s.deinit();
+    s.seedDom();
+
+    var f1 = titleFields(alloc, "edit me");
+    defer f1.deinit(alloc);
+    try s.dispatch("add", null, null, &f1);
+    alloc.free(patchJson(s, alloc));
+
+    const id = s.todos.items[0].id;
+    var idbuf: [16]u8 = undefined;
+    const arg = std.fmt.bufPrint(&idbuf, "{d}", .{id}) catch unreachable;
+
+    // Enter edit mode: sparse entry appears, one when op mounts the form.
+    try s.dispatch("edit", arg, null, null);
+    const j1 = patchJson(s, alloc);
+    defer alloc.free(j1);
+    try std.testing.expect(s.ui_state.contains(id));
+    try std.testing.expect(std.mem.indexOf(u8, j1, "\"op\":\"when\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, j1, "edit-form") != null);
+    try std.testing.expect(std.mem.indexOf(u8, j1, "edit_save") != null);
+
+    // Save with new text: title updated, entry freed, branch swaps back.
+    var fields = editFields(alloc, arg, "edited title");
+    defer fields.deinit(alloc);
+    try s.dispatch("edit_save", null, null, &fields);
+    const j2 = patchJson(s, alloc);
+    defer alloc.free(j2);
+    try std.testing.expectEqualStrings("edited title", s.todos.items[0].title);
+    try std.testing.expect(!s.ui_state.contains(id));
+    try std.testing.expect(std.mem.indexOf(u8, j2, "\"op\":\"when\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, j2, "data-on-dblclick") != null);
+
+    // Re-enter, then cancel: entry gone, title branch restored.
+    try s.dispatch("edit", arg, null, null);
+    try std.testing.expect(s.ui_state.contains(id));
+    alloc.free(patchJson(s, alloc));
+    try s.dispatch("edit_cancel", arg, null, null);
+    const j3 = patchJson(s, alloc);
+    defer alloc.free(j3);
+    try std.testing.expect(!s.ui_state.contains(id));
+    try std.testing.expect(std.mem.indexOf(u8, j3, "\"op\":\"when\"") != null);
+
+    // Edit on unknown id is rejected like any other action.
+    try std.testing.expectError(error.TodoNotFound, s.dispatch("edit", "999", null, null));
+}
+
+test "empty edit save deletes the todo and cleans ui state" {
+    const alloc = std.testing.allocator;
+    const s = createSession(alloc);
+    defer s.deinit();
+    s.seedDom();
+
+    var f1 = titleFields(alloc, "doomed");
+    defer f1.deinit(alloc);
+    try s.dispatch("add", null, null, &f1);
+    alloc.free(patchJson(s, alloc));
+
+    const id = s.todos.items[0].id;
+    var idbuf: [16]u8 = undefined;
+    const arg = std.fmt.bufPrint(&idbuf, "{d}", .{id}) catch unreachable;
+    try s.dispatch("edit", arg, null, null);
+    alloc.free(patchJson(s, alloc));
+    try std.testing.expect(s.ui_state.contains(id));
+
+    var fields = editFields(alloc, arg, "   ");
+    defer fields.deinit(alloc);
+    try s.dispatch("edit_save", null, null, &fields);
+    const j = patchJson(s, alloc);
+    defer alloc.free(j);
+    try std.testing.expectEqual(@as(usize, 0), s.todos.items.len);
+    try std.testing.expectEqual(@as(usize, 0), s.ui_state.count());
+    try std.testing.expect(std.mem.indexOf(u8, j, "\"op\":\"remove\"") != null);
 }
 
 test "chrome mounts and unmounts through when anchors" {
