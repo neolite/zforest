@@ -113,3 +113,15 @@ open route-tabs holds N sessions. Cap is 32 (FIFO evict →
   durability/ACK/retry/shutdown semantics designed first.
 - Todo drag&drop reorder — model needs an order field; `move` patches
   already exist.
+
+## Where the reactive graph earns its keep (discussion)
+
+Direct render-on-mutate suffices for todo/board today; the zefx graph
+pays off for: optimistic actions with rollback (pending→confirmed/
+failed via events+effects), live dashboards with derived aggregates
+(only changed branches recompute), high-frequency streams
+(sample/throttle before render), complex multi-field forms
+(combine-derived validity), and future per-item reactive cells.
+Caveat: the win is at the model layer — the view is still rebuilt and
+diffed wholesale per flush; DOM-level granularity needs direct leaf
+bindings instead.
