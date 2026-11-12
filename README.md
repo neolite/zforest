@@ -8,6 +8,10 @@ vanilla JS patch client. Two apps share the transport:
 - **`zboard`** — an anonymous message board (static boards, threads,
   nested tree comments) over a shared SQLite-backed model.
 
+<p align="center">
+  <img src="docs/architecture.svg" alt="zforest architecture" width="900">
+</p>
+
 ## Run
 
 ```sh
@@ -52,10 +56,13 @@ restarts with posts/comments/users intact (`:memory:` is ephemeral).
 
 ## How it works
 
-1. `GET /` creates a per-browser-session model (random `zfxs` cookie,
-   `HttpOnly; SameSite=Strict`) and returns fully rendered HTML plus a
+1. `GET /` creates a per-browser-session model keyed by
+   `(cookie token, route)` (random `zfxb`/`zfxs` cookie,
+   `HttpOnly; SameSite=Strict`) — tabs of one browser on different routes
+   get independent views, and returns fully rendered HTML plus a
    per-session CSRF token in a `<meta>` tag.
-2. The client opens `GET /events` (Server-Sent Events, cookie auth) and
+2. The client opens `GET /events?r=<route>` (Server-Sent Events, cookie
+   auth) and
    waits for the first `event: snapshot` before enabling any
    `data-on-submit` controls. Each snapshot is `{"rev","ops"}` — the
    declarative view serialized as a full-state ops array
@@ -123,3 +130,23 @@ restarts with posts/comments/users intact (`:memory:` is ephemeral).
 - `zefx` core: two-phase flush (pure → effects) with generational
   subscription slots, `watchCtx`, cursor-drained queues, and after-flush
   hooks. See `src/zefx/root.zig` tests for semantics.
+
+## Roadmap
+
+Shipped: reactive core (`zefx`), declarative view + SSR + snapshot, SSE
+patch transport, keyed lists, `when` branches, delegated events, two
+apps (todo + SQLite board), route-keyed sessions, cross-tab fan-out.
+
+Next, roughly in order:
+
+- **Todo persistence** — SQLite per session so restarts/evictions stop
+  wiping lists (board already persists).
+- **Board moderation** — post/comment edit + delete, maybe tripcodes.
+- **Markdown** — server-side render for post/comment bodies.
+- **Todo polish** — drag&drop reorder (model needs an order field).
+- **Finer reactivity** — direct leaf bindings (store → Dom op, skipping
+  the tree diff) and per-item reactive cells; both deferred until
+  profiling justifies the lifecycle complexity (see
+  [ARCHITECTURE.md](ARCHITECTURE.md)).
+- **Deploy hardening** — process supervisor on the VM, SSE fallback
+  polling for hostile proxies.
