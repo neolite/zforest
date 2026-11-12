@@ -169,3 +169,24 @@ failed via events+effects), live dashboards with derived aggregates
 Caveat (updated): the win is now at BOTH layers — zmon's live bindings
 skip the rebuild+diff entirely for leaf updates; the diff path remains
 for structural changes and for apps that haven't opted into live mode.
+
+## Cross-project: server UI over a shared document (kulman probe)
+
+Prototype `kulman-gui/packages/kulman-bim-model/tools/bim-ui-stand.ts`
+(validated the pattern, not committed upstream): a standalone Node/tsx
+server holding one immutable `KulmanBimModel` + revision, synthetic
+domain mutations every ~900 ms (`section-group/update` transactions +
+patch-level renames), per-session cookie selection, and server-rendered
+HTML regions pushed over SSE. Client is ~60 lines: `innerHTML` swaps per
+region id — no framework, no WS, no client state.
+
+Mapping to our stack: `KulmanBimModel.revision` ≈ `model.seq`;
+`BimModelPatchTransaction` ≈ mutation event; region-HTML-over-SSE ≈
+Turbo-Streams-style fragments (coarser than our DOM ops — a real port
+would diff the view tree like `forest.diff` does). kulman-gui's real
+`bim-model-sync` WS gateway already does document sync with CAS +
+write-behind Postgres + presence; the missing piece it does NOT have is
+server-rendered UI — React owns all rendering there. If server-driven
+panels (properties/history/ops log) are ever wanted inside kulman, this
+stand shows the shape: subscribe `BimSyncCommittedListener`, keep a
+per-session view state, render regions, push on commit.
