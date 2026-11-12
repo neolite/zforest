@@ -71,6 +71,33 @@ marks the session caught up.
   bindings), lazy `htmlFor` + O(N) wanted-set in `syncKeyedList`,
   memcpy `resolvedId`, per-row shared id strings in both apps.
 
+## Session model: route-keyed (done)
+
+**Problem:** one browser = one session cookie, but tabs can sit on
+different routes (`/b/meta`, `/t/36`). A single session had ONE
+`route`/`dom`/`history`, so the last page load won and every tab
+received patches for that one view — the other tab's DOM lacked the
+target ids (`comments` missing on `/b/meta`) and silently never updated.
+
+**Fix:** sessions are keyed `(cookie token, route)` in
+`SessionStore.by_key` (`token\x01route`). Route arrives via
+`?r=<path>` on `GET /events` and `x-zforest-route` header on
+`POST /action`; page GETs key by the request path. The cookie token
+itself stays stable per browser (minted once). Each route-session has
+its own graph/dom/history/reply_to — which also fixed `reply_to`
+leaking across threads.
+
+**Cross-route fan-out unchanged:** the board `BoardModel` is shared;
+every route-session's `syncPull()` sees `global_seq` move and re-renders
+its OWN route's view, so a comment posted on `/t/36` still patches the
+counter on every `/b/*` tab. Verified: two SSE streams, same cookie,
+different `?r=` — thread stream got the `create` op, board stream got
+the counter `text` op.
+
+**Cost:** session cap counts (token, route) pairs — one browser with N
+open route-tabs holds N sessions. Cap is 32 (FIFO evict →
+`session_expired` → client reloads).
+
 ## Deferred / future
 
 - Per-item reactive cells — blocked on detachable graph lifecycle

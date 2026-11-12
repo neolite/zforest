@@ -191,7 +191,10 @@
     }
   }
 
-  var es = new EventSource("/events");
+  // Sessions are keyed (cookie token, route) server-side: the stream and
+  // every action must name this page's route so they hit the right view.
+  var route = location.pathname;
+  var es = new EventSource("/events?r=" + route);
   es.addEventListener("snapshot", function (ev) {
     var d;
     try {
@@ -239,6 +242,7 @@
         headers: {
           "content-type": "application/json",
           "x-zforest-csrf": csrfToken,
+          "x-zforest-route": route,
         },
         body: JSON.stringify(payload),
         credentials: "same-origin",

@@ -41,13 +41,19 @@ const sse_heartbeat_ticks = 200; // 200 * 50ms ≈ 10s
 /// Session registry. Demo cap: `max_sessions`, oldest session is evicted
 /// (documented teardown policy — no persistence, no timers needed).
 /// All access is serialized by `Server.mutex`.
+///
+/// Sessions are keyed by `(cookie token, route)` so that tabs of one
+/// browser on DIFFERENT routes (e.g. /b/meta and /t/36) get independent
+/// views — one shared view would patch the wrong DOM on the other tab.
+/// Cross-route fan-out still works through the shared model: each
+/// route-session's `syncPull` re-renders when `model.global_seq` moved.
 pub fn SessionStore(comptime Session: type) type {
     return struct {
         const Self = @This();
 
         gpa: std.mem.Allocator,
         io: std.Io,
-        by_token: std.StringHashMapUnmanaged(*Session) = .empty,
+        by_key: std.StringHashMapUnmanaged(*Session) = .empty,
         order: std.ArrayListUnmanaged([]u8) = .empty,
 
         pub fn init(gpa: std.mem.Allocator, io: std.Io) Self {
@@ -55,35 +61,53 @@ pub fn SessionStore(comptime Session: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            for (self.order.items) |tok| {
-                const s = self.by_token.get(tok).?;
+            for (self.order.items) |key| {
+                const s = self.by_key.get(key).?;
                 s.deinit();
-                self.gpa.free(tok);
+                self.gpa.free(key);
             }
             self.order.deinit(self.gpa);
-            self.by_token.deinit(self.gpa);
+            self.by_key.deinit(self.gpa);
         }
 
-        pub fn lookup(self: *Self, token: []const u8) ?*Session {
-            return self.by_token.get(token);
+        /// Lookup key for `(token, route)` into a caller-provided buffer.
+        pub fn keyInto(token: []const u8, route: []const u8, buf: []u8) []u8 {
+            const n = token.len + 1 + route.len;
+            if (buf.len < n) @panic("session key buf too small");
+            @memcpy(buf[0..token.len], token);
+            buf[token.len] = 0x01;
+            @memcpy(buf[token.len + 1 ..][0..route.len], route);
+            return buf[0..n];
         }
 
-        /// Create a session and return its fresh token (owned by the store).
-        pub fn create(self: *Self) []u8 {
+        pub fn lookup(self: *Self, token: []const u8, route: []const u8) ?*Session {
+            var buf: [320]u8 = undefined;
+            const key = keyInto(token, route, &buf);
+            return self.by_key.get(key);
+        }
+
+        /// Create a session for `(token, route)`; the store owns the key.
+        /// The token itself is NOT minted here — the caller passes the
+        /// browser's cookie token (or a freshly minted one).
+        pub fn create(self: *Self, token: []const u8, route: []const u8) *Session {
             if (self.order.items.len >= max_sessions) {
                 const oldest = self.order.orderedRemove(0);
-                const s = self.by_token.fetchRemove(oldest).?;
+                const s = self.by_key.fetchRemove(oldest).?;
                 s.value.deinit();
                 self.gpa.free(oldest);
             }
-            var rand_bytes: [16]u8 = undefined;
-            self.io.random(&rand_bytes);
-            const token = std.fmt.allocPrint(self.gpa, "{x:0>16}", .{std.mem.readInt(u64, rand_bytes[0..8], .little)}) catch @panic("OOM");
+            const n = token.len + 1 + route.len;
+            const key = self.gpa.alloc(u8, n) catch @panic("OOM");
+            @memcpy(key[0..token.len], token);
+            key[token.len] = 0x01;
+            @memcpy(key[token.len + 1 ..][0..route.len], route);
             const s = Session.create(self.gpa, self.io);
-            s.setCsrf(std.fmt.allocPrint(self.gpa, "{x:0>32}", .{std.mem.readInt(u128, &rand_bytes, .little)}) catch @panic("OOM"));
-            self.by_token.put(self.gpa, token, s) catch @panic("OOM");
-            self.order.append(self.gpa, token) catch @panic("OOM");
-            return token;
+            var rb: [16]u8 = undefined;
+            self.io.random(&rb);
+            s.setCsrf(std.fmt.allocPrint(self.gpa, "{x:0>32}", .{std.mem.readInt(u128, &rb, .little)}) catch @panic("OOM"));
+            self.by_key.put(self.gpa, key, s) catch @panic("OOM");
+            self.order.append(self.gpa, key) catch @panic("OOM");
+            return s;
         }
     };
 }
@@ -141,6 +165,24 @@ fn requestPath(target: []const u8) []const u8 {
     return path[0 .. std.mem.indexOfScalar(u8, path, '?') orelse path.len];
 }
 
+/// Normalize a route path for session keying: "/index.html" is an alias
+/// for "/" on every app.
+fn normalizeRoute(path: []const u8) []const u8 {
+    return if (std.mem.eql(u8, path, "/index.html")) "/" else path;
+}
+
+/// Extract a query param from a raw request target ("/events?r=/t/36").
+/// Values are not URL-decoded — routes are path-safe by construction.
+fn queryParam(target: []const u8, name: []const u8) ?[]const u8 {
+    const q = std.mem.indexOfScalar(u8, target, '?') orelse return null;
+    var it = std.mem.splitScalar(u8, target[q + 1 ..], '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
+    }
+    return null;
+}
+
 /// The DOM event protocol posted to /action: `action` is the
 /// `data-on-<event>` attribute, `arg` the `data-arg` payload, `value`
 /// the changed element's new value, and `fields` an object of a
@@ -186,7 +228,7 @@ fn renderHead(comptime Session: type, s: *Session, out: anytype) !void {
 }
 
 fn renderTail(out: anytype) !void {
-    try out.writeAll("</main><script src=\"/client.js?v=2\"></script></body></html>");
+    try out.writeAll("</main><script src=\"/client.js?v=3\"></script></body></html>");
 }
 
 fn handle(
@@ -205,21 +247,26 @@ fn handle(
     var host_hdr: ?[]const u8 = null;
     var origin_hdr: ?[]const u8 = null;
     var csrf_hdr: ?[]const u8 = null;
+    var route_hdr: ?[]const u8 = null;
     var it = req.iterateHeaders();
     while (it.next()) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "cookie")) cookie_hdr = h.value;
         if (std.ascii.eqlIgnoreCase(h.name, "host")) host_hdr = h.value;
         if (std.ascii.eqlIgnoreCase(h.name, "origin")) origin_hdr = h.value;
         if (std.ascii.eqlIgnoreCase(h.name, "x-zforest-csrf")) csrf_hdr = h.value;
+        if (std.ascii.eqlIgnoreCase(h.name, "x-zforest-route")) route_hdr = h.value;
     }
 
     if (method == .POST and std.mem.eql(u8, path, "/action")) {
+        // The action targets the route-session the page was rendered for.
+        const route = normalizeRoute(route_hdr orelse return .bad_request);
+
         // Fast locked precheck so unauthorized requests get 403 without
         // waiting on a body read (ordering identical to the old server).
         {
             srv.mutex.lockUncancelable(srv.io);
             defer srv.mutex.unlock(srv.io);
-            const pre = if (cookieValue(cookie_hdr, cname)) |tok| srv.store.lookup(tok) else null;
+            const pre = if (cookieValue(cookie_hdr, cname)) |tok| srv.store.lookup(tok, route) else null;
             const ps = pre orelse return .forbidden;
             const pre_ok = csrf_hdr != null and std.mem.eql(u8, csrf_hdr.?, ps.csrf_token);
             if (!pre_ok and !sameOrigin(origin_hdr, host_hdr)) return .forbidden;
@@ -238,7 +285,7 @@ fn handle(
         // apply + serialize + publish + clear. No network I/O inside.
         srv.mutex.lockUncancelable(srv.io);
         defer srv.mutex.unlock(srv.io);
-        const entry = if (cookieValue(cookie_hdr, cname)) |tok| srv.store.lookup(tok) else null;
+        const entry = if (cookieValue(cookie_hdr, cname)) |tok| srv.store.lookup(tok, route) else null;
         const s = entry orelse return .forbidden;
         // CSRF: accept when the custom X-Zforest-CSRF header matches the
         // per-session token (browsers can't set custom headers cross-origin
@@ -300,11 +347,19 @@ fn handle(
         if (@hasDecl(Session, "validPath") and !Session.validPath(rpath)) return .not_found;
         srv.mutex.lockUncancelable(srv.io);
         defer srv.mutex.unlock(srv.io);
-        var token: []const u8 = undefined;
-        const entry = if (cookieValue(cookie_hdr, cname)) |tok| srv.store.lookup(tok) else null;
-        const e = entry orelse blk: {
-            token = srv.store.create();
-            break :blk srv.store.lookup(token).?;
+        // Sessions are keyed (cookie token, route): one browser gets one
+        // session per route it visits, so tabs on different routes never
+        // share a view. The cookie token itself is stable per browser.
+        var fresh_token: ?[]const u8 = null;
+        const e = if (cookieValue(cookie_hdr, cname)) |tok| blk: {
+            if (srv.store.lookup(tok, rpath)) |s| break :blk s;
+            break :blk srv.store.create(tok, rpath);
+        } else blk: {
+            var rb: [16]u8 = undefined;
+            srv.io.random(&rb);
+            const tok = std.fmt.allocPrint(arena, "{x:0>16}", .{std.mem.readInt(u64, rb[0..8], .little)}) catch @panic("OOM");
+            fresh_token = tok;
+            break :blk srv.store.create(tok, rpath);
         };
         extra.append(arena, .{ .name = "content-type", .value = "text/html; charset=utf-8" }) catch @panic("OOM");
         // Auxiliary cookies (board's `zfxu`) also apply to page loads —
@@ -316,10 +371,10 @@ fn handle(
         const ok = e.servePage(rpath, &aw.writer) catch @panic("OOM");
         if (!ok) return .not_found;
         renderTail(&aw.writer) catch @panic("OOM");
-        if (entry == null) {
+        if (fresh_token) |tok| {
             extra.append(arena, .{
                 .name = "set-cookie",
-                .value = std.fmt.allocPrint(arena, "{s}={s}; HttpOnly; SameSite=Strict; Path=/", .{ cname, token }) catch @panic("OOM"),
+                .value = std.fmt.allocPrint(arena, "{s}={s}; HttpOnly; SameSite=Strict; Path=/", .{ cname, tok }) catch @panic("OOM"),
             }) catch @panic("OOM");
         }
         out_body.appendSlice(arena, aw.writer.buffered()) catch @panic("OOM");
@@ -354,6 +409,9 @@ fn serveEvents(comptime Session: type, srv: *Server(Session), req: *std.http.Ser
     }
     const token = try srv.gpa.dupe(u8, cookieValue(cookie_hdr, sessionCookieName(Session)) orelse "");
     defer srv.gpa.free(token);
+    // The page tells us which route-session this stream belongs to; a
+    // missing param (very old client) falls back to the home route.
+    const route = normalizeRoute(queryParam(req.head.target, "r") orelse "/");
 
     const out = req.server.out;
     try out.writeAll("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-store\r\nx-accel-buffering: no\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n");
@@ -371,7 +429,7 @@ fn serveEvents(comptime Session: type, srv: *Server(Session), req: *std.http.Ser
         {
             srv.mutex.lockUncancelable(srv.io);
             defer srv.mutex.unlock(srv.io);
-            const s = srv.store.lookup(token);
+            const s = srv.store.lookup(token, route);
             if (s) |sess| {
                 if (!connected) {
                     connected = true;
