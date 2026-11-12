@@ -191,7 +191,9 @@ pub const Session = struct {
                 else => return error.InvalidAction,
             };
             const title = std.mem.trim(u8, raw, " \t\r\n");
-            if (title.len == 0 or title.len > max_title_len) return error.InvalidTitle;
+            // Empty submit is a silent no-op (TodoMVC); overlong is rejected.
+            if (title.len == 0) return;
+            if (title.len > max_title_len) return error.InvalidTitle;
             if (self.todos.items.len >= max_todos) return error.TooManyTodos;
             self.mutate.emit(.{ .add = title });
         } else if (std.mem.eql(u8, action, "toggle")) {
@@ -687,7 +689,9 @@ test "action validation rejects bad input" {
 
     var spaces = titleFields(alloc, "   ");
     defer spaces.deinit(alloc);
-    try std.testing.expectError(error.InvalidTitle, s.dispatch("add", null, null, &spaces));
+    // Empty/whitespace submit is a silent no-op, not an error.
+    try s.dispatch("add", null, null, &spaces);
+    try std.testing.expectEqual(@as(usize, 0), s.todos.items.len);
 
     try std.testing.expectError(error.InvalidAction, s.dispatch("toggle", "abc", null, null));
     try std.testing.expectError(error.InvalidAction, s.dispatch("toggle", null, null, null));
