@@ -71,10 +71,12 @@
       case "text":
         el = document.getElementById(p.id);
         if (el) el.textContent = p.text;
+        else console.debug("zforest: text target missing: " + p.id);
         break;
       case "html":
         el = document.getElementById(p.id);
         if (el) el.innerHTML = p.html; // trusted server-generated, data escaped
+        else console.debug("zforest: html target missing: " + p.id);
         break;
       case "when": {
         // Idempotent "set content strictly between the z-when markers".
@@ -93,7 +95,10 @@
       }
       case "attr":
         el = document.getElementById(p.id);
-        if (!el || !ATTR_WHITELIST[p.name]) return;
+        if (!el || !ATTR_WHITELIST[p.name]) {
+          if (!el) console.debug("zforest: attr target missing: " + p.id);
+          return;
+        }
         if (p.value === null) {
           el.removeAttribute(p.name);
           if (p.name === "checked") el.checked = false;
@@ -107,7 +112,14 @@
   }
 
   function applyOps(ops) {
-    if (ops) for (var i = 0; i < ops.length; i++) applyPatch(ops[i]);
+    if (!ops) return;
+    for (var i = 0; i < ops.length; i++) {
+      try {
+        applyPatch(ops[i]);
+      } catch (e) {
+        console.error("zforest: op failed", ops[i], e);
+      }
+    }
   }
 
   function showError(msg) {
@@ -181,13 +193,28 @@
 
   var es = new EventSource("/events");
   es.addEventListener("snapshot", function (ev) {
-    applySnapshot(JSON.parse(ev.data));
+    var d;
+    try {
+      d = JSON.parse(ev.data);
+    } catch (e) {
+      console.error("zforest: bad snapshot json", e);
+      return;
+    }
+    applySnapshot(d);
   });
   es.addEventListener("patch", function (ev) {
-    var d = JSON.parse(ev.data);
+    var d;
+    try {
+      d = JSON.parse(ev.data);
+    } catch (e) {
+      console.error("zforest: bad patch json", e);
+      return;
+    }
     if (d.rev > lastRev) { // ignore obsolete batches
       applyOps(d.patches);
       lastRev = d.rev;
+    } else {
+      console.debug("zforest: skipping patch rev " + d.rev + " (lastRev " + lastRev + ")");
     }
   });
   es.addEventListener("session_expired", function () {
