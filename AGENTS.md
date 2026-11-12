@@ -24,6 +24,13 @@ model); `zboard` is an anonymous board (shared SQLite-backed model).
 - `build.zig`: build graph, run step, and test step definitions.
 - `build.zig.zon`: package metadata (`minimum_zig_version = 0.17.1`).
 
+## Architecture decisions
+- `ARCHITECTURE.md` records every architecture discussion and its
+  outcome (reactivity granularity, state ownership, lifecycle,
+  transport). **Any design discussion must be summarized there before
+  the session ends** — conversation context is lossy, the file is not.
+  Read it before proposing or reviewing architectural changes.
+
 ## Architecture notes
 
 - Transport: `GET /events` is a Server-Sent Events stream (initial

@@ -954,3 +954,37 @@ test "syncPull re-renders only when global_seq moved" {
     // The home latest list picked up the new post.
     try std.testing.expect(std.mem.indexOf(u8, j, "post-") != null);
 }
+
+test "comment on another session patches the board counter live" {
+    const alloc = std.testing.allocator;
+    const mm = testModel(alloc);
+    defer mm.deinit();
+    model = mm;
+    defer model = null;
+
+    _ = try mm.addPost("b", "tok1", "thread post");
+    // Board-index session already rendered (SSR-equivalent seed).
+    const s = createSession(alloc, std.testing.io);
+    defer s.deinit();
+    try std.testing.expect(s.setRoute("/b/b"));
+    s.seedDom();
+    alloc.free(patchJson(s, alloc)); // discard the seed batch
+
+    // Another session comments on the thread → global_seq bumps.
+    const other = createSession(alloc, std.testing.io);
+    defer other.deinit();
+    var f: std.json.ObjectMap = .empty;
+    defer f.deinit(alloc);
+    try f.put(alloc, "post", .{ .string = "1" });
+    try f.put(alloc, "text", .{ .string = "hi" });
+    try other.dispatch("comment", null, null, &f);
+    alloc.free(patchJson(other, alloc));
+
+    s.syncPull();
+    const j = patchJson(s, alloc);
+    defer alloc.free(j);
+    // The live counter "→ тред (N)" is a bound text op on post-1/go —
+    // any dynamic value must reach the diff, unbound content goes stale.
+    try std.testing.expect(std.mem.indexOf(u8, j, "\"op\":\"text\",\"id\":\"post-1/go\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, j, "тред (1)") != null);
+}
