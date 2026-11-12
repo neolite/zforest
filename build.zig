@@ -70,6 +70,17 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(zmon);
 
+    // The zcar booking app: same zefx/forest modules, no sqlite, no libc.
+    const zcar_mod = b.createModule(.{
+        .root_source_file = b.path("src/car_main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &app_imports,
+    });
+    const zcar = b.addExecutable(.{ .name = "zcar", .root_module = zcar_mod });
+
+    b.installArtifact(zcar);
+
     const run_step = b.step("run", "Run the todo server");
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
@@ -84,6 +95,11 @@ pub fn build(b: *std.Build) void {
     const run_mon_cmd = b.addRunArtifact(zmon);
     run_mon_step.dependOn(&run_mon_cmd.step);
     run_mon_cmd.step.dependOn(b.getInstallStep());
+
+    const run_car_step = b.step("run-car", "Run the zcar booking app");
+    const run_car_cmd = b.addRunArtifact(zcar);
+    run_car_step.dependOn(&run_car_cmd.step);
+    run_car_cmd.step.dependOn(b.getInstallStep());
 
     const zefx_tests = b.addTest(.{ .root_module = zefx_mod });
     const run_zefx_tests = b.addRunArtifact(zefx_tests);
@@ -110,10 +126,14 @@ pub fn build(b: *std.Build) void {
     const zmon_tests = b.addTest(.{ .root_module = zmon_mod });
     const run_zmon_tests = b.addRunArtifact(zmon_tests);
 
+    const zcar_tests = b.addTest(.{ .root_module = zcar_mod });
+    const run_zcar_tests = b.addRunArtifact(zcar_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_zefx_tests.step);
     test_step.dependOn(&run_forest_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_zboard_tests.step);
     test_step.dependOn(&run_zmon_tests.step);
+    test_step.dependOn(&run_zcar_tests.step);
 }

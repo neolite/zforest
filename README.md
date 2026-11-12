@@ -2,16 +2,21 @@
 
 Server-driven UIs in Zig: the `zefx` reactive graph core plus `forest`, a
 fine-grained DOM patch layer, served by a minimal `std.http` server with a
-vanilla JS patch client. Three apps share the transport:
+vanilla JS patch client. Four apps share the transport:
 
 - **`zforest`** — the Todo demo (per-session model, no database).
 - **`zboard`** — an anonymous message board (static boards, threads,
   nested tree comments) over a shared SQLite-backed model.
 - **`zmon`** — a live ops dashboard (mock request stream, windowed
   rps/error/latency stats, 384-line request-log firehose, inject +
-  storm buttons) on **fine-grained live bindings**: the view tree is
-  built once per session and every bound leaf subscribes to its store,
-  so updates emit patch ops with no rebuild+diff (`forest.bindTree`).
+  storm buttons, traffic sliders, SVG sparklines) on **fine-grained
+  live bindings**: the view tree is built once per session and every
+  bound leaf subscribes to its store, so updates emit patch ops with
+  no rebuild+diff (`forest.bindTree`).
+- **`zcar`** — a service-booking demo (brand → model → year cascade,
+  vehicle specs, service catalogue by category, context upsells, combo
+  discounts, booking form + history) — exercises keyed lists and
+  conditional subtrees on the diff path.
 
 <p align="center">
   <img src="docs/architecture.svg" alt="zforest architecture" width="900">
@@ -20,13 +25,15 @@ vanilla JS patch client. Three apps share the transport:
 ## Run
 
 ```sh
-zig build        # produces zig-out/bin/zforest, zboard and zmon
+zig build        # produces zig-out/bin/{zforest,zboard,zmon,zcar}
 zig build run    # serves the todo app on http://127.0.0.1:8080
 zig build run-board 8081 127.0.0.1 board.db  # board on :8081, file db
 zig build run-mon 8082 127.0.0.1             # dashboard on :8082
+zig build run-car 8083 127.0.0.1             # booking demo on :8083
 ./zig-out/bin/zforest [port] [bind-ip]
 ./zig-out/bin/zboard   [port] [bind-ip] [db-path]   # db-path default ":memory:"
 ./zig-out/bin/zmon     [port] [bind-ip]
+./zig-out/bin/zcar     [port] [bind-ip]
 zig build test   # engine, forest, session, db, and board tests
 ```
 

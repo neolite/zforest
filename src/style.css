@@ -258,3 +258,69 @@ footer { margin-top: .9rem; color: var(--muted); font-size: .85rem; }
   cursor: pointer;
 }
 .btn:hover { border-color: var(--accent); }
+
+/* ── zcar booking ────────────────────────────────────────────── */
+.app-car { max-width: 60rem; }
+.sub { color: var(--muted); margin: -.4rem 0 1rem; font-size: .9rem; }
+.vsec { margin-bottom: 1.4rem; }
+.sec { font-size: 1.05rem; margin: 0 0 .6rem; }
+.cat { font-size: .8rem; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); margin: .9rem 0 .4rem; }
+.fld { display: flex; flex-direction: column; gap: .35rem; margin-bottom: .7rem; }
+.flabel { font-size: .75rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.chips { display: flex; flex-wrap: wrap; gap: .35rem; }
+.chip {
+  font: 600 .82rem/1 inherit; padding: .42rem .8rem; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+  cursor: pointer;
+}
+.chip:hover { border-color: var(--accent); }
+.chip.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.spec {
+  margin-top: .6rem; padding: .55rem .8rem; border-radius: .6rem;
+  background: var(--panel); border: 1px solid var(--accent); font-weight: 600;
+}
+.svc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr)); gap: .45rem; }
+.svc {
+  display: flex; flex-direction: column; gap: .15rem; padding: .5rem .7rem;
+  background: var(--panel); border: 1px solid var(--line); border-radius: .55rem;
+  cursor: pointer; transition: border-color .12s;
+}
+.svc:hover { border-color: var(--accent); }
+.svc.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, var(--panel)); }
+.svc.on .svc-name::before { content: "✓ "; color: var(--accent); }
+.svc-name { font-size: .85rem; font-weight: 600; }
+.svc-meta { display: flex; justify-content: space-between; font-size: .75rem; color: var(--muted); }
+.svc-price { font-family: ui-monospace, Menlo, monospace; color: var(--ink); }
+.upsell-list { display: flex; flex-direction: column; gap: .4rem; }
+.upsell {
+  display: flex; align-items: center; gap: .7rem; padding: .5rem .8rem;
+  background: var(--panel); border: 1px dashed var(--accent); border-radius: .55rem;
+}
+.upsell-txt { flex: 1; display: flex; flex-direction: column; }
+.upsell-name { font-size: .85rem; font-weight: 600; }
+.upsell-why { font-size: .75rem; color: var(--muted); }
+.upsell-price { font: 600 .85rem ui-monospace, Menlo, monospace; }
+.upsell-in { font-size: .75rem; color: var(--accent); font-weight: 600; }
+.btn.mini { padding: .25rem .6rem; font-size: .9rem; }
+.sum-list { display: flex; flex-direction: column; gap: .2rem; margin-bottom: .4rem; }
+.sum-line { display: flex; justify-content: space-between; font-size: .88rem; padding: .25rem 0; border-bottom: 1px dashed var(--line); }
+.sum-line.disc .sum-name, .sum-line.disc .sum-price { color: var(--accent); }
+.sum-total {
+  display: flex; justify-content: space-between; font-size: 1.15rem; font-weight: 700;
+  padding: .5rem 0 .8rem;
+}
+.book-form { display: flex; gap: .5rem; flex-wrap: wrap; }
+.book-form input {
+  flex: 1; min-width: 10rem; padding: .5rem .7rem; border-radius: .5rem;
+  border: 1px solid var(--line); background: var(--panel); color: var(--ink); font: inherit;
+}
+.book-list { display: flex; flex-direction: column; gap: .4rem; }
+.booking {
+  display: flex; align-items: center; gap: .8rem; padding: .55rem .8rem;
+  background: var(--panel); border: 1px solid var(--line); border-radius: .55rem;
+}
+.bk-id { font: 700 .85rem ui-monospace, Menlo, monospace; color: var(--accent); }
+.bk-main { flex: 1; display: flex; flex-direction: column; }
+.bk-name { font-weight: 600; font-size: .9rem; }
+.bk-car { font-size: .78rem; color: var(--muted); }
+.bk-meta { font-size: .78rem; color: var(--muted); font-family: ui-monospace, Menlo, monospace; }

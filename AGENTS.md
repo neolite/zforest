@@ -1,11 +1,13 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-`zforest` hosts three server-driven apps on one transport: the `zefx`
+`zforest` hosts four server-driven apps on one transport: the `zefx`
 reactive core plus a `forest` fine-grained DOM patch layer and a minimal
 generic `std.http` server. `zforest` is the Todo demo (per-session
 model); `zboard` is an anonymous board (shared SQLite-backed model);
-`zmon` is a live ops dashboard on fine-grained live bindings.
+`zmon` is a live ops dashboard on fine-grained live bindings; `zcar` is
+a service-booking demo (vehicle cascade, service catalogue, upsells,
+combo discounts, booking history).
 
 - `src/zefx/root.zig`: public API surface exported as module `zefx`.
 - `src/zefx/engine.zig`, `event.zig`, `store.zig`, `sample.zig`, `shape.zig`, `effect.zig`: reactive graph primitives and operators.
@@ -17,6 +19,9 @@ model); `zboard` is an anonymous board (shared SQLite-backed model);
 - `src/db.zig`: typed wrapper over the vendored sqlite3 amalgamation (`vendor/sqlite3`, official 3.54.1; flags `-DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_LOAD_EXTENSION`). Linked only into `zboard` and test binaries — never the `zforest` exe.
 - `src/board_app.zig`: zboard session/view — routes (`/`, `/b/<slug>`, `/t/<post>`, `/t/<post>/c/<comment>`), sidebar nav, post/comment forms, nested keyed comment trees, `w-rep-N` inline reply anchors, `zfxu` anonymous identity cookie, per-session `reply_to`.
 - `src/board_main.zig`: `zboard` executable entry point (`zboard [port] [bind-ip] [db-path]`).
+- `src/car_data.zig`: static catalogue — brands/models/years with engine/transmission/drivetrain specs, service list by `Cat`, combo discount rules.
+- `src/car_app.zig`: zcar session/view — per-session cart (`AutoHashMapUnmanaged`), vehicle selection state, upsell suggestions, booking records; dispatch actions `set_brand`/`set_model`/`set_year`/`toggle_svc`/`add_svc`/`book`; `discounts` writes into a caller buffer (no stack-slice escape).
+- `src/car_main.zig`: `zcar` executable entry point (`zcar [port] [bind-ip]`).
 - `src/server/http.zig`: generic-over-`Session` HTTP/SSE server (cookie sessions, POST /action → ACK, GET /events → SSE stream, `Ip4Address` bind, `setRoute`/`servePage`/`syncPull`/`out_cookie`/`readCookies` hooks, per-action `Set-Cookie`).
 - `src/server/history.zig`: bounded per-session ring of serialized patch batches for SSE subscribers.
 - `src/server/stream.zig`: `{rev,ops}` snapshot serialization for SSE snapshot events.
@@ -61,10 +66,12 @@ model); `zboard` is an anonymous board (shared SQLite-backed model);
 - Generated artifacts: `.zig-cache/` and `zig-out/` (do not edit manually).
 
 ## Build, Test, and Development Commands
-- `zig build`: compile and install both executables (`zforest`, `zboard`).
+- `zig build`: compile and install the executables (`zforest`, `zboard`, `zmon`, `zcar`).
 - `zig build run`: run the todo server on 127.0.0.1:8080 (port arg optional).
 - `zig build run-board`: run the board server (`zboard [port] [bind-ip] [db-path]`).
-- `zig build test`: run module + executable test targets for both apps.
+- `zig build run-mon`: run the dashboard (`zmon [port] [bind-ip]`).
+- `zig build run-car`: run the booking demo (`zcar [port] [bind-ip]`).
+- `zig build test`: run module + executable test targets for all apps.
 - `zig build -Doptimize=ReleaseFast`: build with release optimization.
 - `zig fmt src/**/*.zig build.zig`: format code before committing.
 
