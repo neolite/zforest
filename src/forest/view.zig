@@ -3,7 +3,6 @@ const patch_mod = @import("patch.zig");
 const dom_mod = @import("dom.zig");
 
 const Dom = dom_mod.Dom;
-const Row = dom_mod.Row;
 const PatchLog = patch_mod.PatchLog;
 const escapeHtmlInto = patch_mod.escapeHtmlInto;
 
@@ -539,7 +538,12 @@ fn resolvedId(a: std.mem.Allocator, id: ?[]const u8, lid: ?[]const u8, parent_pa
     if (id) |v| return v;
     const l = lid orelse return null;
     if (parent_path.len == 0) return a.dupe(u8, l) catch @panic("OOM");
-    return std.fmt.allocPrint(a, "{s}/{s}", .{ parent_path, l }) catch @panic("OOM");
+    // Manual concat — this runs per bound element per render, so skip fmt.
+    const out = a.alloc(u8, parent_path.len + 1 + l.len) catch @panic("OOM");
+    @memcpy(out[0..parent_path.len], parent_path);
+    out[parent_path.len] = '/';
+    @memcpy(out[parent_path.len + 1 ..], l);
+    return out;
 }
 
 /// The id a `z-when` comment pair answers to — `resolvedId` over the
@@ -699,36 +703,31 @@ fn diffNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, dom: *Dom
     }
 }
 
-fn diffKeyed(a: std.mem.Allocator, parent_id: []const u8, kids: []const Node, dom: *Dom, log: *PatchLog) void {
-    // Row html is consumed ONLY by create patches inside syncKeyedList —
-    // existing rows diff their bound state via diffNode instead. Build
-    // the tracked-id set once so per-row HTML serialization is skipped
-    // for rows already on the page (the common case: O(dirty) instead
-    // of O(all) serialization per flush).
-    var existing: std.StringHashMapUnmanaged(void) = .empty;
-    defer existing.deinit(a);
-    for (dom.keyedOrder(parent_id)) |id| {
-        existing.put(a, id, {}) catch @panic("OOM");
-    }
+/// Context for `rowHtml` — serializes keyed child `i`'s markup. Called
+/// by `Dom.syncKeyedList` only for rows that actually need a create
+/// patch, so existing rows never pay for HTML serialization.
+const RowHtml = struct {
+    a: std.mem.Allocator,
+    kids: []const Node,
+    parent_id: []const u8,
+};
 
-    var rows: std.ArrayListUnmanaged(Row) = .empty;
-    defer rows.deinit(a);
-    for (kids) |k| {
-        const kid_id = keyedChildId(k);
-        var html: []const u8 = &.{};
-        if (!existing.contains(kid_id)) {
-            var aw: std.Io.Writer.Allocating = .init(a);
-            defer aw.deinit();
-            writeNode(a, k, parent_id, &aw.writer) catch @panic("OOM");
-            html = aw.toOwnedSlice() catch @panic("OOM");
-        }
-        rows.append(a, .{ .id = kid_id, .html = html }) catch @panic("OOM");
-    }
+fn rowHtml(ctx: RowHtml, i: usize) []const u8 {
+    var aw: std.Io.Writer.Allocating = .init(ctx.a);
+    defer aw.deinit();
+    writeNode(ctx.a, ctx.kids[i], ctx.parent_id, &aw.writer) catch @panic("OOM");
+    return aw.toOwnedSlice() catch @panic("OOM");
+}
+
+fn diffKeyed(a: std.mem.Allocator, parent_id: []const u8, kids: []const Node, dom: *Dom, log: *PatchLog) void {
+    const ids = a.alloc([]const u8, kids.len) catch @panic("OOM");
+    for (kids, 0..) |k, i| ids[i] = keyedChildId(k);
 
     // `created` is allocated with the Dom's gpa (see syncKeyedList).
     var created: std.ArrayListUnmanaged([]const u8) = .empty;
     defer created.deinit(dom.gpa);
-    dom.syncKeyedList(log, parent_id, rows.items, &created);
+    const hctx: RowHtml = .{ .a = a, .kids = kids, .parent_id = parent_id };
+    dom.syncKeyedList(log, a, parent_id, ids, rowHtml, hctx, &created);
 
     for (kids) |k| {
         const kid = keyedChildId(k);

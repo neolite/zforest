@@ -2,10 +2,6 @@ const std = @import("std");
 const patch_mod = @import("patch.zig");
 const PatchLog = patch_mod.PatchLog;
 
-/// One row of a keyed list: `id` is the stable node id, `html` the trusted
-/// server-generated markup used when the row is (re)created.
-pub const Row = struct { id: []const u8, html: []const u8 };
-
 /// Client-visible DOM state tracked server-side so `render` passes only emit
 /// patches for actual changes. All keys/values are owned copies.
 pub const Dom = struct {
@@ -62,13 +58,18 @@ pub const Dom = struct {
 
     /// Emit a text patch only when the tracked value differs.
     pub fn setText(self: *Dom, log: *PatchLog, id: []const u8, value: []const u8) void {
+        // Lookup first: the common case (unchanged binding) then costs a
+        // single hash probe instead of dupe+free churn on every render.
+        if (self.texts.getPtr(id)) |slot| {
+            if (std.mem.eql(u8, slot.*, value)) return;
+            self.gpa.free(slot.*);
+            slot.* = self.gpa.dupe(u8, value) catch @panic("OOM");
+            log.setText(id, value);
+            return;
+        }
         const new_key = self.gpa.dupe(u8, id) catch @panic("OOM");
         const gop = self.texts.getOrPut(self.gpa, new_key) catch @panic("OOM");
-        if (gop.found_existing) {
-            self.gpa.free(new_key);
-            if (std.mem.eql(u8, gop.value_ptr.*, value)) return;
-            self.gpa.free(gop.value_ptr.*);
-        }
+        std.debug.assert(!gop.found_existing);
         gop.value_ptr.* = self.gpa.dupe(u8, value) catch @panic("OOM");
         log.setText(id, value);
     }
@@ -78,49 +79,48 @@ pub const Dom = struct {
     pub fn seedAttr(self: *Dom, id: []const u8, name: []const u8, value: ?[]const u8) void {
         var key_buf: [256]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buf, "{s}\x00{s}", .{ id, name }) catch @panic("attr key too long");
+        if (self.attrs.getPtr(key)) |slot| {
+            if (slot.*) |v| self.gpa.free(v);
+            slot.* = if (value) |v| self.gpa.dupe(u8, v) catch @panic("OOM") else null;
+            return;
+        }
         const new_key = self.gpa.dupe(u8, key) catch @panic("OOM");
         const gop = self.attrs.getOrPut(self.gpa, new_key) catch @panic("OOM");
-        if (gop.found_existing) {
-            self.gpa.free(new_key);
-            if (gop.value_ptr.*) |v| self.gpa.free(v);
-        }
+        std.debug.assert(!gop.found_existing);
         gop.value_ptr.* = if (value) |v| self.gpa.dupe(u8, v) catch @panic("OOM") else null;
     }
 
     /// Record a text binding without emitting — for seeding tracked state
     /// that matches markup already shipped in a create patch or SSR page.
     pub fn seedText(self: *Dom, id: []const u8, value: []const u8) void {
+        if (self.texts.getPtr(id)) |slot| {
+            self.gpa.free(slot.*);
+            slot.* = self.gpa.dupe(u8, value) catch @panic("OOM");
+            return;
+        }
         const new_key = self.gpa.dupe(u8, id) catch @panic("OOM");
         const gop = self.texts.getOrPut(self.gpa, new_key) catch @panic("OOM");
-        if (gop.found_existing) {
-            self.gpa.free(new_key);
-            self.gpa.free(gop.value_ptr.*);
-        }
+        std.debug.assert(!gop.found_existing);
         gop.value_ptr.* = self.gpa.dupe(u8, value) catch @panic("OOM");
-    }
-
-    /// The tracked child ids of keyed parent `parent_id`, in DOM order.
-    /// Borrowed slice — valid until the next mutation of this Dom's
-    /// `orders` map. Empty when the parent has no recorded order.
-    pub fn keyedOrder(self: *Dom, parent_id: []const u8) []const []const u8 {
-        const gop = self.orders.getPtr(parent_id) orelse return &.{};
-        return gop.items;
     }
 
     /// Record the child order for `parent_id` without emitting — used when
     /// a keyed list's markup was already shipped inside a create patch.
     pub fn seedOrder(self: *Dom, parent_id: []const u8, ids: []const []const u8) void {
-        const new_key = self.gpa.dupe(u8, parent_id) catch @panic("OOM");
-        const gop = self.orders.getOrPut(self.gpa, new_key) catch @panic("OOM");
-        if (gop.found_existing) {
-            self.gpa.free(new_key);
-            for (gop.value_ptr.items) |id| self.gpa.free(id);
-            gop.value_ptr.clearRetainingCapacity();
-        } else {
+        const list: *std.ArrayListUnmanaged([]u8) = blk: {
+            if (self.orders.getPtr(parent_id)) |gop| {
+                for (gop.items) |id| self.gpa.free(id);
+                gop.clearRetainingCapacity();
+                break :blk gop;
+            }
+            const new_key = self.gpa.dupe(u8, parent_id) catch @panic("OOM");
+            const gop = self.orders.getOrPut(self.gpa, new_key) catch @panic("OOM");
+            std.debug.assert(!gop.found_existing);
             gop.value_ptr.* = .empty;
-        }
+            break :blk gop.value_ptr;
+        };
         for (ids) |id| {
-            gop.value_ptr.append(self.gpa, self.gpa.dupe(u8, id) catch @panic("OOM")) catch @panic("OOM");
+            list.append(self.gpa, self.gpa.dupe(u8, id) catch @panic("OOM")) catch @panic("OOM");
         }
     }
 
@@ -129,16 +129,19 @@ pub const Dom = struct {
     pub fn setAttr(self: *Dom, log: *PatchLog, id: []const u8, name: []const u8, value: ?[]const u8) void {
         var key_buf: [256]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buf, "{s}\x00{s}", .{ id, name }) catch @panic("attr key too long");
-        const new_key = self.gpa.dupe(u8, key) catch @panic("OOM");
-        const gop = self.attrs.getOrPut(self.gpa, new_key) catch @panic("OOM");
-        if (gop.found_existing) {
-            self.gpa.free(new_key);
-            const old = gop.value_ptr.*;
+        if (self.attrs.getPtr(key)) |slot| {
+            const old = slot.*;
             const same = (old == null and value == null) or
                 (old != null and value != null and std.mem.eql(u8, old.?, value.?));
             if (same) return;
             if (old) |v| self.gpa.free(v);
+            slot.* = if (value) |v| self.gpa.dupe(u8, v) catch @panic("OOM") else null;
+            log.setAttr(id, name, value);
+            return;
         }
+        const new_key = self.gpa.dupe(u8, key) catch @panic("OOM");
+        const gop = self.attrs.getOrPut(self.gpa, new_key) catch @panic("OOM");
+        std.debug.assert(!gop.found_existing);
         gop.value_ptr.* = if (value) |v| self.gpa.dupe(u8, v) catch @panic("OOM") else null;
         log.setAttr(id, name, value);
     }
@@ -153,16 +156,18 @@ pub const Dom = struct {
     /// the caller then emits a `when` op carrying the new branch markup.
     /// `key == null` is the empty branch.
     pub fn setWhen(self: *Dom, id: []const u8, key: ?[]const u8) bool {
-        const new_key = self.gpa.dupe(u8, id) catch @panic("OOM");
-        const gop = self.when_states.getOrPut(self.gpa, new_key) catch @panic("OOM");
-        if (gop.found_existing) {
-            self.gpa.free(new_key);
-            const old = gop.value_ptr.*;
+        if (self.when_states.getPtr(id)) |slot| {
+            const old = slot.*;
             const same = (old == null and key == null) or
                 (old != null and key != null and std.mem.eql(u8, old.?, key.?));
             if (same) return false;
             if (old) |v| self.gpa.free(v);
+            slot.* = if (key) |k| self.gpa.dupe(u8, k) catch @panic("OOM") else null;
+            return true;
         }
+        const new_key = self.gpa.dupe(u8, id) catch @panic("OOM");
+        const gop = self.when_states.getOrPut(self.gpa, new_key) catch @panic("OOM");
+        std.debug.assert(!gop.found_existing);
         gop.value_ptr.* = if (key) |k| self.gpa.dupe(u8, k) catch @panic("OOM") else null;
         return true;
     }
@@ -170,12 +175,14 @@ pub const Dom = struct {
     /// Record an anchor's branch key without comparing — for seeding state
     /// that matches markup already shipped (SSR, create patch, when-op html).
     pub fn seedWhen(self: *Dom, id: []const u8, key: ?[]const u8) void {
+        if (self.when_states.getPtr(id)) |slot| {
+            if (slot.*) |v| self.gpa.free(v);
+            slot.* = if (key) |k| self.gpa.dupe(u8, k) catch @panic("OOM") else null;
+            return;
+        }
         const new_key = self.gpa.dupe(u8, id) catch @panic("OOM");
         const gop = self.when_states.getOrPut(self.gpa, new_key) catch @panic("OOM");
-        if (gop.found_existing) {
-            self.gpa.free(new_key);
-            if (gop.value_ptr.*) |v| self.gpa.free(v);
-        }
+        std.debug.assert(!gop.found_existing);
         gop.value_ptr.* = if (key) |k| self.gpa.dupe(u8, k) catch @panic("OOM") else null;
     }
 
@@ -228,29 +235,45 @@ pub const Dom = struct {
         }
     }
 
-    /// Diff `rows` (desired order) against the last known order for
+    /// Diff `ids` (desired order) against the last known order for
     /// `parent_id`; emit create/remove/move patches and binding updates.
-    /// If `created` is non-null it is filled with the ids of rows created
-    /// this pass (slices borrowed from `rows`, not owned).
-    pub fn syncKeyedList(self: *Dom, log: *PatchLog, parent_id: []const u8, rows: []const Row, created: ?*std.ArrayListUnmanaged([]const u8)) void {
-        const new_key = self.gpa.dupe(u8, parent_id) catch @panic("OOM");
-        const gop = self.orders.getOrPut(self.gpa, new_key) catch @panic("OOM");
-        if (gop.found_existing) {
-            self.gpa.free(new_key);
-        } else {
+    /// `htmlFor(ctx, i)` is invoked ONLY for rows that need a create patch
+    /// — existing rows never pay for markup serialization. `a` is scratch
+    /// space (the render arena) for the membership set. If `created` is
+    /// non-null it is filled with the ids of rows created this pass
+    /// (slices borrowed from `ids`, not owned).
+    pub fn syncKeyedList(
+        self: *Dom,
+        log: *PatchLog,
+        a: std.mem.Allocator,
+        parent_id: []const u8,
+        ids: []const []const u8,
+        htmlFor: anytype,
+        htmlCtx: anytype,
+        created: ?*std.ArrayListUnmanaged([]const u8),
+    ) void {
+        const cur: *std.ArrayListUnmanaged([]u8) = blk: {
+            if (self.orders.getPtr(parent_id)) |gop| break :blk gop;
+            const new_key = self.gpa.dupe(u8, parent_id) catch @panic("OOM");
+            const gop = self.orders.getOrPut(self.gpa, new_key) catch @panic("OOM");
+            std.debug.assert(!gop.found_existing);
             gop.value_ptr.* = .empty;
-        }
-        const cur = gop.value_ptr;
+            break :blk gop.value_ptr;
+        };
+
+        // Desired-id set: the remove pass below is then O(N) lookups
+        // instead of an O(N²) scan of `ids` per tracked child.
+        var wanted: std.StringHashMapUnmanaged(void) = .empty;
+        defer wanted.deinit(a);
+        for (ids) |id| wanted.put(a, id, {}) catch @panic("OOM");
 
         // Remove nodes no longer present.
         var i: usize = 0;
-        outer: while (i < cur.items.len) {
+        while (i < cur.items.len) {
             const id = cur.items[i];
-            for (rows) |r| {
-                if (std.mem.eql(u8, r.id, id)) {
-                    i += 1;
-                    continue :outer;
-                }
+            if (wanted.contains(id)) {
+                i += 1;
+                continue;
             }
             log.remove(id);
             self.removeTracked(id);
@@ -262,8 +285,8 @@ pub const Dom = struct {
         // matching existing node before the element it currently displaces,
         // or create it there. `cur` is kept in lockstep with the real DOM.
         i = 0;
-        while (i < rows.len) : (i += 1) {
-            const want = rows[i].id;
+        while (i < ids.len) : (i += 1) {
+            const want = ids[i];
             if (i < cur.items.len and std.mem.eql(u8, cur.items[i], want)) continue;
 
             var j = i;
@@ -279,15 +302,38 @@ pub const Dom = struct {
                 log.move(parent_id, want, before);
             } else {
                 // New node: insert before whatever currently occupies this
-                // position (or append at the end).
+                // position (or append at the end). htmlFor runs lazily —
+                // only real creates serialize markup.
                 const before: ?[]const u8 = if (i < cur.items.len) cur.items[i] else null;
-                log.create(parent_id, before, want, rows[i].html);
+                log.create(parent_id, before, want, htmlFor(htmlCtx, i));
                 cur.insert(self.gpa, i, self.gpa.dupe(u8, want) catch @panic("OOM")) catch @panic("OOM");
                 if (created) |c| c.append(self.gpa, want) catch @panic("OOM");
             }
         }
     }
 };
+
+const TestRow = struct { id: []const u8, html: []const u8 };
+
+fn testHtml(rows: []const TestRow, i: usize) []const u8 {
+    return rows[i].html;
+}
+
+/// Test shim keeping the old `{id, html}` row literal ergonomics over the
+/// lazy `ids` + `htmlFor` syncKeyedList signature.
+fn syncRows(
+    dom: *Dom,
+    log: *PatchLog,
+    a: std.mem.Allocator,
+    parent_id: []const u8,
+    rows: []const TestRow,
+    created: ?*std.ArrayListUnmanaged([]const u8),
+) void {
+    const ids = a.alloc([]const u8, rows.len) catch @panic("OOM");
+    defer a.free(ids);
+    for (rows, 0..) |r, i| ids[i] = r.id;
+    dom.syncKeyedList(log, a, parent_id, ids, testHtml, rows, created);
+}
 
 test "keyed list lifecycle emits exact patches" {
     var dom = Dom.init(std.testing.allocator);
@@ -296,7 +342,7 @@ test "keyed list lifecycle emits exact patches" {
     defer log.deinit();
 
     // Initial render: three creates.
-    dom.syncKeyedList(&log, "list", &.{
+    syncRows(&dom, &log, std.testing.allocator, "list", &.{
         .{ .id = "row-1", .html = "<li>one</li>" },
         .{ .id = "row-2", .html = "<li>two</li>" },
         .{ .id = "row-3", .html = "<li>three</li>" },
@@ -306,7 +352,7 @@ test "keyed list lifecycle emits exact patches" {
     log.clear();
 
     // Remove row-2 and add row-4 at the end: remove + create.
-    dom.syncKeyedList(&log, "list", &.{
+    syncRows(&dom, &log, std.testing.allocator, "list", &.{
         .{ .id = "row-1", .html = "<li>one</li>" },
         .{ .id = "row-3", .html = "<li>three</li>" },
         .{ .id = "row-4", .html = "<li>four</li>" },
@@ -317,7 +363,7 @@ test "keyed list lifecycle emits exact patches" {
     log.clear();
 
     // Reorder row-4 before row-1: single move patch.
-    dom.syncKeyedList(&log, "list", &.{
+    syncRows(&dom, &log, std.testing.allocator, "list", &.{
         .{ .id = "row-4", .html = "<li>four</li>" },
         .{ .id = "row-1", .html = "<li>one</li>" },
         .{ .id = "row-3", .html = "<li>three</li>" },
@@ -328,7 +374,7 @@ test "keyed list lifecycle emits exact patches" {
     log.clear();
 
     // Identical render emits nothing.
-    dom.syncKeyedList(&log, "list", &.{
+    syncRows(&dom, &log, std.testing.allocator, "list", &.{
         .{ .id = "row-4", .html = "<li>four</li>" },
         .{ .id = "row-1", .html = "<li>one</li>" },
         .{ .id = "row-3", .html = "<li>three</li>" },
@@ -399,7 +445,7 @@ test "keyed list reorder replays to exact DOM order" {
     var log = PatchLog.init(alloc);
     defer log.deinit();
 
-    dom.syncKeyedList(&log, "list", &.{
+    syncRows(&dom, &log, std.testing.allocator, "list", &.{
         .{ .id = "A", .html = "<li/>" },
         .{ .id = "B", .html = "<li/>" },
         .{ .id = "C", .html = "<li/>" },
@@ -407,7 +453,7 @@ test "keyed list reorder replays to exact DOM order" {
     log.clear();
 
     // ABC -> CAB
-    dom.syncKeyedList(&log, "list", &.{
+    syncRows(&dom, &log, std.testing.allocator, "list", &.{
         .{ .id = "C", .html = "<li/>" },
         .{ .id = "A", .html = "<li/>" },
         .{ .id = "B", .html = "<li/>" },
@@ -419,7 +465,7 @@ test "keyed list reorder replays to exact DOM order" {
     log.clear();
 
     // CAB -> CBA (swap tail)
-    dom.syncKeyedList(&log, "list", &.{
+    syncRows(&dom, &log, std.testing.allocator, "list", &.{
         .{ .id = "C", .html = "<li/>" },
         .{ .id = "B", .html = "<li/>" },
         .{ .id = "A", .html = "<li/>" },
@@ -430,7 +476,7 @@ test "keyed list reorder replays to exact DOM order" {
     log.clear();
 
     // CBA -> DBC: remove A, insert D first, move B
-    dom.syncKeyedList(&log, "list", &.{
+    syncRows(&dom, &log, std.testing.allocator, "list", &.{
         .{ .id = "D", .html = "<li/>" },
         .{ .id = "B", .html = "<li/>" },
         .{ .id = "C", .html = "<li/>" },
@@ -468,11 +514,11 @@ test "removed rows drop tracked bindings" {
     var log = PatchLog.init(std.testing.allocator);
     defer log.deinit();
 
-    dom.syncKeyedList(&log, "list", &.{.{ .id = "row-1", .html = "<li/>" }}, null);
+    syncRows(&dom, &log, std.testing.allocator, "list", &.{.{ .id = "row-1", .html = "<li/>" }}, null);
     dom.setText(&log, "row-1/title", "hello");
     log.clear();
 
-    dom.syncKeyedList(&log, "list", &.{}, null);
+    syncRows(&dom, &log, std.testing.allocator, "list", &.{}, null);
     try std.testing.expectEqual(@as(usize, 0), dom.texts.count());
     try std.testing.expectEqual(@as(usize, 0), dom.attrs.count());
 }

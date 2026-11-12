@@ -466,24 +466,24 @@ fn footerView(a: std.mem.Allocator, s: *Session) forest.Node {
 }
 
 /// Idle row branch: the title, which enters edit mode on double-click.
-fn viewBranch(a: std.mem.Allocator, t: Todo) forest.Node {
+fn viewBranch(a: std.mem.Allocator, t: Todo, arg: []const u8) forest.Node {
     return forest.el(a, .span, .{
         .class = "title",
         .on = .{ .dblclick = "edit" },
-        .arg = t.id,
+        .arg = arg,
     }, t.title);
 }
 
 /// Editing row branch: an inline form swapped in through the `row-N/we`
 /// anchor. The hidden `id` input carries the todo id — form submits
 /// serialize named fields only, never `data-arg`.
-fn editBranch(a: std.mem.Allocator, t: Todo, draft: []const u8) forest.Node {
+fn editBranch(a: std.mem.Allocator, draft: []const u8, arg: []const u8) forest.Node {
     return forest.el(a, .form, .{
         .class = "edit-form",
         .autocomplete = "off",
         .on = .{ .submit = "edit_save" },
     }, .{
-        forest.el(a, .input, .{ .type = "hidden", .name = "id", .value = t.id }, .{}),
+        forest.el(a, .input, .{ .type = "hidden", .name = "id", .value = arg }, .{}),
         forest.el(a, .input, .{
             .name = "text",
             .value = draft,
@@ -495,35 +495,41 @@ fn editBranch(a: std.mem.Allocator, t: Todo, draft: []const u8) forest.Node {
             .type = "button",
             .class = "edit-cancel",
             .on = .{ .click = "edit_cancel" },
-            .arg = t.id,
+            .arg = arg,
         }, "×"),
     });
 }
 
 fn buildRow(a: std.mem.Allocator, s: *Session, t: Todo) forest.Node {
     const ui = s.uiEntry(t.id);
+    // The todo id formats once per row and is shared by every `data-arg`
+    // / hidden `value` binding — previously each attr ran its own `{d}`.
+    var idbuf: [24]u8 = undefined;
+    const arg = a.dupe(u8, std.fmt.bufPrint(&idbuf, "{d}", .{t.id}) catch unreachable) catch @panic("OOM");
+    const base = if (t.done) "todo done" else "todo";
+    const suffix: []const u8 = if (ui != null) " editing" else "";
+    const class = a.alloc(u8, base.len + suffix.len) catch @panic("OOM");
+    @memcpy(class[0..base.len], base);
+    @memcpy(class[base.len..], suffix);
     return forest.el(a, .li, .{
         .id = std.fmt.allocPrint(a, "row-{d}", .{t.id}) catch @panic("OOM"),
-        .class = std.fmt.allocPrint(a, "{s}{s}", .{
-            if (t.done) "todo done" else "todo",
-            if (ui != null) " editing" else "",
-        }) catch @panic("OOM"),
+        .class = class,
     }, .{
         forest.el(a, .input, .{
             .lid = "cb",
             .type = "checkbox",
             .checked = t.done,
             .on = .{ .change = "set_checked" },
-            .arg = t.id,
+            .arg = arg,
         }, .{}),
         // One `when` op swaps the whole title/form branch; inside a
         // branch the diff recurses into bound descendants as usual.
-        forest.variant(a, .{ .lid = "we" }, if (ui != null) "edit" else "view", if (ui) |u| editBranch(a, t, u.draft) else viewBranch(a, t)),
+        forest.variant(a, .{ .lid = "we" }, if (ui != null) "edit" else "view", if (ui) |u| editBranch(a, u.draft, arg) else viewBranch(a, t, arg)),
         forest.el(a, .button, .{
             .class = "del",
             .@"aria-label" = "delete",
             .on = .{ .click = "delete" },
-            .arg = t.id,
+            .arg = arg,
         }, "×"),
     });
 }

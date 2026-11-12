@@ -414,12 +414,19 @@ fn postForm(a: std.mem.Allocator, slug: []const u8) forest.Node {
     });
 }
 
+/// Format a u64 id once per use site — shared by `data-arg`, hidden
+/// `value`s and `#N` labels instead of a `{d}` fmt per binding per render.
+fn u64str(a: std.mem.Allocator, v: u64) []const u8 {
+    var buf: [24]u8 = undefined;
+    return a.dupe(u8, std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable) catch @panic("OOM");
+}
+
 /// Comment form: hidden `post` (+ optional `parent`) + text input.
-fn commentFormNodes(a: std.mem.Allocator, post_id: u64, parent_id: ?u64, is_inline: bool) []const forest.Node {
+fn commentFormNodes(a: std.mem.Allocator, post_str: []const u8, parent_str: ?[]const u8, is_inline: bool) []const forest.Node {
     var kids: std.ArrayListUnmanaged(forest.Node) = .empty;
-    kids.append(a, forest.el(a, .input, .{ .type = "hidden", .name = "post", .value = post_id }, .{})) catch @panic("OOM");
-    if (parent_id) |pid| {
-        kids.append(a, forest.el(a, .input, .{ .type = "hidden", .name = "parent", .value = pid }, .{})) catch @panic("OOM");
+    kids.append(a, forest.el(a, .input, .{ .type = "hidden", .name = "post", .value = post_str }, .{})) catch @panic("OOM");
+    if (parent_str) |ps| {
+        kids.append(a, forest.el(a, .input, .{ .type = "hidden", .name = "parent", .value = ps }, .{})) catch @panic("OOM");
     }
     if (is_inline) {
         kids.append(a, forest.el(a, .input, .{
@@ -448,29 +455,36 @@ fn commentFormNodes(a: std.mem.Allocator, post_id: u64, parent_id: ?u64, is_inli
 }
 
 fn commentForm(a: std.mem.Allocator, post_id: u64, parent_id: ?u64) forest.Node {
+    const post_str = u64str(a, post_id);
+    const parent_str = if (parent_id) |pid| u64str(a, pid) else null;
     return forest.el(a, .form, .{
         .class = "comment-form",
         .autocomplete = "off",
         .on = .{ .submit = "comment" },
-    }, commentFormNodes(a, post_id, parent_id, false));
+    }, commentFormNodes(a, post_str, parent_str, false));
 }
 
 /// Inline reply form mounted under comment `c` via the `w-rep-N` anchor.
-fn replyForm(a: std.mem.Allocator, c: *const board.Comment) forest.Node {
+fn replyForm(a: std.mem.Allocator, post_str: []const u8, parent_str: []const u8) forest.Node {
     return forest.el(a, .form, .{
         .class = "reply-form",
         .autocomplete = "off",
         .on = .{ .submit = "comment" },
-    }, commentFormNodes(a, c.post, c.id, true));
+    }, commentFormNodes(a, post_str, parent_str, true));
 }
 
 /// One comment node: meta (id, Anon, time, «ответить»), text, the inline
 /// reply `when` anchor, and a nested keyed `<ul>` of children.
-fn commentNode(a: std.mem.Allocator, s: *Session, c: *const board.Comment) forest.Node {
+/// `post_str` is the thread's post id pre-formatted once per view.
+fn commentNode(a: std.mem.Allocator, s: *Session, c: *const board.Comment, post_str: []const u8) forest.Node {
     const mm = m();
     const id_str = std.fmt.allocPrint(a, "cm-{d}", .{c.id}) catch @panic("OOM");
     const rep_id = std.fmt.allocPrint(a, "w-rep-{d}", .{c.id}) catch @panic("OOM");
     const replying = s.reply_to != null and s.reply_to.? == c.id;
+    const num = u64str(a, c.id);
+    const hash = a.alloc(u8, num.len + 1) catch @panic("OOM");
+    hash[0] = '#';
+    @memcpy(hash[1..], num);
 
     var kids: std.ArrayListUnmanaged(forest.Node) = .empty;
     kids.append(a, forest.el(a, .div, .{ .class = "cmeta" }, .{
@@ -478,7 +492,7 @@ fn commentNode(a: std.mem.Allocator, s: *Session, c: *const board.Comment) fores
         forest.el(a, .a, .{
             .class = "plink",
             .href = commentHref(a, c.post, c.id),
-        }, std.fmt.allocPrint(a, "#{d}", .{c.id}) catch @panic("OOM")),
+        }, hash),
         forest.text(" · "),
         forest.el(a, .span, .{ .class = "who" }, nameOf(c.user)),
         forest.text(" · "),
@@ -487,17 +501,17 @@ fn commentNode(a: std.mem.Allocator, s: *Session, c: *const board.Comment) fores
         forest.el(a, .button, .{
             .class = "reply-btn",
             .on = .{ .click = "reply" },
-            .arg = c.id,
+            .arg = num,
         }, "ответить"),
     })) catch @panic("OOM");
     kids.append(a, forest.el(a, .div, .{ .class = "ctext" }, c.text)) catch @panic("OOM");
     // Inline reply form mounts between the text and the children list.
-    kids.append(a, forest.when(a, .{ .id = rep_id }, replying, replyForm(a, c))) catch @panic("OOM");
+    kids.append(a, forest.when(a, .{ .id = rep_id }, replying, replyForm(a, post_str, num))) catch @panic("OOM");
 
     const kid_idx = mm.childIdx(a, c.id) catch @panic("OOM");
     var ck: std.ArrayListUnmanaged(forest.Node) = .empty;
     for (kid_idx) |ci| {
-        ck.append(a, commentNode(a, s, &mm.comments.items[ci])) catch @panic("OOM");
+        ck.append(a, commentNode(a, s, &mm.comments.items[ci], post_str)) catch @panic("OOM");
     }
     kids.append(a, forest.el(a, .ul, .{ .lid = "kids", .class = "kids" }, forest.each(ck.toOwnedSlice(a) catch @panic("OOM")))) catch @panic("OOM");
 
@@ -581,9 +595,10 @@ fn threadView(a: std.mem.Allocator, s: *Session, post_id: u64) forest.Node {
     kids.append(a, commentForm(a, post_id, null)) catch @panic("OOM");
 
     const tops = mm.topCommentIdx(a, post_id) catch @panic("OOM");
+    const post_str = u64str(a, post_id);
     var ck: std.ArrayListUnmanaged(forest.Node) = .empty;
     for (tops) |ci| {
-        ck.append(a, commentNode(a, s, &mm.comments.items[ci])) catch @panic("OOM");
+        ck.append(a, commentNode(a, s, &mm.comments.items[ci], post_str)) catch @panic("OOM");
     }
     kids.append(a, forest.el(a, .ul, .{ .id = "comments", .class = "comments" }, forest.each(ck.toOwnedSlice(a) catch @panic("OOM")))) catch @panic("OOM");
     kids.append(a, forest.when(a, .{ .id = "w-comments-empty" }, tops.len == 0, forest.el(a, .p, .{ .class = "empty" }, "Нет комментариев — будь первым."))) catch @panic("OOM");
@@ -616,7 +631,7 @@ fn commentView(a: std.mem.Allocator, s: *Session, cid: u64) forest.Node {
     // Arena-allocate the single-row slice — a `&.{…}` temporary would
     // dangle once the statement ends (the keyed list outlives it).
     const only = a.alloc(forest.Node, 1) catch @panic("OOM");
-    only[0] = commentNode(a, s, c);
+    only[0] = commentNode(a, s, c, u64str(a, p.id));
     kids.append(a, forest.el(a, .ul, .{ .id = "comments", .class = "comments" }, forest.each(only))) catch @panic("OOM");
     return forest.fragment(a, kids.toOwnedSlice(a) catch @panic("OOM"));
 }

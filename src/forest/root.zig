@@ -9,7 +9,6 @@ pub const PatchLog = patch.PatchLog;
 pub const escapeHtml = patch.escapeHtml;
 pub const escapeHtmlInto = patch.escapeHtmlInto;
 pub const Dom = dom.Dom;
-pub const Row = dom.Row;
 pub const Node = view.Node;
 pub const Element = view.Element;
 pub const Variant = view.Variant;
