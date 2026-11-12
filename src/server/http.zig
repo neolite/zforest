@@ -228,7 +228,7 @@ fn renderHead(comptime Session: type, s: *Session, out: anytype) !void {
 }
 
 fn renderTail(out: anytype) !void {
-    try out.writeAll("</main><script src=\"/client.js?v=3\"></script></body></html>");
+    try out.writeAll("</main><script src=\"/client.js?v=4\"></script></body></html>");
 }
 
 fn handle(

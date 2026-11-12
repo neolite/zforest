@@ -48,6 +48,14 @@ pub const Session = struct {
     st_feed: *zefx.Store([]const u8) = undefined,
     /// Firehose log text — one leaf, rewritten whole each refresh.
     st_log: *zefx.Store([]const u8) = undefined,
+    /// Sparkline `points` payloads — attr-bound leaves on SVG polylines.
+    st_sp_rps: *zefx.Store([]const u8) = undefined,
+    st_sp_err: *zefx.Store([]const u8) = undefined,
+    st_sp_lat: *zefx.Store([]const u8) = undefined,
+    /// Traffic-control readouts ("100%", "10.00%", "100%").
+    st_p_rate: *zefx.Store([]const u8) = undefined,
+    st_p_err: *zefx.Store([]const u8) = undefined,
+    st_p_lat: *zefx.Store([]const u8) = undefined,
     /// Error rate in basis points (0..10000) — feeds `computed` bindings.
     st_err_bp: *zefx.Store(u64) = undefined,
     /// Derived health flags — drive the `variant` status pills.
@@ -130,7 +138,6 @@ pub const Session = struct {
         fields: ?*const std.json.ObjectMap,
     ) !void {
         _ = arg;
-        _ = value;
         _ = fields;
         self.out_cookie = "";
         var rb: [16]u8 = undefined;
@@ -144,6 +151,19 @@ pub const Session = struct {
             m().record(.{ .ok = true, .lat_ms = 700.0 + @as(f64, @floatFromInt(roll % 400)), .method = "POST", .path = "/inject/slow", .status = 200 });
         } else if (std.mem.eql(u8, action, "inject_storm")) {
             m().storm(400);
+        } else if (std.mem.eql(u8, action, "ctl_rate") or
+            std.mem.eql(u8, action, "ctl_err") or
+            std.mem.eql(u8, action, "ctl_lat"))
+        {
+            const v = value orelse return error.InvalidAction;
+            const n = std.fmt.parseInt(u32, v, 10) catch return error.InvalidAction;
+            const kind: MonModel.ParamKind = if (std.mem.eql(u8, action, "ctl_rate"))
+                .rate
+            else if (std.mem.eql(u8, action, "ctl_err"))
+                .err
+            else
+                .lat;
+            m().setParam(kind, n);
         } else {
             return error.InvalidAction;
         }
@@ -199,6 +219,13 @@ pub const Session = struct {
         self.st_feed.set(feed);
         const log = m().logText(a.alloc(u8, 24576) catch a.alloc(u8, 0) catch return);
         self.st_log.set(log);
+        self.st_sp_rps.set(m().sparkline(.rps, a.alloc(u8, 1400) catch a.alloc(u8, 0) catch return));
+        self.st_sp_err.set(m().sparkline(.err, a.alloc(u8, 1400) catch a.alloc(u8, 0) catch return));
+        self.st_sp_lat.set(m().sparkline(.lat, a.alloc(u8, 1400) catch a.alloc(u8, 0) catch return));
+        const p = m().params();
+        self.st_p_rate.set(std.fmt.allocPrint(a, "{d}%", .{p.rate_pct}) catch "");
+        self.st_p_err.set(std.fmt.allocPrint(a, "{d}.{d:0>2}%", .{ p.err_bp / 100, p.err_bp % 100 }) catch "");
+        self.st_p_lat.set(std.fmt.allocPrint(a, "{d}%", .{p.lat_pct}) catch "");
         self.st_err_bp.set(@as(u64, @intFromFloat(@round(s.err_pct * 100))));
         self.st_rps_s.set(std.fmt.allocPrint(a, "{d}", .{@as(u64, @intFromFloat(@round(s.rps)))}) catch "");
         self.st_lat_s.set(std.fmt.allocPrint(a, "{d}", .{@as(u64, @intFromFloat(@round(s.avg_lat_ms)))}) catch "");
@@ -257,6 +284,40 @@ fn btn(a: std.mem.Allocator, action: []const u8, label: []const u8) forest.Node 
     return forest.el(a, .button, .{ .class = "btn", .on = .{ .click = action } }, label);
 }
 
+/// Range slider bound to a model param via `change` → POST /action.
+fn ctl(
+    a: std.mem.Allocator,
+    label: []const u8,
+    action: []const u8,
+    min: u32,
+    max: u32,
+    step: u32,
+    val: anytype,
+) forest.Node {
+    return forest.el(a, .div, .{ .class = "ctl" }, .{
+        forest.el(a, .span, .{ .class = "ctl-name" }, label),
+        forest.el(a, .input, .{
+            .type = "range",
+            .min = min,
+            .max = max,
+            .step = step,
+            .on = .{ .change = action },
+        }, .{}),
+        forest.el(a, .span, .{ .class = "ctl-val", .text = val }, .{}),
+    });
+}
+
+/// Sparkline card: label + SVG polyline whose `points` attr is a live
+/// leaf bound to a store (attr op per refresh — no rebuild).
+fn spark(a: std.mem.Allocator, id: []const u8, label: []const u8, pts: anytype) forest.Node {
+    return forest.el(a, .div, .{ .class = "spark" }, .{
+        forest.el(a, .div, .{ .class = "clabel" }, label),
+        forest.el(a, .svg, .{ .class = "spark-svg", .viewBox = "0 0 120 28" }, .{
+            forest.el(a, .polyline, .{ .id = id, .class = "spark-line", .points = pts, .fill = "none" }, .{}),
+        }),
+    });
+}
+
 fn errPctText(a: std.mem.Allocator, bp: u64) []const u8 {
     return std.fmt.allocPrint(a, "{d}.{d}%", .{ bp / 100, bp % 100 }) catch "—";
 }
@@ -294,6 +355,16 @@ fn buildView(a: std.mem.Allocator, s: *Session) []const forest.Node {
             card(a, "mon-total", "total reqs", s.st_total_s),
             card(a, "mon-up", "uptime", s.st_up_s),
             card(a, "mon-status", "status", forest.computed(s.st_err_bp, statusText)),
+        }),
+        forest.el(a, .div, .{ .class = "mon-controls" }, .{
+            ctl(a, "traffic", "ctl_rate", 0, 500, 10, s.st_p_rate),
+            ctl(a, "errors", "ctl_err", 0, 3000, 50, s.st_p_err),
+            ctl(a, "latency", "ctl_lat", 0, 400, 10, s.st_p_lat),
+        }),
+        forest.el(a, .div, .{ .class = "mon-sparks" }, .{
+            spark(a, "sp-rps", "req/s", s.st_sp_rps),
+            spark(a, "sp-err", "errors %", s.st_sp_err),
+            spark(a, "sp-lat", "latency ms", s.st_sp_lat),
         }),
         forest.el(a, .div, .{ .id = "feed", .class = "feed", .text = s.st_feed }, .{}),
         forest.el(a, .div, .{ .class = "mon-logwrap" }, .{
@@ -333,6 +404,12 @@ pub fn createSession(gpa: std.mem.Allocator, io: std.Io) *Session {
     s.st_up_s = s.app.createStore([]const u8, "");
     s.st_feed = s.app.createStore([]const u8, "");
     s.st_log = s.app.createStore([]const u8, "");
+    s.st_sp_rps = s.app.createStore([]const u8, "");
+    s.st_sp_err = s.app.createStore([]const u8, "");
+    s.st_sp_lat = s.app.createStore([]const u8, "");
+    s.st_p_rate = s.app.createStore([]const u8, "100%");
+    s.st_p_err = s.app.createStore([]const u8, "10.00%");
+    s.st_p_lat = s.app.createStore([]const u8, "100%");
     s.st_err_bp = s.app.createStore(u64, 0);
     s.st_ok = s.st_err_bp.map(bool, isOk);
     s.st_bad = s.st_err_bp.map(bool, isBad);

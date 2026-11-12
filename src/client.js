@@ -15,6 +15,7 @@
     disabled: true,
     "class": true,
     type: true,
+    points: true,
   };
 
   // Comment anchors for "when" ops: id -> {start, end} Comment nodes.

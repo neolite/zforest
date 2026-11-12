@@ -36,6 +36,7 @@ fn nowMillis() i64 {
 
 const LogCap = 384;
 const LineCap = 96;
+const HistCap = 120;
 
 pub const MonModel = struct {
     io: std.Io,
@@ -67,6 +68,21 @@ pub const MonModel = struct {
     log_head: usize = 0,
     log_count: usize = 0,
 
+    // ── traffic controls (set via ctl_* actions, read by tick) ──
+    /// Burst size percent (0..500).
+    rate_pct: u32 = 100,
+    /// Error probability in basis points (0..10000).
+    err_bp: u32 = 1000,
+    /// Latency scale percent (0..400).
+    lat_pct: u32 = 100,
+
+    // ── completed-window history for sparklines ──
+    hist_rps: [HistCap]u16 = @splat(0),
+    hist_err: [HistCap]u16 = @splat(0),
+    hist_lat: [HistCap]u16 = @splat(0),
+    hist_head: usize = 0,
+    hist_count: usize = 0,
+
     start_s: i64 = 0,
 
     global_seq: std.atomic.Value(u64) = .init(0),
@@ -97,16 +113,17 @@ pub const MonModel = struct {
     const ok_status = [_]u16{ 200, 200, 200, 201, 204, 301 };
     const err_status = [_]u16{ 400, 404, 429, 500, 502, 503 };
 
-    /// Roll one synthetic request descriptor.
+    /// Roll one synthetic request descriptor — error rate and latency
+    /// scale come from the live traffic controls.
     fn rollReq(self: *MonModel, seed: u32) Req {
-        _ = self;
-        const ok = seed % 100 < 90;
+        const ok = seed % 10000 >= self.err_bp;
         const method = methods[seed % methods.len];
         const path = paths[(seed / 7) % paths.len];
-        const lat = if (ok)
+        const base_lat = if (ok)
             2.0 + @as(f64, @floatFromInt(seed % 90))
         else
             150.0 + @as(f64, @floatFromInt((seed / 13) % 1100));
+        const lat = base_lat * @as(f64, @floatFromInt(self.lat_pct)) / 100.0;
         const status = if (ok)
             ok_status[(seed / 11) % ok_status.len]
         else
@@ -178,18 +195,29 @@ pub const MonModel = struct {
         self.bump();
     }
 
-    /// Ticker: rotate the window, synthesize a burst of fake requests.
+    /// Ticker: archive the completed window into sparkline history,
+    /// rotate, then synthesize a burst sized by the rate control.
     pub fn tick(self: *MonModel) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const now = nowMillis();
+        const elapsed_ms = now - self.win_start_ms;
+        if (self.win_total > 0 and elapsed_ms > 0) {
+            const wt = @as(f64, @floatFromInt(self.win_total));
+            self.pushHist(
+                @as(u16, @intFromFloat(@min(@as(f64, 65535), wt * 1000.0 / @as(f64, @floatFromInt(elapsed_ms))))),
+                @as(u16, @intFromFloat(@min(@as(f64, 65535), @as(f64, @floatFromInt(self.win_errors)) * 10000.0 / wt))),
+                @as(u16, @intFromFloat(@min(@as(f64, 65535), self.win_lat_sum / wt))),
+            );
+        }
         self.win_total = 0;
         self.win_errors = 0;
         self.win_lat_sum = 0;
         self.win_start_ms = now;
         var rb: [16]u8 = undefined;
         self.io.random(&rb);
-        const n = 15 + (std.mem.readInt(u32, rb[0..4], .little) % 25);
+        const base = 15 + (std.mem.readInt(u32, rb[0..4], .little) % 25);
+        const n = @min(@as(usize, 600), base * @as(usize, self.rate_pct) / 100);
         var i: usize = 0;
         var seed = std.mem.readInt(u32, rb[4..8], .little);
         while (i < n) : (i += 1) {
@@ -197,6 +225,71 @@ pub const MonModel = struct {
             self.recordLocked(self.rollReq(seed));
         }
         self.bump();
+    }
+
+    fn pushHist(self: *MonModel, rps: u16, err_bp: u16, lat_ms: u16) void {
+        const idx = self.hist_head % HistCap;
+        self.hist_rps[idx] = rps;
+        self.hist_err[idx] = err_bp;
+        self.hist_lat[idx] = lat_ms;
+        self.hist_head = (self.hist_head + 1) % HistCap;
+        if (self.hist_count < HistCap) self.hist_count += 1;
+    }
+
+    pub const ParamKind = enum { rate, err, lat };
+
+    pub const Params = struct { rate_pct: u32, err_bp: u32, lat_pct: u32 };
+
+    /// Clamp-and-set one traffic control.
+    pub fn setParam(self: *MonModel, kind: ParamKind, v: u32) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        switch (kind) {
+            .rate => self.rate_pct = @min(v, 500),
+            .err => self.err_bp = @min(v, 5000),
+            .lat => self.lat_pct = @min(v, 400),
+        }
+    }
+
+    pub fn params(self: *MonModel) Params {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return .{ .rate_pct = self.rate_pct, .err_bp = self.err_bp, .lat_pct = self.lat_pct };
+    }
+
+    pub const SparkKind = enum { rps, err, lat };
+
+    /// `points` attribute payload for a 120×28-viewBox polyline: oldest
+    /// sample left, autoscaled to the ring's max. Newest-first rings are
+    /// walked oldest→newest so the line reads left-to-right in time.
+    pub fn sparkline(self: *MonModel, comptime kind: SparkKind, buf: []u8) []const u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const ring: *const [HistCap]u16 = switch (kind) {
+            .rps => &self.hist_rps,
+            .err => &self.hist_err,
+            .lat => &self.hist_lat,
+        };
+        var max: u16 = 1;
+        var i: usize = 0;
+        while (i < self.hist_count) : (i += 1) {
+            const idx = (self.hist_head + HistCap - self.hist_count + i) % HistCap;
+            max = @max(max, ring[idx]);
+        }
+        var fbs = std.heap.FixedBufferAllocator.init(buf);
+        const fa = fbs.allocator();
+        var out: std.ArrayList(u8) = .empty;
+        const denom = @max(@as(usize, 1), self.hist_count -| 1);
+        i = 0;
+        while (i < self.hist_count) : (i += 1) {
+            const idx = (self.hist_head + HistCap - self.hist_count + i) % HistCap;
+            const v = ring[idx];
+            const x = @divTrunc(i * 119, denom);
+            const y = 27 -| @min(@as(u32, 27), @as(u32, @intCast(v)) * 27 / @as(u32, @intCast(max)));
+            if (i != 0) out.append(fa, ' ') catch break;
+            out.print(fa, "{d},{d}", .{ x, y }) catch break;
+        }
+        return out.items;
     }
 
     pub fn snapshot(self: *MonModel) Snapshot {

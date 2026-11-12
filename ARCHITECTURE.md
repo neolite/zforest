@@ -135,6 +135,12 @@ Verified live: one SSE patch batch carried `text` ops for every changed
 card plus `when` ops swapping the HEALTHY/DEGRADED pill — zero view
 rebuilds after the initial bind.
 
+zmon also exercises attr bindings and two-way control: SVG sparkline
+`points` attrs are live leaves (`attr` ops, `points` added to the
+client whitelist), and range sliders POST `ctl_*` actions that mutate
+shared model params (`rate_pct`/`err_bp`/`lat_pct`) — the next tick
+reads them, so UI controls steer the synthetic traffic itself.
+
 ## Deferred / future
 
 - Per-item reactive cells — blocked on detachable graph lifecycle
