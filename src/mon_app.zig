@@ -1,7 +1,8 @@
-//! zmon — live ops dashboard. The reactive graph genuinely drives the
-//! view here: `syncPull`/injects refresh session stores from the shared
-//! `MonModel`, store.set flushes settle, and the after-flush hook diffs
-//! the declarative view — only changed bindings ship as SSE patches.
+//! zmon — live ops dashboard on fine-grained bindings: the view tree is
+//! built ONCE per session, `bindTree` subscribes every bound leaf
+//! (`.text`/attrs/`variant` keys) to its zefx store, and store
+//! notifications emit patch ops directly — no per-tick rebuild+diff.
+//! Derived stores (`map`) feed `computed` bindings and `variant` pills.
 
 const std = @import("std");
 const zefx = @import("zefx");
@@ -47,12 +48,19 @@ pub const Session = struct {
     st_feed: *zefx.Store([]const u8) = undefined,
     /// Error rate in basis points (0..10000) — feeds `computed` bindings.
     st_err_bp: *zefx.Store(u64) = undefined,
+    /// Derived health flags — drive the `variant` status pills.
+    st_ok: *zefx.Store(bool) = undefined,
+    st_bad: *zefx.Store(bool) = undefined,
 
     dom: forest.Dom,
     log: forest.PatchLog,
     history: History,
     render_arena: std.heap.ArenaAllocator,
     fmt_arena: std.heap.ArenaAllocator,
+    /// Session-lifetime arena for the view tree — built once, never reset
+    /// (bindings capture its slices; rebuilding would orphan subscriptions).
+    view_arena: std.heap.ArenaAllocator,
+    view_nodes: ?[]const forest.Node = null,
     csrf_token: []u8 = &.{},
 
     const Ping = struct {};
@@ -68,6 +76,7 @@ pub const Session = struct {
         self.history.deinit();
         self.render_arena.deinit();
         self.fmt_arena.deinit();
+        self.view_arena.deinit();
         self.app.deinit();
         self.gpa.destroy(self);
     }
@@ -164,11 +173,13 @@ pub const Session = struct {
         eng.onAfterFlush(.{
             .ctx = @ptrCast(self),
             .call = &struct {
-                fn render(raw: *anyopaque) void {
+                fn commit(raw: *anyopaque) void {
                     const s: *Session = @ptrCast(@alignCast(raw));
-                    s.render();
+                    // Live bindings already emitted their ops during the
+                    // notify phase; the hook only stamps the batch rev.
+                    s.log.revision = s.seq.get();
                 }
-            }.render,
+            }.commit,
         });
     }
 
@@ -191,40 +202,48 @@ pub const Session = struct {
 
     // ── rendering ──────────────────────────────────────────────────
 
-    fn render(self: *Session) void {
-        _ = self.render_arena.reset(.retain_capacity);
-        const a = self.render_arena.allocator();
-        forest.diff(a, buildView(a, self), &self.dom, &self.log);
-        self.log.revision = self.seq.get();
+    /// The session's view tree — built once into `view_arena` and reused
+    /// for SSR, snapshots and live bindings.
+    fn viewNodes(self: *Session) []const forest.Node {
+        if (self.view_nodes) |n| return n;
+        const a = self.view_arena.allocator();
+        self.view_nodes = buildView(a, self);
+        return self.view_nodes.?;
     }
 
     /// Render the `<main>` inner content — used by the initial page.
     pub fn writeView(self: *Session, writer: anytype) !void {
         _ = self.render_arena.reset(.retain_capacity);
         const a = self.render_arena.allocator();
-        try forest.writeHtml(a, buildView(a, self), writer);
+        try forest.writeHtml(a, self.viewNodes(), writer);
     }
 
     /// The session's current view nodes — the SSE snapshot writer
     /// serializes them via `forest.writeSnapshotOps`.
-    pub fn buildViewNodes(self: *Session, a: std.mem.Allocator) []const forest.Node {
+    pub fn buildViewNodes(self: *Session, _: std.mem.Allocator) []const forest.Node {
         self.refreshStores();
-        return buildView(a, self);
+        return self.viewNodes();
     }
 
-    /// Seed tracked DOM state to match markup already emitted in the page.
+    /// Seed tracked DOM state to match the shipped page, then subscribe
+    /// every live-capable leaf — from here on, store notifications emit
+    /// patches directly (no rebuild, no diff).
     pub fn seedDom(self: *Session) void {
-        self.render();
+        _ = self.render_arena.reset(.retain_capacity);
+        const a = self.render_arena.allocator();
+        const nodes = self.viewNodes();
+        forest.diff(a, nodes, &self.dom, &self.log);
         self.log.clear();
+        forest.bindTree(self.fmt_arena.allocator(), nodes, &self.dom, &self.log);
     }
 };
 
 // ── view ──────────────────────────────────────────────────────────
 
-fn card(a: std.mem.Allocator, label: []const u8, val: anytype) forest.Node {
+fn card(a: std.mem.Allocator, id: []const u8, label: []const u8, val: anytype) forest.Node {
     return forest.el(a, .div, .{ .class = "card" }, .{
         forest.el(a, .div, .{ .class = "clabel" }, label),
-        forest.el(a, .div, .{ .class = "cval", .text = val }, .{}),
+        forest.el(a, .div, .{ .class = "cval", .id = id, .text = val }, .{}),
     });
 }
 
@@ -240,20 +259,35 @@ fn statusText(_: std.mem.Allocator, bp: u64) []const u8 {
     return if (bp > 500) "DEGRADED" else "HEALTHY";
 }
 
+fn isOk(bp: u64) bool {
+    return bp <= 500;
+}
+
+fn isBad(bp: u64) bool {
+    return bp > 500;
+}
+
 fn buildView(a: std.mem.Allocator, s: *Session) []const forest.Node {
     const nodes = a.alloc(forest.Node, 1) catch @panic("OOM");
     nodes[0] = forest.el(a, .div, .{ .class = "mon" }, .{
         forest.el(a, .div, .{ .class = "mon-head" }, .{
             forest.el(a, .span, .{ .class = "mon-title" }, "zmon — live ops"),
-            forest.el(a, .span, .{ .class = "mon-status", .text = forest.computed(s.st_err_bp, statusText) }, .{}),
+            // Structural fine-graining: the pill mounts/unmounts live via
+            // a `variant` key bound to derived stores — no rebuild.
+            forest.variant(a, .{ .id = "mon-pill-ok" }, s.st_ok, .{
+                forest.el(a, .span, .{ .class = "mon-pill ok" }, "HEALTHY"),
+            }),
+            forest.variant(a, .{ .id = "mon-pill-bad" }, s.st_bad, .{
+                forest.el(a, .span, .{ .class = "mon-pill bad" }, "DEGRADED"),
+            }),
         }),
         forest.el(a, .div, .{ .class = "mon-grid" }, .{
-            card(a, "req/s", s.st_rps_s),
-            card(a, "error rate", forest.computed(s.st_err_bp, errPctText)),
-            card(a, "avg latency", s.st_lat_s),
-            card(a, "total reqs", s.st_total_s),
-            card(a, "uptime", s.st_up_s),
-            card(a, "status", forest.computed(s.st_err_bp, statusText)),
+            card(a, "mon-rps", "req/s", s.st_rps_s),
+            card(a, "mon-err", "error rate", forest.computed(s.st_err_bp, errPctText)),
+            card(a, "mon-lat", "avg latency", s.st_lat_s),
+            card(a, "mon-total", "total reqs", s.st_total_s),
+            card(a, "mon-up", "uptime", s.st_up_s),
+            card(a, "mon-status", "status", forest.computed(s.st_err_bp, statusText)),
         }),
         forest.el(a, .div, .{ .id = "feed", .class = "feed", .text = s.st_feed }, .{}),
         forest.el(a, .div, .{ .class = "mon-actions" }, .{
@@ -278,6 +312,7 @@ pub fn createSession(gpa: std.mem.Allocator, io: std.Io) *Session {
         .history = History.init(gpa),
         .render_arena = std.heap.ArenaAllocator.init(gpa),
         .fmt_arena = std.heap.ArenaAllocator.init(gpa),
+        .view_arena = std.heap.ArenaAllocator.init(gpa),
     };
     s.ping = s.app.createEvent(Session.Ping);
     s.seq = s.app.createStore(u64, 0);
@@ -287,6 +322,8 @@ pub fn createSession(gpa: std.mem.Allocator, io: std.Io) *Session {
     s.st_up_s = s.app.createStore([]const u8, "");
     s.st_feed = s.app.createStore([]const u8, "");
     s.st_err_bp = s.app.createStore(u64, 0);
+    s.st_ok = s.st_err_bp.map(bool, isOk);
+    s.st_bad = s.st_err_bp.map(bool, isBad);
     s.wire();
     return s;
 }

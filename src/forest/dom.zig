@@ -14,6 +14,27 @@ pub const Dom = struct {
     orders: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]u8)) = .empty,
     /// `z-when` anchor id -> last mounted branch key (null value = empty branch)
     when_states: std.StringHashMapUnmanaged(?[]u8) = .empty,
+    /// Live leaf bindings subscribed to reactive stores (see view.bindTree).
+    /// `node_id` is the owned resolved id used for prefix drops; `ctx` is
+    /// an opaque binder record whose `destroy` unsubscribes and frees it.
+    bindings: std.ArrayListUnmanaged(Binding) = .empty,
+
+    /// One live binding registration. `kind`/`name` disambiguate leaves
+    /// sharing an element id (its `.text` vs each bound attr vs a `when`
+    /// anchor on the same id).
+    pub const Binding = struct {
+        pub const Kind = enum { text, attr, when_key };
+        kind: Kind,
+        /// Owned resolved node/anchor id — matched against removeTracked's
+        /// `id`/`id/…` prefix rule.
+        node_id: []u8,
+        /// Owned attribute name for `.attr` bindings, "" otherwise.
+        name: []u8 = "",
+        ctx: *anyopaque,
+        /// Unsubscribes the store watcher and frees `ctx` (and `node_id`/
+        /// `name` stay owned by the Dom — freed by the drop helpers).
+        destroy: *const fn (*anyopaque) void,
+    };
 
     pub fn init(gpa: std.mem.Allocator) Dom {
         return .{ .gpa = gpa };
@@ -54,6 +75,59 @@ pub const Dom = struct {
             if (e.value_ptr.*) |v| self.gpa.free(v);
         }
         self.when_states.deinit(self.gpa);
+        self.dropAllBindings();
+        self.bindings.deinit(self.gpa);
+    }
+
+    /// Whether a live binding for `(kind, node_id, name)` is already
+    /// registered — bindTree uses this to stay idempotent.
+    pub fn findBinding(self: *Dom, kind: Binding.Kind, node_id: []const u8, name: []const u8) bool {
+        for (self.bindings.items) |b| {
+            if (b.kind == kind and std.mem.eql(u8, b.node_id, node_id) and std.mem.eql(u8, b.name, name)) return true;
+        }
+        return false;
+    }
+
+    /// Register a live binding. `node_id`/`name` are copied; `ctx` ownership
+    /// transfers to the Dom (destroyed on drop/deinit).
+    pub fn addBinding(self: *Dom, kind: Binding.Kind, node_id: []const u8, name: []const u8, ctx: *anyopaque, destroy: *const fn (*anyopaque) void) void {
+        self.bindings.append(self.gpa, .{
+            .kind = kind,
+            .node_id = self.gpa.dupe(u8, node_id) catch @panic("OOM"),
+            .name = self.gpa.dupe(u8, name) catch @panic("OOM"),
+            .ctx = ctx,
+            .destroy = destroy,
+        }) catch @panic("OOM");
+    }
+
+    fn dropBindingAt(self: *Dom, i: usize) void {
+        const b = self.bindings.orderedRemove(i);
+        b.destroy(b.ctx);
+        self.gpa.free(b.node_id);
+        self.gpa.free(b.name);
+    }
+
+    /// Unsubscribe + free every binding whose node id is `id` or under
+    /// `id/…` — mirrors the texts/attrs/when_states prefix rule. `keep`
+    /// exempts one binder ctx (a `when_key` binder dropping its own
+    /// anchor's tracked state during a branch swap must survive).
+    pub fn dropBindings(self: *Dom, id: []const u8, keep: ?*anyopaque) void {
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = std.fmt.bufPrint(&prefix_buf, "{s}/", .{id}) catch @panic("id too long");
+        var i: usize = 0;
+        while (i < self.bindings.items.len) {
+            const b = &self.bindings.items[i];
+            const kept = keep != null and b.ctx == keep.?;
+            if (!kept and (std.mem.eql(u8, b.node_id, id) or std.mem.startsWith(u8, b.node_id, prefix))) {
+                self.dropBindingAt(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn dropAllBindings(self: *Dom) void {
+        while (self.bindings.items.len > 0) self.dropBindingAt(self.bindings.items.len - 1);
     }
 
     /// Emit a text patch only when the tracked value differs.
@@ -187,7 +261,10 @@ pub const Dom = struct {
     }
 
     /// Drop tracked state for `id` and any child bindings ("<id>/...").
-    pub fn removeTracked(self: *Dom, id: []const u8) void {
+    /// `keep_binding` exempts one live binder from the drop (see
+    /// dropBindings) — used by `when_key` emitters re-seeding their own
+    /// anchor.
+    pub fn removeTracked(self: *Dom, id: []const u8, keep_binding: ?*anyopaque) void {
         var prefix_buf: [128]u8 = undefined;
         const prefix = std.fmt.bufPrint(&prefix_buf, "{s}/", .{id}) catch @panic("id too long");
 
@@ -233,6 +310,7 @@ pub const Dom = struct {
             self.gpa.free(kv.key);
             if (kv.value) |v| self.gpa.free(v);
         }
+        self.dropBindings(id, keep_binding);
     }
 
     /// Diff `ids` (desired order) against the last known order for
@@ -276,7 +354,7 @@ pub const Dom = struct {
                 continue;
             }
             log.remove(id);
-            self.removeTracked(id);
+            self.removeTracked(id, null);
             self.gpa.free(id);
             _ = cur.orderedRemove(i);
         }
@@ -542,7 +620,7 @@ test "when anchors track branch keys and purge with their row" {
     try std.testing.expect(!dom.setWhen("row-1/sw", "on"));
 
     // Removing the row drops only prefix-matched anchor state.
-    dom.removeTracked("row-1");
+    dom.removeTracked("row-1", null);
     try std.testing.expect(dom.when_states.get("row-1/sw") == null);
     try std.testing.expect(dom.when_states.get("row-1/deep/nest") == null);
     try std.testing.expect(dom.when_states.get("w-top") != null);

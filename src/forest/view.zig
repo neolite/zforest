@@ -90,6 +90,11 @@ pub const Bound = struct {
     call: *const fn (a: std.mem.Allocator, ctx: *const anyopaque) ?[]const u8,
     /// Resolved bools render as bare-name presence attributes.
     presence: bool = false,
+    /// Fine-grained subscription hooks — set by `bindGet`/`computed` when
+    /// the source store exposes the watch contract (`watchCtx`/`unwatch`/
+    /// `Value`, i.e. zefx `Store`). `bindTree` subscribes the leaf to the
+    /// store so it self-updates between structural diffs.
+    live: ?Live = null,
 };
 
 /// An element's children: either static nodes or a keyed list (from
@@ -235,6 +240,7 @@ pub fn computed(store: anytype, comptime f: anytype) Bound {
         .ctx = store,
         .call = &gen.call,
         .presence = comptime fnReturnsBool(@TypeOf(f)),
+        .live = liveFor(S),
     };
 }
 
@@ -418,6 +424,7 @@ fn bindGet(store: anytype) Bound {
         .ctx = store,
         .call = &gen.call,
         .presence = comptime getReturnsBool(S),
+        .live = liveFor(S),
     };
 }
 
@@ -677,7 +684,7 @@ fn diffNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, dom: *Dom
                 for (v.nodes) |k| writeNode(a, k, anchor, &aw.writer) catch @panic("OOM");
             }
             log.setWhen(anchor, aw.toOwnedSlice() catch @panic("OOM"));
-            dom.removeTracked(anchor);
+            dom.removeTracked(anchor, null);
             // removeTracked drops the anchor's own when_state too — re-seed.
             dom.seedWhen(anchor, key);
             if (key != null) for (v.nodes) |k| seedNode(a, k, anchor, dom);
@@ -833,6 +840,277 @@ fn seedNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, dom: *Dom
                     for (kids) |k| ids.append(a, keyedChildId(k)) catch @panic("OOM");
                     dom.seedOrder(pid, ids.items);
                     for (kids) |k| seedNode(a, k, pid, dom);
+                },
+            }
+        },
+    }
+}
+
+// ── live bindings (fine-grained updates) ────────────────────────
+//
+// `diff` reconciles a freshly built tree against tracked Dom state on
+// every render. `bindTree` is the alternative for sessions whose view is
+// built ONCE: every bound leaf whose `Bound` carries `.live` (any
+// `*T.get()` store exposing `watchCtx`/`unwatch`/`Value` — zefx `Store`)
+// gets a `Binder` subscribed to the store. When the store notifies, the
+// binder re-resolves the Bound and emits the matching patch op straight
+// into the session's PatchLog — no view rebuild, no tree walk.
+//
+// Scope: leaf bindings (`.text`, attrs) and `variant`/`when` branch keys.
+// Keyed lists and multi-branch variants stay structural — the tree is
+// walked as built, so live mode wants a stable structure (build the view
+// once per session/route and never rebuild it).
+
+/// Subscription hooks carried by `Bound.live`. `attach` allocates a
+/// `Binder`, subscribes it to `env.store` and registers it on `env.dom`.
+pub const Live = struct {
+    attach: *const fn (env: AttachEnv) *Binder,
+};
+
+/// Everything a leaf binder needs: Dom/PatchLog targets, the resolved
+/// node id, and the Bound thunk to re-run on every notification.
+/// `store` is `Bound.ctx` — for `bindGet`/`computed` that IS the store
+/// pointer the watch contract is invoked on.
+pub const AttachEnv = struct {
+    gpa: std.mem.Allocator,
+    /// Scratch for `bound_call` resolutions at emit time — must outlive
+    /// the flush (a per-refresh arena is the right choice).
+    arena: std.mem.Allocator,
+    dom: *Dom,
+    log: *PatchLog,
+    kind: dom_mod.Dom.Binding.Kind,
+    /// Resolved element/anchor id (owned copy made by `attach`).
+    id: []const u8,
+    /// Attribute name for `.attr` bindings, "" otherwise.
+    name: []const u8 = "",
+    store: *const anyopaque,
+    bound_call: *const fn (std.mem.Allocator, *const anyopaque) ?[]const u8,
+    bound_ctx: *const anyopaque,
+    /// Branch markup for `.when_key` binders — re-serialized on swaps.
+    variant_nodes: []const Node = &.{},
+};
+
+/// A subscribed leaf. Owned by the Dom's binding registry; `detach_fn`
+/// (generated per store type) unsubscribes and frees everything.
+pub const Binder = struct {
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    dom: *Dom,
+    log: *PatchLog,
+    kind: dom_mod.Dom.Binding.Kind,
+    id: []u8,
+    name: []u8,
+    store: *const anyopaque,
+    /// Boxed store Subscription — opaque here, typed in the trampoline.
+    sub_box: *anyopaque,
+    detach_fn: *const fn (*Binder) void,
+    bound_call: *const fn (std.mem.Allocator, *const anyopaque) ?[]const u8,
+    bound_ctx: *const anyopaque,
+    variant_nodes: []const Node,
+
+    /// Re-resolve the Bound and emit the leaf's patch op. Called from the
+    /// store's notify phase — the graph has settled, `arena` is scratch.
+    pub fn emit(self: *Binder) void {
+        const s = self.bound_call(self.arena, self.bound_ctx);
+        switch (self.kind) {
+            .text => if (s) |v| self.dom.setText(self.log, self.id, v),
+            .attr => self.dom.setAttr(self.log, self.id, self.name, s),
+            .when_key => self.emitWhen(s),
+        }
+    }
+
+    /// Branch-key change: one idempotent `when` op ships the new branch
+    /// markup, tracked state under the anchor is dropped (inner bindings
+    /// unsubscribed — `self` is kept), then the branch is re-seeded and
+    /// re-bound. Mirrors `diffNode`'s variant path.
+    fn emitWhen(self: *Binder, key: ?[]const u8) void {
+        if (!self.dom.setWhen(self.id, key)) return;
+        var aw: std.Io.Writer.Allocating = .init(self.arena);
+        defer aw.deinit();
+        if (key != null) {
+            for (self.variant_nodes) |k| writeNode(self.arena, k, self.id, &aw.writer) catch @panic("OOM");
+        }
+        self.log.setWhen(self.id, aw.toOwnedSlice() catch @panic("OOM"));
+        self.dom.removeTracked(self.id, self);
+        // removeTracked drops the anchor's own when_state too — re-seed.
+        self.dom.seedWhen(self.id, key);
+        if (key != null) {
+            const a = self.arena;
+            for (self.variant_nodes) |k| seedNode(a, k, self.id, self.dom);
+            bindNodes(a, self.variant_nodes, self.id, self.dom, self.log);
+        }
+    }
+};
+
+/// Live hooks for store pointer type `S` (`*T.get()`), or null when the
+/// store doesn't expose the watch contract — those bindings simply stay
+/// diff-resolved.
+fn liveFor(comptime S: type) ?Live {
+    const ptr_info = @typeInfo(S).pointer;
+    if (ptr_info.attrs.@"const") return null;
+    const C = std.meta.Child(S);
+    const can = comptime switch (@typeInfo(C)) {
+        .@"struct", .@"union", .@"enum", .@"opaque" => @hasDecl(C, "watchCtx") and @hasDecl(C, "unwatch") and @hasDecl(C, "Value"),
+        else => false,
+    };
+    if (!can) return null;
+    return .{ .attach = &LiveGen(S).attach };
+}
+
+/// Per-store-type trampolines: `watchCtx` needs a comptime callback whose
+/// payload type is the store's `Value`, so the glue is generated here.
+fn LiveGen(comptime S: type) type {
+    const C = std.meta.Child(S);
+    return struct {
+        const SubT = @TypeOf((@as(S, undefined)).watchCtx(@as(*Binder, undefined), &watchCb));
+
+        fn watchCb(b: *Binder, v: C.Value) void {
+            _ = v;
+            b.emit();
+        }
+
+        fn attach(env: AttachEnv) *Binder {
+            const st: S = @ptrCast(@alignCast(@constCast(env.store)));
+            const b = env.gpa.create(Binder) catch @panic("OOM");
+            b.* = .{
+                .gpa = env.gpa,
+                .arena = env.arena,
+                .dom = env.dom,
+                .log = env.log,
+                .kind = env.kind,
+                .id = env.gpa.dupe(u8, env.id) catch @panic("OOM"),
+                .name = env.gpa.dupe(u8, env.name) catch @panic("OOM"),
+                .store = env.store,
+                .sub_box = undefined,
+                .detach_fn = &unwatchBinder,
+                .bound_call = env.bound_call,
+                .bound_ctx = env.bound_ctx,
+                .variant_nodes = env.variant_nodes,
+            };
+            const sub = env.gpa.create(SubT) catch @panic("OOM");
+            sub.* = st.watchCtx(b, &watchCb);
+            b.sub_box = sub;
+            env.dom.addBinding(env.kind, env.id, env.name, b, &destroyBinder);
+            return b;
+        }
+
+        fn unwatchBinder(b: *Binder) void {
+            const st: S = @ptrCast(@alignCast(@constCast(b.store)));
+            const sub: *SubT = @ptrCast(@alignCast(b.sub_box));
+            st.unwatch(sub.*);
+            b.gpa.destroy(sub);
+        }
+
+        fn destroyBinder(p: *anyopaque) void {
+            const b: *Binder = @ptrCast(@alignCast(p));
+            b.detach_fn(b);
+            b.gpa.free(b.id);
+            b.gpa.free(b.name);
+            b.gpa.destroy(b);
+        }
+    };
+}
+
+/// Subscribe every live-capable bound leaf in `nodes` to its store.
+/// Call once after the initial diff-seed; the tree must stay stable
+/// afterwards (bindings capture resolved ids and branch markup).
+/// `a` is scratch for id resolution AND the emit-time arena stored in
+/// each binder — pass an arena that survives until the next refresh.
+pub fn bindTree(a: std.mem.Allocator, nodes: []const Node, dom: *Dom, log: *PatchLog) void {
+    bindNodes(a, nodes, "", dom, log);
+}
+
+fn bindNodes(a: std.mem.Allocator, nodes: []const Node, parent_path: []const u8, dom: *Dom, log: *PatchLog) void {
+    for (nodes) |n| bindNode(a, n, parent_path, dom, log);
+}
+
+fn boundOf(v: Value) ?Bound {
+    return switch (v) {
+        .bound => |b| b,
+        .str => null,
+    };
+}
+
+fn attachLeaf(env_base: AttachEnv, lv: Live) void {
+    _ = lv.attach(env_base);
+}
+
+fn bindNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, dom: *Dom, log: *PatchLog) void {
+    switch (node) {
+        .text, .raw => {},
+        .fragment => |kids| bindNodes(a, kids, parent_path, dom, log),
+        .variant => |v| {
+            const anchor = anchorId(a, v, parent_path);
+            if (v.key) |kv| {
+                if (boundOf(kv)) |bnd| {
+                    if (bnd.live) |lv| {
+                        if (!dom.findBinding(.when_key, anchor, "")) {
+                            attachLeaf(.{
+                                .gpa = dom.gpa,
+                                .arena = a,
+                                .dom = dom,
+                                .log = log,
+                                .kind = .when_key,
+                                .id = anchor,
+                                .store = bnd.ctx,
+                                .bound_call = bnd.call,
+                                .bound_ctx = bnd.ctx,
+                                .variant_nodes = v.nodes,
+                            }, lv);
+                        }
+                    }
+                }
+            }
+            if (resolveValue(a, v.key) != null) bindNodes(a, v.nodes, anchor, dom, log);
+        },
+        .element => |e| {
+            const id = resolvedId(a, e.id, e.lid, parent_path);
+            if (id) |nid| {
+                for (e.attrs) |at| {
+                    const val = at.value orelse continue;
+                    const bnd = boundOf(val) orelse continue;
+                    const lv = bnd.live orelse continue;
+                    if (dom.findBinding(.attr, nid, at.name)) continue;
+                    attachLeaf(.{
+                        .gpa = dom.gpa,
+                        .arena = a,
+                        .dom = dom,
+                        .log = log,
+                        .kind = .attr,
+                        .id = nid,
+                        .name = at.name,
+                        .store = bnd.ctx,
+                        .bound_call = bnd.call,
+                        .bound_ctx = bnd.ctx,
+                    }, lv);
+                }
+                if (e.text) |tv| {
+                    if (boundOf(tv)) |bnd| {
+                        if (bnd.live) |lv| {
+                            if (!dom.findBinding(.text, nid, "")) {
+                                attachLeaf(.{
+                                    .gpa = dom.gpa,
+                                    .arena = a,
+                                    .dom = dom,
+                                    .log = log,
+                                    .kind = .text,
+                                    .id = nid,
+                                    .store = bnd.ctx,
+                                    .bound_call = bnd.call,
+                                    .bound_ctx = bnd.ctx,
+                                }, lv);
+                            }
+                        }
+                    }
+                }
+            }
+            const path = id orelse parent_path;
+            if (e.text != null) return; // .text owns the element's content
+            switch (e.children) {
+                .nodes => |kids| bindNodes(a, kids, path, dom, log),
+                .keyed => |kids| {
+                    const pid = id orelse @panic("keyed children require a bound parent (.id/.lid)");
+                    for (kids) |k| bindNode(a, k, pid, dom, log);
                 },
             }
         },
@@ -1605,4 +1883,254 @@ test "snapshot ops cover variant branches without inner ops" {
     // Covered subtrees emit no inner ops.
     try std.testing.expect(std.mem.indexOf(u8, json, "\"id\":\"in\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"id\":\"gone\"") == null);
+}
+
+// ─────────────────────────────────────────────
+// live binding tests
+// ─────────────────────────────────────────────
+
+/// Duck-typed watchable store: the live-binding contract is
+/// `get` + `watchCtx` + `unwatch` + `Value` — no zefx dependency.
+fn FakeLiveStore(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        pub const Value = T;
+        pub const Sub = struct { index: u32 };
+        const Entry = struct {
+            ctx: *anyopaque,
+            cb: ?*const fn (*anyopaque, T) void,
+        };
+
+        gpa: std.mem.Allocator,
+        v: T,
+        subs: std.ArrayListUnmanaged(Entry) = .empty,
+
+        pub fn get(self: *const Self) T {
+            return self.v;
+        }
+
+        pub fn watchCtx(self: *Self, ctx: anytype, comptime cb: *const fn (@TypeOf(ctx), T) void) Sub {
+            const CtxT = @TypeOf(ctx);
+            const S = struct {
+                fn call(p: *anyopaque, val: T) void {
+                    const c: CtxT = @ptrCast(@alignCast(p));
+                    cb(c, val);
+                }
+            };
+            const idx = self.subs.items.len;
+            self.subs.append(self.gpa, .{ .ctx = @ptrCast(ctx), .cb = &S.call }) catch @panic("OOM");
+            return .{ .index = @intCast(idx) };
+        }
+
+        pub fn unwatch(self: *Self, sub: Sub) void {
+            if (sub.index >= self.subs.items.len) return;
+            self.subs.items[sub.index].cb = null;
+        }
+
+        /// Test driver: set the value and fire every live watcher —
+        /// what zefx's notify phase does after the graph settles.
+        pub fn emit(self: *Self, val: T) void {
+            self.v = val;
+            for (self.subs.items) |e| {
+                if (e.cb) |cb| cb(e.ctx, val);
+            }
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.subs.deinit(self.gpa);
+        }
+
+        pub fn watcherCount(self: *const Self) usize {
+            var n: usize = 0;
+            for (self.subs.items) |e| {
+                if (e.cb != null) n += 1;
+            }
+            return n;
+        }
+    };
+}
+
+test "live text binding emits a patch on store notify, deduped" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Stores must outlive dom.deinit (defers run LIFO): unsubscribe first.
+    var st = FakeLiveStore(u32){ .gpa = std.testing.allocator, .v = 1 };
+    defer st.deinit();
+    var dom = Dom.init(std.testing.allocator);
+    defer dom.deinit();
+    var log = PatchLog.init(std.testing.allocator);
+    defer log.deinit();
+
+    const nodes = &.{el(a, .span, .{ .id = "c", .text = &st }, .{})};
+    diff(a, nodes, &dom, &log); // SSR-equivalent seed
+    log.clear();
+    bindTree(a, nodes, &dom, &log);
+    try std.testing.expectEqual(@as(usize, 1), dom.bindings.items.len);
+    try std.testing.expectEqual(@as(usize, 1), st.watcherCount());
+
+    st.emit(42);
+    try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
+    try expectText(log.patches.items[0], "c", "42");
+    log.clear();
+
+    // Same value again: the Dom's tracked state absorbs it — no patch.
+    st.emit(42);
+    try std.testing.expectEqual(@as(usize, 0), log.patches.items.len);
+}
+
+test "live attr binding emits attr ops including removal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var st = FakeLiveStore(?[]const u8){ .gpa = std.testing.allocator, .v = "one" };
+    defer st.deinit();
+    var dom = Dom.init(std.testing.allocator);
+    defer dom.deinit();
+    var log = PatchLog.init(std.testing.allocator);
+    defer log.deinit();
+
+    const nodes = &.{el(a, .div, .{ .id = "d", .@"data-x" = &st }, .{})};
+    diff(a, nodes, &dom, &log);
+    log.clear();
+    bindTree(a, nodes, &dom, &log);
+
+    st.emit("two");
+    try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
+    try expectAttr(log.patches.items[0], "d", "data-x", "two");
+    log.clear();
+
+    st.emit(null); // null removes the attribute
+    try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
+    try expectAttr(log.patches.items[0], "d", "data-x", null);
+}
+
+test "computed binding stays live through the map fn" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var st = FakeLiveStore(u32){ .gpa = std.testing.allocator, .v = 3 };
+    defer st.deinit();
+    var dom = Dom.init(std.testing.allocator);
+    defer dom.deinit();
+    var log = PatchLog.init(std.testing.allocator);
+    defer log.deinit();
+
+    const dbl = struct {
+        fn f(alloc: std.mem.Allocator, v: u32) []const u8 {
+            return std.fmt.allocPrint(alloc, "{d}", .{v * 2}) catch @panic("OOM");
+        }
+    }.f;
+    const nodes = &.{el(a, .span, .{ .id = "c", .text = computed(&st, dbl) }, .{})};
+    diff(a, nodes, &dom, &log);
+    log.clear();
+    bindTree(a, nodes, &dom, &log);
+
+    st.emit(21);
+    try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
+    try expectText(log.patches.items[0], "c", "42");
+}
+
+test "non-watchable stores bind nothing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var dom = Dom.init(std.testing.allocator);
+    defer dom.deinit();
+    var log = PatchLog.init(std.testing.allocator);
+    defer log.deinit();
+    var st = FakeStore(u32){ .v = 1 };
+
+    const nodes = &.{el(a, .span, .{ .id = "c", .text = &st }, .{})};
+    diff(a, nodes, &dom, &log);
+    log.clear();
+    bindTree(a, nodes, &dom, &log);
+    try std.testing.expectEqual(@as(usize, 0), dom.bindings.items.len);
+}
+
+test "variant key binds live: mount, inner leaf, unmount resubscribes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var flag = FakeLiveStore(bool){ .gpa = std.testing.allocator, .v = false };
+    defer flag.deinit();
+    var txt = FakeLiveStore(u32){ .gpa = std.testing.allocator, .v = 1 };
+    defer txt.deinit();
+    var dom = Dom.init(std.testing.allocator);
+    defer dom.deinit();
+    var log = PatchLog.init(std.testing.allocator);
+    defer log.deinit();
+
+    // Build the tree ONCE — the variant branch markup is captured.
+    const nodes = &.{variant(a, .{ .id = "w" }, &flag, .{
+        el(a, .span, .{ .lid = "t", .text = &txt }, .{}),
+    })};
+    diff(a, nodes, &dom, &log);
+    log.clear();
+    bindTree(a, nodes, &dom, &log);
+    // Only the when_key binder exists — the branch is unmounted.
+    try std.testing.expectEqual(@as(usize, 1), dom.bindings.items.len);
+    try std.testing.expectEqual(@as(usize, 1), flag.watcherCount());
+    try std.testing.expectEqual(@as(usize, 0), txt.watcherCount());
+
+    // Mount: one when-op ships the branch; inner leaf gets bound.
+    flag.emit(true);
+    try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
+    try std.testing.expect(log.patches.items[0] == .when);
+    try std.testing.expectEqualStrings("w", log.patches.items[0].when.id);
+    try std.testing.expectEqualStrings("<span id=\"w/t\">1</span>", log.patches.items[0].when.html);
+    try std.testing.expectEqual(@as(usize, 2), dom.bindings.items.len);
+    try std.testing.expectEqual(@as(usize, 1), txt.watcherCount());
+    log.clear();
+
+    // Inner leaf updates while mounted.
+    txt.emit(9);
+    try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
+    try expectText(log.patches.items[0], "w/t", "9");
+    log.clear();
+
+    // Unmount: empty when-op; inner binding unsubscribed.
+    flag.emit(false);
+    try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
+    try std.testing.expectEqualStrings("", log.patches.items[0].when.html);
+    try std.testing.expectEqual(@as(usize, 1), dom.bindings.items.len);
+    try std.testing.expectEqual(@as(usize, 0), txt.watcherCount());
+    log.clear();
+
+    // Inner store changes while unmounted: no patch, no crash.
+    txt.emit(5);
+    try std.testing.expectEqual(@as(usize, 0), log.patches.items.len);
+
+    // Remount: fresh when-op carries the CURRENT value; leaf rebinds.
+    flag.emit(true);
+    try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
+    try std.testing.expectEqualStrings("<span id=\"w/t\">5</span>", log.patches.items[0].when.html);
+    try std.testing.expectEqual(@as(usize, 1), txt.watcherCount());
+}
+
+test "removeTracked unsubscribes live bindings under the id" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var st = FakeLiveStore(u32){ .gpa = std.testing.allocator, .v = 1 };
+    defer st.deinit();
+    var dom = Dom.init(std.testing.allocator);
+    defer dom.deinit();
+    var log = PatchLog.init(std.testing.allocator);
+    defer log.deinit();
+
+    const nodes = &.{el(a, .div, .{ .id = "row-1" }, .{
+        el(a, .span, .{ .lid = "v", .text = &st }, .{}),
+    })};
+    diff(a, nodes, &dom, &log);
+    log.clear();
+    bindTree(a, nodes, &dom, &log);
+    try std.testing.expectEqual(@as(usize, 1), st.watcherCount());
+
+    dom.removeTracked("row-1", null);
+    try std.testing.expectEqual(@as(usize, 0), dom.bindings.items.len);
+    try std.testing.expectEqual(@as(usize, 0), st.watcherCount());
+
+    st.emit(2); // dead binding: nothing emitted
+    try std.testing.expectEqual(@as(usize, 0), log.patches.items.len);
 }

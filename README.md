@@ -2,11 +2,16 @@
 
 Server-driven UIs in Zig: the `zefx` reactive graph core plus `forest`, a
 fine-grained DOM patch layer, served by a minimal `std.http` server with a
-vanilla JS patch client. Two apps share the transport:
+vanilla JS patch client. Three apps share the transport:
 
 - **`zforest`** — the Todo demo (per-session model, no database).
 - **`zboard`** — an anonymous message board (static boards, threads,
   nested tree comments) over a shared SQLite-backed model.
+- **`zmon`** — a live ops dashboard (mock request stream, windowed
+  rps/error/latency stats, inject buttons) on **fine-grained live
+  bindings**: the view tree is built once per session and every bound
+  leaf subscribes to its store, so updates emit patch ops with no
+  rebuild+diff (`forest.bindTree`).
 
 <p align="center">
   <img src="docs/architecture.svg" alt="zforest architecture" width="900">
@@ -15,11 +20,13 @@ vanilla JS patch client. Two apps share the transport:
 ## Run
 
 ```sh
-zig build        # produces zig-out/bin/zforest and zig-out/bin/zboard
+zig build        # produces zig-out/bin/zforest, zboard and zmon
 zig build run    # serves the todo app on http://127.0.0.1:8080
 zig build run-board 8081 127.0.0.1 board.db  # board on :8081, file db
+zig build run-mon 8082 127.0.0.1             # dashboard on :8082
 ./zig-out/bin/zforest [port] [bind-ip]
 ./zig-out/bin/zboard   [port] [bind-ip] [db-path]   # db-path default ":memory:"
+./zig-out/bin/zmon     [port] [bind-ip]
 zig build test   # engine, forest, session, db, and board tests
 ```
 
@@ -134,8 +141,11 @@ restarts with posts/comments/users intact (`:memory:` is ephemeral).
 ## Roadmap
 
 Shipped: reactive core (`zefx`), declarative view + SSR + snapshot, SSE
-patch transport, keyed lists, `when` branches, delegated events, two
-apps (todo + SQLite board), route-keyed sessions, cross-tab fan-out.
+patch transport, keyed lists, `when` branches, delegated events, three
+apps (todo + SQLite board + `zmon` live dashboard), route-keyed
+sessions, cross-tab fan-out, **fine-grained live bindings**
+(`forest.bindTree`: store → leaf patch ops with no view rebuild —
+zmon's cards and status pill update per-store-notification).
 
 Next, roughly in order:
 
@@ -144,9 +154,8 @@ Next, roughly in order:
 - **Board moderation** — post/comment edit + delete, maybe tripcodes.
 - **Markdown** — server-side render for post/comment bodies.
 - **Todo polish** — drag&drop reorder (model needs an order field).
-- **Finer reactivity** — direct leaf bindings (store → Dom op, skipping
-  the tree diff) and per-item reactive cells; both deferred until
-  profiling justifies the lifecycle complexity (see
+- **Live-mode structure** — reactive keyed lists and multi-key
+  variants; per-item reactive cells still deferred (see
   [ARCHITECTURE.md](ARCHITECTURE.md)).
 - **Deploy hardening** — process supervisor on the VM, SSE fallback
   polling for hostile proxies.

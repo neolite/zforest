@@ -1,16 +1,17 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-`zforest` hosts two server-driven apps on one transport: the `zefx`
+`zforest` hosts three server-driven apps on one transport: the `zefx`
 reactive core plus a `forest` fine-grained DOM patch layer and a minimal
 generic `std.http` server. `zforest` is the Todo demo (per-session
-model); `zboard` is an anonymous board (shared SQLite-backed model).
+model); `zboard` is an anonymous board (shared SQLite-backed model);
+`zmon` is a live ops dashboard on fine-grained live bindings.
 
 - `src/zefx/root.zig`: public API surface exported as module `zefx`.
 - `src/zefx/engine.zig`, `event.zig`, `store.zig`, `sample.zig`, `shape.zig`, `effect.zig`: reactive graph primitives and operators.
 - `src/forest/patch.zig`: HTML escaping + `Patch`/`PatchLog` (owned strings, JSON batch; `writeOpJson` serializes one op).
 - `src/forest/dom.zig`: server-side DOM state tracking, text/attr bindings, keyed list diff, `when_states` branch keys for `z-when` anchors.
-- `src/forest/view.zig`: declarative view tree (`el`/`text`/`raw`/`eachOf`/`fragment`/`computed`/`variant`/`when`) — one tree drives SSR (`writeHtml`), the DOM-patch `diff`, and the full-state snapshot (`writeSnapshotOps`). Attrs and `.text` accept duck-typed `*T.get()` store pointers and `computed` wrappers resolved lazily; `.on`/`.arg` emit `data-on-<event>`/`data-arg` DOM-event attrs; `variant`/`when` mount/unmount subtrees between `<!--z-when:ID-->` comment pairs via idempotent `when` ops.
+- `src/forest/view.zig`: declarative view tree (`el`/`text`/`raw`/`eachOf`/`fragment`/`computed`/`variant`/`when`) — one tree drives SSR (`writeHtml`), the DOM-patch `diff`, and the full-state snapshot (`writeSnapshotOps`). Attrs and `.text` accept duck-typed `*T.get()` store pointers and `computed` wrappers resolved lazily; `.on`/`.arg` emit `data-on-<event>`/`data-arg` DOM-event attrs; `variant`/`when` mount/unmount subtrees between `<!--z-when:ID-->` comment pairs via idempotent `when` ops. `bindTree` is the live mode: subscribes bound leaves (`Bound.live`, populated when the store exposes `watchCtx`/`unwatch`/`Value`) so store notifications emit patch ops with no rebuild — used by zmon; see ARCHITECTURE.md "Live bindings".
 - `src/todo_app.zig`: per-browser-session Todo model wired through the zefx graph; `Session.dispatch` is the whitelisted action entry (`{action, arg?, value?, fields?}`).
 - `src/board.zig`: shared `BoardModel` — static board whitelist, in-memory posts/comments/users, write-through SQLite, one shared `next_id` (`#N` display ids), and the `global_seq` atomic every session polls for fan-out.
 - `src/db.zig`: typed wrapper over the vendored sqlite3 amalgamation (`vendor/sqlite3`, official 3.54.1; flags `-DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_LOAD_EXTENSION`). Linked only into `zboard` and test binaries — never the `zforest` exe.

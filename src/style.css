@@ -212,6 +212,9 @@ footer { margin-top: .9rem; color: var(--muted); font-size: .85rem; }
 .mon-head { display: flex; align-items: baseline; justify-content: space-between; }
 .mon-title { font-size: 1.25rem; font-weight: 650; }
 .mon-status { font: 600 .85rem/1 ui-monospace, Menlo, monospace; padding: .2rem .55rem; border-radius: .4rem; background: var(--line); }
+.mon-pill { font: 700 .8rem/1 ui-monospace, Menlo, monospace; padding: .3rem .7rem; border-radius: 999px; letter-spacing: .04em; }
+.mon-pill.ok { color: #3fb96b; border: 1px solid #3fb96b55; }
+.mon-pill.bad { color: #e05d5d; border: 1px solid #e05d5d66; background: #e05d5d14; }
 .mon-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr)); gap: .6rem; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: .6rem; padding: .6rem .8rem; }
 .clabel { font-size: .72rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }

@@ -12,16 +12,22 @@ thin generic patch renderer (`client.js`) plus delegated `data-on-*`
 events. Transport: SSR HTML → SSE `snapshot` → `patch` batches `{rev,ops}`
 → POST `/action` ACKs. Sessions are random-cookie keyed, capped at 32.
 
-**The view layer is VDOM-style reconciliation, not Forest-style
-fine-grained reactivity.** `buildView` rebuilds a full declarative `Node`
-tree per flush; `forest.diff` compares it against `Dom` tracked state and
-emits minimal DOM ops. Per-node live bindings (the original Forest
-model) were consciously rejected: one tree drives SSR + diff + snapshot
-with zero hydration mismatch and no per-node subscription lifecycle.
+**Two rendering modes, one view description.** The default is
+VDOM-style reconciliation: `buildView` rebuilds a full declarative
+`Node` tree per flush; `forest.diff` compares it against `Dom` tracked
+state and emits minimal DOM ops (todo, board). The opt-in **live mode**
+(`forest.bindTree`, used by zmon) builds the tree ONCE per session and
+subscribes every bound leaf (`.text`, attrs, `variant`/`when` keys)
+directly to its store: a store notification re-resolves the `Bound`
+thunk and emits the matching patch op — no rebuild, no tree walk.
+Both modes share SSR (`writeHtml`) and snapshot (`writeSnapshotOps`)
+output, so there is no hydration mismatch either way.
 
-Fine-grained exists at the **DOM/network output** level (minimal ops per
-change); server-side computation is a full-tree rebuild + diff — cheap
-at our scale (tens–hundreds of nodes, flush per user action).
+Live mode scope: leaf bindings and boolean `when` branches. Keyed lists
+and multi-key variants remain structural — the tree is walked as
+built, so live sessions need a stable structure. Sessions that need
+structural reactivity stay on the diff path (or hybrid: diff for
+structure, live for leaves — not yet combined).
 
 ## Reactivity model (zefx)
 
@@ -98,15 +104,47 @@ the counter `text` op.
 open route-tabs holds N sessions. Cap is 32 (FIFO evict →
 `session_expired` → client reloads).
 
+## Live bindings (done — zmon)
+
+`Bound.live` is populated by `bindGet`/`computed` whenever the source
+store exposes the watch contract (`watchCtx`/`unwatch`/`Value` — zefx
+`Store` qualifies; plain `get()`-only fakes get `live = null` and stay
+diff-resolved). `forest.bindTree` walks the built tree once and, per
+bound leaf, allocates a `Binder` (Dom-owned, gpa) that calls
+`store.watchCtx`. On notify — which runs in the engine's effects phase
+after derived stores settle — the binder re-runs the Bound thunk and
+emits `dom.setText`/`setAttr`/`setWhen` straight into the session
+`PatchLog`; the existing publish path ships the batch unchanged.
+
+- `variant`/`when` keys bind too: a key change emits one `when` op with
+  re-serialized branch markup, `removeTracked(anchor, keep=self)`
+  unsubscribes inner bindings while preserving the key binder, then the
+  branch is re-seeded and re-bound — mount/unmount is live.
+- `Dom.bindings` is a flat list dropped by the same `id`/`id/…` prefix
+  rule as texts/attrs/when_states, so `removeTracked`, `Dom.reset` and
+  `deinit` unsubscribe everything (dom.deinit MUST run before the
+  stores' engine deinit — session order already guarantees this).
+- Revision stamping stays in an engine `onAfterFlush` hook
+  (`log.revision = seq.get()`); live emits happen during notify, before
+  the hook — one batch per flush, `rev` always current.
+- `computed(store, f)` propagates `live` from the source store; the
+  watcher re-runs `f` on every notification, so derived formatting is
+  live for free. zefx `Store.map` derived stores feed `variant` keys.
+
+Verified live: one SSE patch batch carried `text` ops for every changed
+card plus `when` ops swapping the HEALTHY/DEGRADED pill — zero view
+rebuilds after the initial bind.
+
 ## Deferred / future
 
 - Per-item reactive cells — blocked on detachable graph lifecycle
   (untrack, unregisterable notifiers, queued-work cancellation).
 - Dependency-tagged subtree skip (skip unchanged branches of the view
   rebuild) — needs explicit dep maps; manual deps are a bug source.
-- Direct leaf bindings (store.watch → Dom.setText/setAttr bypassing the
-  tree diff) — must keep `Dom` tracked state in sync, generational
-  handles, drain after structural reconcile, one batch per revision.
+- Live-mode structural reactivity — keyed lists (`eachOf` bound to a
+  store → per-subtree `syncKeyedList`) and multi-key variants; needs
+  bind/unbind on row mount/unmount plus ordering guarantees.
+- Hybrid mode — diff for structure + live leaves in one session.
 - Client-local derived primitives (`data-chars` counter) — generic only,
   server stays source of truth.
 - Persistence effects (debounced/batched SQLite writes) — needs
@@ -122,6 +160,6 @@ failed via events+effects), live dashboards with derived aggregates
 (only changed branches recompute), high-frequency streams
 (sample/throttle before render), complex multi-field forms
 (combine-derived validity), and future per-item reactive cells.
-Caveat: the win is at the model layer — the view is still rebuilt and
-diffed wholesale per flush; DOM-level granularity needs direct leaf
-bindings instead.
+Caveat (updated): the win is now at BOTH layers — zmon's live bindings
+skip the rebuild+diff entirely for leaf updates; the diff path remains
+for structural changes and for apps that haven't opted into live mode.

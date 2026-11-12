@@ -29,6 +29,10 @@ pub const computed = view.computed;
 pub const writeHtml = view.writeHtml;
 pub const writeSnapshotOps = view.writeSnapshotOps;
 pub const diff = view.diff;
+pub const bindTree = view.bindTree;
+pub const Live = view.Live;
+pub const AttachEnv = view.AttachEnv;
+pub const Binder = view.Binder;
 
 test {
     _ = patch;
