@@ -116,7 +116,7 @@ pub const Engine = struct {
     /// once per batch, with fully settled final state; a hook that emits
     /// flushes immediately afterwards (it is outside the batch).
     pub fn batchEnd(self: *Engine) void {
-        std.debug.assert(self.batch_depth > 0);
+        if (self.batch_depth == 0) @panic("zefx: batchEnd without batchBegin");
         self.batch_depth -= 1;
         if (self.batch_depth != 0) return;
         if (self.pure_queue.items.len == 0 and
