@@ -294,3 +294,67 @@ sample/combine edges, per-item cells before disposal semantics,
 built-in thread pools/timer threads, debounced SQLite writes without
 durability+ACK, HTTP/SSE/persistence inside zefx, automatic deep
 equality.
+
+## Astra review: model layer + async (2026-11)
+
+**Models: application-level factories, NO new runtime in zefx.**
+`Session` stays lifetime owner but is too broad — extract `CarModel`
+(engine + model, no HTTP/Forest). Model owns invariants/calculations/
+validation; effect handlers are injected deps; Session owns engine,
+DOM/history/arenas, cookies/CSRF, wire→event translation. Plain Zig
+constructor suffices — `Domain`/`BoundDomain` add no lifecycle value.
+Correction to our assumption: todo items are ALSO plain
+ArrayListUnmanaged — only seq/remaining are stores. Rule: "stores for
+values in reactive decisions/projections; explicit ownership + defined
+notification path for the rest; visible-in-UI alone ≠ must-be-store".
+
+zcar target shape: events brand/model/year/serviceToggled/serviceAdded/
+bookingSubmitted; `$vehicle` = ONE aggregate {brand?,model?,year?}
+(selection is user choice, options are derived — atomic cascade
+invariant, no 3-store settle ordering); `$selectedServices` = value
+bitset over the 23 static service IDs (simpler than heap map);
+`$vehicleOptions`/`$vehicleSpec`/`$vehicleComplete`/`$quote`/
+`$suggestions` derived; booking state = records + op status.
+Model-choice events should carry stable identity or parent brand — a
+delayed model index can silently identify a different car under another
+brand. `bookingSubmitted` → sample vehicle+cart+quote+payload into one
+validated input (needs sample fixes first).
+
+**Async: host executor + serialized completions (option a).**
+Keep graph evaluation synchronous; NEVER threads/engines inside zefx.
+Protocol: under serialization validate+allocate request ID+build owned
+job → admit without waiting (bounded capacity, explicit overload) →
+finish graph turn, release mutex → host executes outside → owned
+completion → serialized new graph turn → cleanup. Completion
+dispatcher must work with NO SSE subscriber (SSE transports, doesn't
+drive). Contracts: request ID per owner incarnation, opaque session
+handle + generation (cookie+route can be recreated; eviction destroys
+immediately — generation check BEFORE resolving effect pointer),
+deep-owned payloads, one cleanup path, bounded queues/bytes/fairness,
+exactly-one terminal transition, shutdown drain semantics.
+`inFlight` is source of truth; `pending = inFlight > 0` derived —
+current impl sets pending=false on ANY done/fail (breaks overlap).
+Stale results still complete lifecycle. Ordering is app policy:
+latest-wins for queries, per-resource serialization for conflicting
+writes, idempotency keys for retried writes (timeout ≠ not-happened).
+
+zcar draft-version rule: capture draft version at submit; clear cart
+only if version still matches — else async booking A erases cart work
+done after submit.
+
+**Board persistence: keep commit-before-success.** Preserve
+validate→INSERT→append→bump ordering, move DB work outside mutex via
+ONE bounded writer module owning the SQLite connection; IDs allocated
+in writer order; committed records applied in commit order by the
+serialized path. Don't run existing addPost on a worker (it mutates
+shared arrays assuming the mutex). ACK semantics: POST waits outside
+mutex for commit+apply (success = committed); bound waiters too.
+`202 Accepted` later — but client.js clears fields on any 2xx today.
+Committed write survives session eviction; only notification is
+generation-gated. No debounce for posts/comments (distinct commands),
+no default write-behind. Note: WAL+synchronous=NORMAL — name the
+durability guarantee in the ACK contract.
+
+Order: fix sample+batching → extract CarModel → owned async
+invocation/completion with controllable test executor → ordered board
+writer. HTTP/SQLite/workers/timers stay outside zefx.
