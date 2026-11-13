@@ -34,6 +34,11 @@ pub const Route = union(enum) {
     comment: u64,
 };
 
+/// Top-level comment ordering on thread pages — a per-session
+/// preference that is part of the render-group key (like reply_to):
+/// sessions only share a view when their sort matches.
+pub const Sort = enum { new, top };
+
 /// Everything the view tree reads from session/group state: route,
 /// inline-reply target, the resolved `#who` display name, and the cursor
 /// `buildView` marks caught-up — the session's `seen_seq` or the render
@@ -42,6 +47,9 @@ pub const Route = union(enum) {
 pub const ViewEnv = struct {
     route: Route,
     reply_to: ?u64 = null,
+    /// Top-level comment order — `.new` newest-first (default),
+    /// `.top` by like count. Mirrors the session's `sort`.
+    sort: Sort = .new,
     /// Resolved display name for the `#who` chip ("Anon#N" / "anon") —
     /// post/comment authors still resolve their own tokens via `nameOf`.
     name: []const u8 = "anon",
@@ -89,6 +97,8 @@ pub const Session = struct {
     route: Route = .home,
     /// Comment id the inline reply form is mounted under (per-session).
     reply_to: ?u64 = null,
+    /// Top-level comment sort preference (per-session, group-key input).
+    sort: Sort = .new,
     /// zfxu cookie value — the anonymous poster identity ("" = anonymous).
     user_token: []u8 = &.{},
     /// Scratch for the Set-Cookie value emitted on the minting POST.
@@ -237,7 +247,7 @@ pub const Session = struct {
     /// render so an identity minted by a (possibly failed) dispatch is
     /// picked up BEFORE the group is chosen/rendered.
     fn groupKey(self: *Session) board_groups.Key {
-        return .{ .route = self.route, .reply_to = self.reply_to, .name = nameOf(self.user_token) };
+        return .{ .route = self.route, .reply_to = self.reply_to, .name = nameOf(self.user_token), .sort = self.sort };
     }
 
     /// Join/migrate the render group when the key changed. Bumps
@@ -251,7 +261,7 @@ pub const Session = struct {
         if (!self.attached) return;
         const key = self.groupKey();
         var kbuf: [256]u8 = undefined;
-        const ks = board_groups.keyStringInto(&kbuf, key.route, key.reply_to, key.name);
+        const ks = board_groups.keyStringInto(&kbuf, key.route, key.reply_to, key.name, key.sort);
         if (self.group) |g| {
             if (std.mem.eql(u8, g.key_string, ks)) return;
             if (!board_groups.contains(key)) {
@@ -282,6 +292,7 @@ pub const Session = struct {
         return .{
             .route = self.route,
             .reply_to = self.reply_to,
+            .sort = self.sort,
             .name = nameOf(self.user_token),
             .seen = &self.seen_seq,
         };
@@ -370,6 +381,25 @@ pub const Session = struct {
             self.ping.emit(.{});
         } else if (std.mem.eql(u8, action, "cancel_reply")) {
             self.reply_to = null;
+            self.ping.emit(.{});
+        } else if (std.mem.eql(u8, action, "sort")) {
+            const a = arg orelse return error.InvalidAction;
+            if (std.mem.eql(u8, a, "top")) {
+                self.sort = .top;
+            } else if (std.mem.eql(u8, a, "new")) {
+                self.sort = .new;
+            } else return error.InvalidAction;
+            self.ping.emit(.{});
+        } else if (std.mem.eql(u8, action, "like")) {
+            const a = arg orelse return error.InvalidAction;
+            if (a.len < 2) return error.InvalidAction;
+            const kind: board.LikeKind = switch (a[0]) {
+                'p' => .post,
+                'c' => .comment,
+                else => return error.InvalidAction,
+            };
+            const target = std.fmt.parseInt(u64, a[1..], 10) catch return error.InvalidAction;
+            _ = try m().toggleLike(kind, target, self.user_token);
             self.ping.emit(.{});
         } else {
             return error.InvalidAction;
@@ -523,9 +553,19 @@ fn navView(a: std.mem.Allocator, env: ViewEnv) forest.Node {
 
 /// Post card: #id, board, Anon, time, pre-wrap text, thread link with a
 /// live comment count (diffed in place via `lid`).
+/// `"c<id>"`/`"p<id>"` — the `data-arg` payload of like buttons.
+fn likeArg(a: std.mem.Allocator, prefix: u8, id: u64) []const u8 {
+    return std.fmt.allocPrint(a, "{c}{d}", .{ prefix, id }) catch @panic("OOM");
+}
+
+fn likeLabel(a: std.mem.Allocator, count: u32) []const u8 {
+    return std.fmt.allocPrint(a, "\u{25B2} {d}", .{count}) catch @panic("OOM");
+}
+
 fn postCard(a: std.mem.Allocator, p: *const board.Post, show_link: bool) forest.Node {
     const mm = m();
     const count = mm.commentCount(p.id);
+    const lcount = mm.likeCount(p.id);
     var kids: std.ArrayListUnmanaged(forest.Node) = .empty;
     kids.append(a, forest.el(a, .div, .{ .class = "meta" }, .{
         forest.el(a, .span, .{ .class = "pid" }, std.fmt.allocPrint(a, "#{d}", .{p.id}) catch @panic("OOM")),
@@ -544,6 +584,12 @@ fn postCard(a: std.mem.Allocator, p: *const board.Post, show_link: bool) forest.
                 .href = threadHref(a, p.id),
                 .text = std.fmt.allocPrint(a, "→ тред ({d})", .{count}) catch @panic("OOM"),
             }, .{}),
+            forest.text(" "),
+            forest.el(a, .button, .{
+                .class = "like-btn",
+                .on = .{ .click = "like" },
+                .arg = likeArg(a, 'p', p.id),
+            }, likeLabel(a, lcount)),
         })) catch @panic("OOM");
     }
     return forest.el(a, .div, .{
@@ -659,6 +705,12 @@ fn commentNode(a: std.mem.Allocator, env: ViewEnv, c: *const board.Comment, post
             .on = .{ .click = "reply" },
             .arg = num,
         }, "ответить"),
+        forest.text(" "),
+        forest.el(a, .button, .{
+            .class = "like-btn",
+            .on = .{ .click = "like" },
+            .arg = likeArg(a, 'c', c.id),
+        }, likeLabel(a, mm.likeCount(c.id))),
     })) catch @panic("OOM");
     kids.append(a, forest.el(a, .div, .{ .class = "ctext" }, c.text)) catch @panic("OOM");
     // Inline reply form mounts between the text and the children list.
@@ -740,6 +792,55 @@ fn boardView(a: std.mem.Allocator, idx: usize) forest.Node {
     return forest.fragment(a, kids.toOwnedSlice(a) catch @panic("OOM"));
 }
 
+/// Order top-level comment indices per the session's sort: `.new` =
+/// newest first (id desc — tops arrive ascending), `.top` = likes desc
+/// then newer first. Children stay chronological — sorting applies to
+/// the top level only.
+fn sortTops(a: std.mem.Allocator, mm: *board.BoardModel, tops: []const usize, sort: Sort) []const usize {
+    const out = a.alloc(usize, tops.len) catch @panic("OOM");
+    switch (sort) {
+        .new => {
+            var j: usize = 0;
+            var i = tops.len;
+            while (i > 0) : (i -= 1) {
+                out[j] = tops[i - 1];
+                j += 1;
+            }
+        },
+        .top => {
+            @memcpy(out, tops);
+            std.sort.block(usize, out, mm, struct {
+                fn less(mm2: *board.BoardModel, x: usize, y: usize) bool {
+                    const cx = mm2.likeCount(mm2.comments.items[x].id);
+                    const cy = mm2.likeCount(mm2.comments.items[y].id);
+                    if (cx != cy) return cx > cy;
+                    return mm2.comments.items[x].id > mm2.comments.items[y].id;
+                }
+            }.less);
+        },
+    }
+    return out;
+}
+
+/// "сортировка: новые | топ" — per-session preference via the `sort`
+/// action; the active mode gets the `sort-on` class.
+fn sortBar(a: std.mem.Allocator, sort: Sort) forest.Node {
+    return forest.el(a, .div, .{ .class = "sort-bar" }, .{
+        forest.text("сортировка: "),
+        forest.el(a, .button, .{
+            .class = if (sort == .new) "mini sort-on" else "mini",
+            .on = .{ .click = "sort" },
+            .arg = "new",
+        }, "новые"),
+        forest.text(" "),
+        forest.el(a, .button, .{
+            .class = if (sort == .top) "mini sort-on" else "mini",
+            .on = .{ .click = "sort" },
+            .arg = "top",
+        }, "топ"),
+    });
+}
+
 fn threadView(a: std.mem.Allocator, env: ViewEnv, post_id: u64) forest.Node {
     const mm = m();
     const p = mm.post(post_id) orelse {
@@ -751,11 +852,13 @@ fn threadView(a: std.mem.Allocator, env: ViewEnv, post_id: u64) forest.Node {
     kids.append(a, commentForm(a, post_id, null)) catch @panic("OOM");
 
     const tops = mm.topCommentIdx(a, post_id) catch @panic("OOM");
+    const ordered = sortTops(a, mm, tops, env.sort);
     const post_str = u64str(a, post_id);
     var ck: std.ArrayListUnmanaged(forest.Node) = .empty;
-    for (tops) |ci| {
+    for (ordered) |ci| {
         ck.append(a, commentNode(a, env, &mm.comments.items[ci], post_str)) catch @panic("OOM");
     }
+    kids.append(a, sortBar(a, env.sort)) catch @panic("OOM");
     kids.append(a, forest.el(a, .ul, .{ .id = "comments", .class = "comments" }, forest.each(ck.toOwnedSlice(a) catch @panic("OOM")))) catch @panic("OOM");
     kids.append(a, forest.when(a, .{ .id = "w-comments-empty" }, tops.len == 0, forest.el(a, .p, .{ .class = "empty" }, "Нет комментариев — будь первым."))) catch @panic("OOM");
     return forest.fragment(a, kids.toOwnedSlice(a) catch @panic("OOM"));
@@ -1394,4 +1497,105 @@ test "render groups: unattached sessions keep the solo diff path" {
     defer alloc.free(j);
     try std.testing.expect(std.mem.indexOf(u8, j, "\"op\":") != null);
     try std.testing.expectEqual(@as(usize, 0), board_groups.registryCount());
+}
+
+test "sortTops: newest-first default, top orders by likes then recency" {
+    const alloc = std.testing.allocator;
+    const mm = testModel(alloc);
+    defer mm.deinit();
+    model = mm;
+    defer model = null;
+    _ = try mm.addPost("b", "tok", "post");
+    _ = try mm.addComment(1, null, "tok", "oldest");
+    _ = try mm.addComment(1, null, "tok", "middle");
+    _ = try mm.addComment(1, null, "tok", "newest");
+    const c_old = mm.comments.items[0].id;
+    const c_mid = mm.comments.items[1].id;
+    const c_new = mm.comments.items[2].id;
+
+    const tops = try mm.topCommentIdx(alloc, 1);
+    defer alloc.free(tops);
+    try std.testing.expectEqual(@as(usize, 3), tops.len);
+
+    // .new reverses the ascending index order → newest id first.
+    const newest = sortTops(alloc, mm, tops, .new);
+    defer alloc.free(newest);
+    try std.testing.expectEqual(@as(usize, 3), newest.len);
+    try std.testing.expectEqual(c_new, mm.comments.items[newest[0]].id);
+    try std.testing.expectEqual(c_mid, mm.comments.items[newest[1]].id);
+    try std.testing.expectEqual(c_old, mm.comments.items[newest[2]].id);
+
+    // .top: two accounts like the OLDEST comment → it leads; the rest
+    // keep newest-first order.
+    _ = try mm.toggleLike(.comment, c_old, "u1");
+    _ = try mm.toggleLike(.comment, c_old, "u2");
+    const top = sortTops(alloc, mm, tops, .top);
+    defer alloc.free(top);
+    try std.testing.expectEqual(c_old, mm.comments.items[top[0]].id);
+    try std.testing.expectEqual(c_new, mm.comments.items[top[1]].id);
+    try std.testing.expectEqual(c_mid, mm.comments.items[top[2]].id);
+}
+
+test "like/sort actions: per-account votes, sort re-keys the group" {
+    const alloc = std.testing.allocator;
+    const mm = testModel(alloc);
+    defer mm.deinit();
+    model = mm;
+    defer model = null;
+
+    const a = createSession(alloc, std.testing.io);
+    defer a.deinit();
+    const b = createSession(alloc, std.testing.io);
+    defer b.deinit();
+
+    var f: std.json.ObjectMap = .empty;
+    defer f.deinit(alloc);
+    try f.put(alloc, "board", .{ .string = "b" });
+    try f.put(alloc, "text", .{ .string = "post" });
+    try a.dispatch("post", null, null, &f);
+    var cf: std.json.ObjectMap = .empty;
+    defer cf.deinit(alloc);
+    try cf.put(alloc, "post", .{ .string = "1" });
+    try cf.put(alloc, "text", .{ .string = "first" });
+    try b.dispatch("comment", null, null, &cf);
+    var cf2: std.json.ObjectMap = .empty;
+    defer cf2.deinit(alloc);
+    try cf2.put(alloc, "post", .{ .string = "1" });
+    try cf2.put(alloc, "text", .{ .string = "second" });
+    try b.dispatch("comment", null, null, &cf2);
+    const c2 = mm.comments.items[1].id;
+
+    // Attach both sessions to the thread route (shared anon group).
+    try serveBoth(alloc, a, b, "/t/1");
+
+    // Like the newer comment: b's token gets the vote, a second toggle
+    // from the same session removes it — one vote per account.
+    var idbuf: [24]u8 = undefined;
+    const carg = std.fmt.bufPrint(&idbuf, "c{d}", .{c2}) catch unreachable;
+    try a.dispatch("like", carg, null, null);
+    try std.testing.expectEqual(@as(u32, 1), mm.likeCount(c2));
+    try a.dispatch("like", carg, null, null);
+    try std.testing.expectEqual(@as(u32, 0), mm.likeCount(c2));
+    // Bad targets rejected.
+    try std.testing.expectError(error.InvalidAction, a.dispatch("like", "x1", null, null));
+    const missing = std.fmt.bufPrint(&idbuf, "c{d}", .{@as(u64, 999)}) catch unreachable;
+    try std.testing.expectError(error.CommentNotFound, a.dispatch("like", missing, null, null));
+
+    // Sort action flips the per-session preference and re-keys the
+    // render group: absent destination key → clone-fork, NO epoch bump.
+    try std.testing.expect(a.attached);
+    const epoch_before = a.membership_epoch;
+    try a.dispatch("sort", "top", null, null);
+    try std.testing.expectEqual(Sort.top, a.sort);
+    try std.testing.expectError(error.InvalidAction, a.dispatch("sort", "bogus", null, null));
+    // syncMembership runs on render; force one via publishPending path
+    // is implicit in tests that call render — call it directly.
+    a.syncMembership();
+    try std.testing.expectEqual(epoch_before, a.membership_epoch);
+    try std.testing.expect(a.group != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.group.?.key_string, "top") != null);
+    try a.dispatch("sort", "new", null, null);
+    a.syncMembership();
+    try std.testing.expectEqual(Sort.new, a.sort);
+    try std.testing.expect(std.mem.indexOf(u8, a.group.?.key_string, "new") != null);
 }

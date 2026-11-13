@@ -32,6 +32,8 @@ pub const Key = struct {
     /// Resolved display name ("Anon#N" / "anon") — NOT the user token:
     /// two tokens resolving to the same name render identically.
     name: []const u8,
+    /// Top-level comment sort — per-session view input like reply_to.
+    sort: board_app.Sort = .new,
 };
 
 /// One render group: shared tracked DOM state, patch log, revisioned
@@ -127,7 +129,7 @@ var next_incarnation: u64 = 1;
 /// u64 ids, "Anon#<base36>"/"anon" names) so the separator cannot appear
 /// inside a field — the encoding is injective for every reachable key.
 /// `buf` must hold ~192 bytes; the result borrows `buf`.
-pub fn keyStringInto(buf: []u8, route: board_app.Route, reply_to: ?u64, name: []const u8) []const u8 {
+pub fn keyStringInto(buf: []u8, route: board_app.Route, reply_to: ?u64, name: []const u8, sort: board_app.Sort) []const u8 {
     var rbuf: [48]u8 = undefined;
     const rpart = switch (route) {
         .home => "home",
@@ -137,7 +139,9 @@ pub fn keyStringInto(buf: []u8, route: board_app.Route, reply_to: ?u64, name: []
     };
     var pbuf: [24]u8 = undefined;
     const ppart = if (reply_to) |r| std.fmt.bufPrint(&pbuf, "reply:{d}", .{r}) catch unreachable else "reply:-";
-    return std.fmt.bufPrint(buf, "{s}\x01{s}\x01{s}", .{ rpart, ppart, name }) catch @panic("group key buf too small");
+    const spart = if (sort == .top) "top" else "new";
+    // name stays LAST: createGroup borrows it as the key_string suffix.
+    return std.fmt.bufPrint(buf, "{s}\x01{s}\x01{s}\x01{s}", .{ rpart, ppart, spart, name }) catch @panic("group key buf too small");
 }
 
 /// Live group count — test/diagnostic helper.
@@ -150,7 +154,7 @@ pub fn registryCount() usize {
 /// key means joining a foreign stream namespace → snapshot.
 pub fn contains(key: Key) bool {
     var kbuf: [256]u8 = undefined;
-    const ks = keyStringInto(&kbuf, key.route, key.reply_to, key.name);
+    const ks = keyStringInto(&kbuf, key.route, key.reply_to, key.name, key.sort);
     return groups.get(ks) != null;
 }
 
@@ -183,7 +187,7 @@ fn createGroup(gpa: std.mem.Allocator, ks: []const u8, route: board_app.Route, r
 /// `members` is incremented on every call; pair with `leave`.
 pub fn join(gpa: std.mem.Allocator, key: Key) *RenderGroup {
     var kbuf: [256]u8 = undefined;
-    const ks = keyStringInto(&kbuf, key.route, key.reply_to, key.name);
+    const ks = keyStringInto(&kbuf, key.route, key.reply_to, key.name, key.sort);
     if (groups.get(ks)) |g| {
         g.members += 1;
         return g;
@@ -211,7 +215,7 @@ pub fn join(gpa: std.mem.Allocator, key: Key) *RenderGroup {
 pub fn fork(gpa: std.mem.Allocator, src: *RenderGroup, key: Key) *RenderGroup {
     src.publish(); // defensive: render+publish are atomic under the mutex, never clone a pending log
     var kbuf: [256]u8 = undefined;
-    const ks = keyStringInto(&kbuf, key.route, key.reply_to, key.name);
+    const ks = keyStringInto(&kbuf, key.route, key.reply_to, key.name, key.sort);
     std.debug.assert(groups.get(ks) == null);
     const g = createGroup(gpa, ks, key.route, key.reply_to);
     // The fresh dom/history shells hold no allocations — overwrite.
@@ -252,13 +256,13 @@ pub fn leave(gpa: std.mem.Allocator, g: *RenderGroup) void {
 test "key encoding is injective across route/reply/name" {
     var b1: [256]u8 = undefined;
     var b2: [256]u8 = undefined;
-    const a = keyStringInto(&b1, .home, null, "anon");
-    const b = keyStringInto(&b2, .home, null, "Anon#1");
+    const a = keyStringInto(&b1, .home, null, "anon", .new);
+    const b = keyStringInto(&b2, .home, null, "Anon#1", .new);
     try std.testing.expect(!std.mem.eql(u8, a, b));
-    const c = keyStringInto(&b2, .home, @as(?u64, 7), "anon");
+    const c = keyStringInto(&b2, .home, @as(?u64, 7), "anon", .new);
     try std.testing.expect(!std.mem.eql(u8, a, c));
-    const d = keyStringInto(&b2, .{ .thread = 7 }, null, "anon");
+    const d = keyStringInto(&b2, .{ .thread = 7 }, null, "anon", .new);
     try std.testing.expect(!std.mem.eql(u8, a, d));
-    const e = keyStringInto(&b2, .home, null, "anon");
+    const e = keyStringInto(&b2, .home, null, "anon", .new);
     try std.testing.expect(std.mem.eql(u8, a, e));
 }

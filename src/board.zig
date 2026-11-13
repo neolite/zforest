@@ -57,6 +57,18 @@ pub const ModelError = error{
     Closed,
 };
 
+/// Like target kind — persisted as 'p'/'c' in the likes table. Ids are
+/// unique across posts+comments (shared `next_id`), so `like_counts`
+/// keys on the raw id while `liked_by` keys carry the kind prefix.
+pub const LikeKind = enum { post, comment };
+
+fn likeKindChar(k: LikeKind) u8 {
+    return switch (k) {
+        .post => 'p',
+        .comment => 'c',
+    };
+}
+
 /// Wall-clock seconds since the unix epoch — libc `time(3)`, already
 /// linked via the sqlite amalgamation (Zig 0.17 needs an `Io` for
 /// `Clock.Timestamp`, which the model deliberately doesn't carry).
@@ -87,6 +99,13 @@ const schema =
     \\    user TEXT NOT NULL,
     \\    text TEXT NOT NULL,
     \\    ts INTEGER NOT NULL
+    \\);
+    \\CREATE TABLE IF NOT EXISTS likes (
+    \\    kind TEXT NOT NULL,
+    \\    target INTEGER NOT NULL,
+    \\    user TEXT NOT NULL,
+    \\    ts INTEGER NOT NULL,
+    \\    PRIMARY KEY (kind, target, user)
     \\);
     \\
 ;
@@ -131,6 +150,12 @@ pub const BoardModel = struct {
     posts_by_board: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) = .empty,
     tops_by_post: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(usize)) = .empty,
     children_by_parent: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(usize)) = .empty,
+    /// Like state: `like_counts` maps a post/comment id (shared id
+    /// space) to its like total; `liked_by` holds one owned
+    /// `"<kind><id>:<token>"` key per (target, user) pair for the
+    /// one-like-per-account toggle check. Both rebuilt on load.
+    like_counts: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    liked_by: std.StringHashMapUnmanaged(void) = .empty,
     /// Shared id space across posts+comments: display "#N".
     next_id: u64 = 1,
     /// Bumped on every mutation; sessions poll it for cross-session fan-out.
@@ -183,6 +208,10 @@ pub const BoardModel = struct {
         }
         self.users.deinit(self.gpa);
         self.post_counts.deinit(self.gpa);
+        var lit = self.liked_by.iterator();
+        while (lit.next()) |e| self.gpa.free(e.key_ptr.*);
+        self.liked_by.deinit(self.gpa);
+        self.like_counts.deinit(self.gpa);
         self.db.close();
         self.gpa.destroy(self);
     }
@@ -256,6 +285,22 @@ pub const BoardModel = struct {
                 try self.comments.append(self.gpa, c);
                 self.indexComment(self.comments.items.len - 1);
                 self.next_id = @max(self.next_id, c.id + 1);
+            }
+        }
+        {
+            var st = try self.db.prepare(self.gpa, "SELECT kind, target, user FROM likes");
+            defer st.finalize();
+            while (try st.step()) {
+                const kind_ch = st.columnText(0)[0];
+                const target: u64 = @intCast(st.columnInt(1));
+                const token = st.columnText(2);
+                const gop = self.like_counts.getOrPut(self.gpa, target) catch @panic("OOM");
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                gop.value_ptr.* += 1;
+                var kbuf: [320]u8 = undefined;
+                const key = std.fmt.bufPrint(&kbuf, "{c}{d}:{s}", .{ kind_ch, target, token }) catch @panic("key too long");
+                const owned = self.gpa.dupe(u8, key) catch @panic("OOM");
+                self.liked_by.put(self.gpa, owned, {}) catch @panic("OOM");
             }
         }
     }
@@ -390,6 +435,57 @@ pub const BoardModel = struct {
 
     pub fn commentCount(self: *const BoardModel, post_id: u64) usize {
         return self.post_counts.get(post_id) orelse 0;
+    }
+
+    /// Total likes on a post/comment id (shared id space).
+    pub fn likeCount(self: *const BoardModel, id: u64) u32 {
+        return self.like_counts.get(id) orelse 0;
+    }
+
+    /// Toggle the caller's like on `kind`/`target`. One like per
+    /// account: the (kind, target, user) PK plus the `liked_by` set
+    /// make a second like from the same token impossible — re-liking
+    /// unlikes instead. Returns the NEW liked state. Write-through
+    /// INSERT/DELETE + `global_seq` bump so every open session
+    /// re-renders the count.
+    pub fn toggleLike(self: *BoardModel, kind: LikeKind, target: u64, user_token: []const u8) ModelError!bool {
+        switch (kind) {
+            .post => if (self.findPost(target) == null) return error.PostNotFound,
+            .comment => if (self.findComment(target) == null) return error.CommentNotFound,
+        }
+        var kbuf: [320]u8 = undefined;
+        const key = std.fmt.bufPrint(&kbuf, "{c}{d}:{s}", .{ likeKindChar(kind), target, user_token }) catch @panic("key too long");
+        var kbuf2: [2]u8 = undefined;
+        const ks = kbuf2[0..1];
+        ks[0] = likeKindChar(kind);
+        if (self.liked_by.get(key) != null) {
+            var st = self.db.prepare(self.gpa, "DELETE FROM likes WHERE kind = ? AND target = ? AND user = ?") catch |e| return dbErr(e);
+            defer st.finalize();
+            st.bindText(1, ks) catch |e| return dbErr(e);
+            st.bindInt(2, @intCast(target)) catch |e| return dbErr(e);
+            st.bindText(3, user_token) catch |e| return dbErr(e);
+            _ = st.step() catch |e| return dbErr(e);
+            if (self.liked_by.fetchRemove(key)) |kv| self.gpa.free(kv.key);
+            const gop = self.like_counts.getPtr(target) orelse return error.Sqlite;
+            std.debug.assert(gop.* > 0);
+            gop.* -= 1;
+            self.bump();
+            return false;
+        }
+        var st = self.db.prepare(self.gpa, "INSERT INTO likes (kind, target, user, ts) VALUES (?, ?, ?, ?)") catch |e| return dbErr(e);
+        defer st.finalize();
+        st.bindText(1, ks) catch |e| return dbErr(e);
+        st.bindInt(2, @intCast(target)) catch |e| return dbErr(e);
+        st.bindText(3, user_token) catch |e| return dbErr(e);
+        st.bindInt(4, nowSeconds()) catch |e| return dbErr(e);
+        _ = st.step() catch |e| return dbErr(e);
+        const owned = self.gpa.dupe(u8, key) catch @panic("OOM");
+        self.liked_by.put(self.gpa, owned, {}) catch @panic("OOM");
+        const gop = self.like_counts.getOrPut(self.gpa, target) catch @panic("OOM");
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
+        self.bump();
+        return true;
     }
 
     /// Insert a post: validate, write-through INSERT, append, bump seq.
@@ -662,5 +758,71 @@ test "board model persists and reloads from a file db" {
         // next_id continues the shared sequence.
         const p = try m.addPost("b", "tok-persist", "second life");
         try std.testing.expect(p.id > 1);
+    }
+}
+
+test "board model: likes toggle once per account, counts, kind isolation" {
+    const alloc = std.testing.allocator;
+    var m = try BoardModel.init(alloc, ":memory:");
+    defer m.deinit();
+    _ = try m.ensureUser("tok-a");
+    _ = try m.ensureUser("tok-b");
+    const p = try m.addPost("tech", "tok-a", "liked post");
+    const c = try m.addComment(p.id, null, "tok-a", "liked comment");
+
+    // First toggle inserts, second removes — the same token can never
+    // hold two votes on one target.
+    try std.testing.expect(try m.toggleLike(.post, p.id, "tok-a"));
+    try std.testing.expectEqual(@as(u32, 1), m.likeCount(p.id));
+    try std.testing.expect(!(try m.toggleLike(.post, p.id, "tok-a")));
+    try std.testing.expectEqual(@as(u32, 0), m.likeCount(p.id));
+
+    // A different account likes independently; re-liking by tok-a adds
+    // a second vote.
+    try std.testing.expect(try m.toggleLike(.post, p.id, "tok-b"));
+    try std.testing.expect(try m.toggleLike(.post, p.id, "tok-a"));
+    try std.testing.expectEqual(@as(u32, 2), m.likeCount(p.id));
+
+    // Same numeric id space, different kind — no cross-talk.
+    try std.testing.expect(try m.toggleLike(.comment, c.id, "tok-a"));
+    try std.testing.expectEqual(@as(u32, 1), m.likeCount(c.id));
+    try std.testing.expectEqual(@as(u32, 2), m.likeCount(p.id));
+
+    // Missing/wrong-kind targets rejected before any mutation.
+    try std.testing.expectError(error.PostNotFound, m.toggleLike(.post, 999, "tok-a"));
+    try std.testing.expectError(error.CommentNotFound, m.toggleLike(.comment, 999, "tok-a"));
+    try std.testing.expectError(error.CommentNotFound, m.toggleLike(.comment, p.id, "tok-a"));
+}
+
+test "board model: likes survive reload from a file db" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "/tmp/zboard-test-likes.db";
+    std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, path ++ "-wal") catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, path ++ "-wal") catch {};
+    std.Io.Dir.deleteFileAbsolute(io, path ++ "-shm") catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, path ++ "-shm") catch {};
+
+    {
+        var m = try BoardModel.init(alloc, path);
+        _ = try m.ensureUser("tok-like");
+        const p = try m.addPost("tech", "tok-like", "persisted likes");
+        _ = try m.toggleLike(.post, p.id, "tok-like");
+        _ = try m.toggleLike(.post, p.id, "tok-like"); // toggles back off
+        _ = try m.toggleLike(.post, p.id, "tok-like"); // and on again
+        const c = try m.addComment(p.id, null, "tok-like", "liked reply");
+        _ = try m.toggleLike(.comment, c.id, "tok-like");
+        m.deinit();
+    }
+    {
+        var m = try BoardModel.init(alloc, path);
+        defer m.deinit();
+        try std.testing.expectEqual(@as(u32, 1), m.likeCount(1));
+        // Reloaded liked_by set lets the same account toggle OFF.
+        try std.testing.expect(!(try m.toggleLike(.post, 1, "tok-like")));
+        try std.testing.expectEqual(@as(u32, 0), m.likeCount(1));
+        try std.testing.expectEqual(@as(u32, 1), m.likeCount(2));
     }
 }

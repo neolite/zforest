@@ -202,6 +202,27 @@ footer { margin-top: .9rem; color: var(--muted); font-size: .85rem; }
   padding: 0 .2rem;
 }
 .app-board .reply-btn:hover { text-decoration: underline; }
+.app-board .like-btn {
+  border: none;
+  background: none;
+  color: var(--muted);
+  font-size: .8rem;
+  padding: 0 .2rem;
+}
+.app-board .like-btn:hover { color: var(--accent); }
+.app-board .sort-bar {
+  display: flex;
+  align-items: center;
+  gap: .3rem;
+  font-size: .85rem;
+  color: var(--muted);
+  margin: .5rem 0 .35rem;
+}
+.app-board .sort-bar button.mini.sort-on {
+  color: var(--accent);
+  font-weight: 650;
+  text-decoration: underline;
+}
 .app-board button.mini { padding: .2rem .55rem; font-size: .85rem; align-self: flex-start; }
 .app-board button.mini.cancel { color: var(--muted); }
 .app-board .empty { color: var(--muted); font-size: .9rem; }

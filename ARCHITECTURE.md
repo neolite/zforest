@@ -811,3 +811,43 @@ the intermediate single-member group had been destroyed, so cancel
 forked again rather than joining. The join-existing→snapshot path
 still fires when the destination group has other live members
 (covered by the A→B→A test with `b` holding base alive).
+
+## zboard: comment sorting + likes (done)
+
+**Comments default to newest-first.** `topCommentIdx`/`childIdx`
+return ascending insertion order (the old scan semantics preserved by
+the adjacency indexes); the VIEW reverses top-level order — sorting is
+a presentation concern, indexes stay canonical. `sortTops` produces
+the ordered index slice per `env.sort`; children stay chronological.
+
+**Sort is a group-key input.** `Session.sort ∈ {new, top}` joins
+`ViewEnv` and `board_groups.Key` (encoded `new`/`top` in
+`keyStringInto`, name kept last so `createGroup`'s suffix borrow
+still works). Switching sort = key change → clone-fork when the
+destination is absent (patch stream continues, drafts live) or join +
+snapshot when another session already owns that sort's group. Reorder
+surfaces as keyed-list `move` ops — no custom protocol.
+
+**Likes: one vote per account.** SQLite `likes(kind, target, user, ts)`
+with `PRIMARY KEY(kind, target, user)` — the PK alone enforces
+one-like-per-token at the storage layer. In memory:
+`like_counts: id → u32` (posts/comments share one id space; `kind`
+disambiguates) and `liked_by: "{p|c}{id}:{token}" → void` for O(1)
+toggle checks. `toggleLike` validates target+kind, write-through
+INSERT/DELETE, bumps `global_seq` → normal render-group fan-out.
+Toggle semantics: absent → insert+count+1; present → delete+count−1.
+`ensureUser()` already runs at the top of every `dispatch`, so the
+`zfxu` token is always minted before a like lands — anonymous lurkers
+get a real account on first click.
+
+**UI.** `▲ N` like buttons (`data-on-click="like"`, `data-arg="c12"`/
+`"p3"`) on post cards and comment meta; sort bar `сортировка: новые |
+топ` above the comments list with `sort-on` active styling. Delegated
+events — no client.js changes.
+
+**Tests.** Model: toggle/unlike, one-vote-per-token, cross-account
+independence, kind isolation, missing-target rejection, file-db
+reload (liked_by survives → same account toggles OFF after restart).
+View: `sortTops` new/top ordering + tie-break; dispatch like/sort
+incl. InvalidAction paths; sort re-key → clone-fork with NO epoch
+bump, key_string carries the sort field.
