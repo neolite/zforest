@@ -79,6 +79,46 @@ pub const Dom = struct {
         self.bindings.deinit(self.gpa);
     }
 
+    /// Deep-copy all tracked state into a fresh Dom on the same
+    /// allocator — render-group clone-on-fork relies on the clone
+    /// tracking EXACTLY what the source tracked, so diffing the same
+    /// view against either produces identical ops. Live `bindings`
+    /// cannot be copied (each ctx owns store subscriptions), so a Dom
+    /// that has them must never be cloned — board sessions never call
+    /// bindTree, making the assert a real invariant, not a hope.
+    pub fn cloneDeep(self: *const Dom) Dom {
+        std.debug.assert(self.bindings.items.len == 0);
+        var out = Dom.init(self.gpa);
+        var ti = self.texts.iterator();
+        while (ti.next()) |e| {
+            const k = self.gpa.dupe(u8, e.key_ptr.*) catch @panic("OOM");
+            const v = self.gpa.dupe(u8, e.value_ptr.*) catch @panic("OOM");
+            out.texts.put(self.gpa, k, v) catch @panic("OOM");
+        }
+        var ai = self.attrs.iterator();
+        while (ai.next()) |e| {
+            const k = self.gpa.dupe(u8, e.key_ptr.*) catch @panic("OOM");
+            const v: ?[]u8 = if (e.value_ptr.*) |s| self.gpa.dupe(u8, s) catch @panic("OOM") else null;
+            out.attrs.put(self.gpa, k, v) catch @panic("OOM");
+        }
+        var oi = self.orders.iterator();
+        while (oi.next()) |e| {
+            const k = self.gpa.dupe(u8, e.key_ptr.*) catch @panic("OOM");
+            var ids: std.ArrayListUnmanaged([]u8) = .empty;
+            for (e.value_ptr.items) |id| {
+                ids.append(self.gpa, self.gpa.dupe(u8, id) catch @panic("OOM")) catch @panic("OOM");
+            }
+            out.orders.put(self.gpa, k, ids) catch @panic("OOM");
+        }
+        var wi = self.when_states.iterator();
+        while (wi.next()) |e| {
+            const k = self.gpa.dupe(u8, e.key_ptr.*) catch @panic("OOM");
+            const v: ?[]u8 = if (e.value_ptr.*) |s| self.gpa.dupe(u8, s) catch @panic("OOM") else null;
+            out.when_states.put(self.gpa, k, v) catch @panic("OOM");
+        }
+        return out;
+    }
+
     /// Whether a live binding for `(kind, node_id, name)` is already
     /// registered — bindTree uses this to stay idempotent.
     pub fn findBinding(self: *Dom, kind: Binding.Kind, node_id: []const u8, name: []const u8) bool {
@@ -626,4 +666,42 @@ test "when anchors track branch keys and purge with their row" {
     try std.testing.expect(dom.when_states.get("w-top") != null);
     // Purged anchors report changed again on next diff.
     try std.testing.expect(dom.setWhen("row-1/sw", "on"));
+}
+
+test "cloneDeep copies all tracked state and stays independent" {
+    const alloc = std.testing.allocator;
+    var dom = Dom.init(alloc);
+    defer dom.deinit();
+    var log = PatchLog.init(alloc);
+    defer log.deinit();
+
+    dom.setText(&log, "n1", "hello");
+    dom.setAttr(&log, "n1", "class", "x");
+    dom.setAttr(&log, "n1", "hidden", null);
+    dom.seedOrder("list", &.{ "i1", "i2" });
+    dom.seedWhen("w1", "on");
+    log.clear();
+
+    var clone = dom.cloneDeep();
+    defer clone.deinit();
+
+    // Same tracked state → same-value writes are no-ops on BOTH.
+    clone.setText(&log, "n1", "hello");
+    clone.setAttr(&log, "n1", "class", "x");
+    try std.testing.expectEqual(@as(usize, 0), log.patches.items.len);
+    try std.testing.expect(!clone.setWhen("w1", "on"));
+
+    // Divergence is independent: mutating the source doesn't leak into
+    // the clone, and the clone still diffs against its own baseline.
+    dom.setText(&log, "n1", "bye");
+    try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
+    log.clear();
+    clone.setText(&log, "n1", "yo");
+    try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
+    try std.testing.expectEqualStrings("yo", log.patches.items[0].text.text);
+
+    // Orders and when_states cloned too.
+    try std.testing.expectEqual(@as(usize, 1), clone.orders.count());
+    try std.testing.expectEqual(@as(usize, 1), clone.when_states.count());
+    try std.testing.expect(clone.setWhen("w1", "off"));
 }

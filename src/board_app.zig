@@ -104,10 +104,13 @@ pub const Session = struct {
     /// Render-group membership (board_groups.zig): sessions with equal
     /// (route, reply_to, resolved name) share one Dom/history/revision.
     group: ?*board_groups.RenderGroup = null,
-    /// Bumped on every group join/leave/re-key — the SSE stream compares
-    /// it per poll; ANY change forces a snapshot + revision adopt because
-    /// group-local revision numbers don't imply baseline equality (this
-    /// also covers A→B→A between polls).
+    /// Bumped on every stream-INCOMPATIBLE group transition — join of a
+    /// foreign namespace, first attach, group recreation — the SSE
+    /// stream compares it per poll; ANY change forces a snapshot +
+    /// revision adopt because group-local revision numbers don't imply
+    /// baseline equality (this also covers A→B→A between polls).
+    /// Clone-on-fork transitions preserve the lineage and do NOT bump
+    /// (Render groups v2).
     membership_epoch: u64 = 0,
 
     ping: *zefx.Event(Ping),
@@ -238,9 +241,12 @@ pub const Session = struct {
     }
 
     /// Join/migrate the render group when the key changed. Bumps
-    /// `membership_epoch` on every actual transition — the SSE stream
-    /// treats any bump as "send a snapshot and adopt the new revision",
-    /// since patch revisions are group-local.
+    /// `membership_epoch` on every STREAM-INCOMPATIBLE transition —
+    /// the SSE stream treats a bump as "send a snapshot and adopt the
+    /// new revision". Clone-on-fork transitions (new key absent from
+    /// the registry) do NOT bump: the forked group continues this
+    /// session's rev/history lineage, so patches keep flowing and
+    /// drafts survive (ARCHITECTURE.md "Render groups v2").
     fn syncMembership(self: *Session) void {
         if (!self.attached) return;
         const key = self.groupKey();
@@ -248,6 +254,14 @@ pub const Session = struct {
         const ks = board_groups.keyStringInto(&kbuf, key.route, key.reply_to, key.name);
         if (self.group) |g| {
             if (std.mem.eql(u8, g.key_string, ks)) return;
+            if (!board_groups.contains(key)) {
+                // Absent key → clone-fork: new group inherits g's stream
+                // lineage (rev + history + tracked Dom). Epoch stays —
+                // the client's cursor remains valid on the new group.
+                self.group = board_groups.fork(self.gpa, g, key);
+                board_groups.leave(self.gpa, g);
+                return;
+            }
             board_groups.leave(self.gpa, g);
             self.group = null;
         }
@@ -308,8 +322,10 @@ pub const Session = struct {
         return if (self.group) |g| &g.history else &self.history;
     }
 
-    /// Membership epoch for the SSE stream: bumped on every group
-    /// join/leave/re-key; any change forces a snapshot + revision adopt.
+    /// Membership epoch for the SSE stream: bumped on stream-incompatible
+    /// group transitions; any change forces a snapshot + revision adopt.
+    /// Clone-fork transitions keep the epoch — the forked group continues
+    /// the same rev/history lineage, so the cursor stays valid.
     pub fn membershipEpoch(self: *Session) u64 {
         return self.membership_epoch;
     }
@@ -1239,7 +1255,7 @@ test "render groups: equal keys share one group; one render per model bump" {
     try std.testing.expectEqual(@as(usize, 1), f.batches.len);
 }
 
-test "render groups: reply_to re-key forks and A→B→A rejoins the same group" {
+test "render groups v2: reply_to fork clones the stream; A→B→A still snapshots" {
     const alloc = std.testing.allocator;
     const mm = testModel(alloc);
     defer mm.deinit();
@@ -1258,22 +1274,41 @@ test "render groups: reply_to re-key forks and A→B→A rejoins the same group"
     try std.testing.expect(a.group.? == b.group.?);
     const e0 = a.membershipEpoch();
 
-    // reply_to is a group-key input: setting it + ping migrates `a` to a
-    // forked group while `b` stays on the base group.
+    // Give the base group a published batch so its ring is non-empty —
+    // the fork must carry it verbatim for lagging cursors.
+    _ = try mm.addComment(1, null, "tok2", "c2");
+    a.syncPull();
+    try std.testing.expectEqual(@as(u64, 1), base.rev);
+
+    // reply_to is a group-key input: setting it + ping migrates `a`.
+    // The new key is ABSENT → clone-on-fork: epoch NOT bumped, the forked
+    // group continues base's rev/history lineage → patches, no snapshot.
     a.reply_to = c1.id;
     a.ping.emit(.{});
-    try std.testing.expect(a.membershipEpoch() == e0 + 1);
-    try std.testing.expect(a.group.? != base);
+    try std.testing.expect(a.membershipEpoch() == e0);
+    const forked = a.group.?;
+    try std.testing.expect(forked != base);
     try std.testing.expect(b.group.? == base);
     try std.testing.expectEqual(@as(usize, 2), board_groups.registryCount());
 
-    // A→B→A between renders: cancel returns to the SAME still-alive base
-    // group instance (b keeps it alive); epoch bumped twice total.
+    // needs_render forced one diff even though global_seq didn't move
+    // for the re-key itself: rev continues base's numbering, and the
+    // ring holds base's batch plus the incremental transition.
+    try std.testing.expectEqual(base.rev + 1, forked.rev);
+    try std.testing.expectEqual(forked.rev, forked.history.latest_rev);
+    const fc = try forked.history.fetch(0, alloc);
+    defer History.freeFetch(alloc, fc);
+    try std.testing.expectEqual(@as(usize, 2), fc.batches.len);
+    try std.testing.expect(std.mem.indexOf(u8, fc.batches[1].data, "\"op\":\"when\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fc.batches[1].data, "\"op\":\"create\"") == null);
+
+    // A→B→A: the base key EXISTS (b holds it) → join path → epoch bump
+    // → snapshot; the single-member fork is destroyed on leave.
     a.reply_to = null;
     a.ping.emit(.{});
-    try std.testing.expect(a.membershipEpoch() == e0 + 2);
+    try std.testing.expect(a.membershipEpoch() == e0 + 1);
     try std.testing.expect(a.group.? == base);
-    try std.testing.expectEqual(@as(usize, 1), board_groups.registryCount()); // fork destroyed
+    try std.testing.expectEqual(@as(usize, 1), board_groups.registryCount());
 }
 
 test "render groups: minted identity re-keys the session out of the anon group" {
@@ -1300,7 +1335,9 @@ test "render groups: minted identity re-keys the session out of the anon group" 
     try f.put(alloc, "post", .{ .string = "1" });
     try f.put(alloc, "text", .{ .string = "hi" });
     try d.dispatch("comment", null, null, &f);
-    try std.testing.expect(d.membershipEpoch() > e0);
+    // Absent key → clone-fork: the stream lineage continues, so the
+    // epoch does NOT bump — the open SSE gets patches, not a snapshot.
+    try std.testing.expect(d.membershipEpoch() == e0);
     try std.testing.expect(d.group.? != anon_group);
     try std.testing.expectEqualStrings("Anon#1", d.group.?.key.name);
     try std.testing.expect(a.group.? == anon_group); // a unaffected

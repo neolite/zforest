@@ -702,7 +702,7 @@ contract.
 
 ---
 
-## Render groups v2 — clone-on-fork plan (2026-11, not implemented)
+## Render groups v2 — clone-on-fork (2026-11, implemented)
 
 **Motivation.** v1 forces a snapshot on EVERY membership change
 (`membership_epoch` bump → SSE snapshot → full DOM rebuild). Astra's
@@ -792,3 +792,22 @@ fork produces `patch` (not `snapshot`) with contiguous revs; minimal
 ops (reply region only); lagging cursor catch-up through cloned ring;
 fork-of-fork; A→B→A still snapshots; identity mint mid-session no
 longer snapshots; eviction/recreation unchanged.
+
+**Implementation (done).** `Dom.cloneDeep` (dom.zig — deep-copies
+texts/attrs/orders/when_states; asserts `bindings` empty since live
+binders own store subscriptions and board never bindTree),
+`History.cloneDeep` (history.zig — verbatim ring copy, bounded),
+`RenderGroup.fork` + `needs_render` + `contains` (board_groups.zig;
+`createGroup` helper shared with `join`), and the `syncMembership`
+fork branch (board_app.zig — absent key + live group → fork, epoch
+NOT bumped; present key → join + epoch++ as before). `http.zig` and
+`client.js` unchanged — the epoch contract already expressed the
+right policy.
+
+**Verified live** (zboard :8899, /t/1): reply → `event: patch`
+rev=2 with a single `when` op mounting the reply form (v1 sent a
+full snapshot); cancel_reply → `event: patch` rev=3 unmounting it —
+the intermediate single-member group had been destroyed, so cancel
+forked again rather than joining. The join-existing→snapshot path
+still fires when the destination group has other live members
+(covered by the A→B→A test with `b` holding base alive).

@@ -78,6 +78,24 @@ pub const History = struct {
         return .{ .batches = out };
     }
 
+    /// Deep-copy the retained ring on the same allocator — render-group
+    /// clone-on-fork carries the parent's history verbatim so a forking
+    /// client's cursor keeps resolving to ops computed against the DOM
+    /// it already shows. Bounded by max_entries/max_bytes.
+    pub fn cloneDeep(self: *const History) History {
+        var out = History.init(self.gpa);
+        out.entries.ensureTotalCapacity(self.gpa, self.entries.items.len) catch @panic("OOM");
+        for (self.entries.items) |e| {
+            out.entries.append(self.gpa, .{
+                .rev = e.rev,
+                .data = self.gpa.dupe(u8, e.data) catch @panic("OOM"),
+            }) catch @panic("OOM");
+        }
+        out.total_bytes = self.total_bytes;
+        out.latest_rev = self.latest_rev;
+        return out;
+    }
+
     pub fn firstRetainedRev(self: *const History) ?u64 {
         if (self.entries.items.len == 0) return null;
         return self.entries.items[0].rev;
@@ -196,4 +214,33 @@ test "single oversized batch empties retained history but yields gap" {
     defer History.freeFetch(alloc, f2);
     try std.testing.expect(f2 == .batches);
     try std.testing.expectEqual(@as(usize, 0), f2.batches.len);
+}
+
+test "cloneDeep copies the ring; clones fetch and evict independently" {
+    const alloc = std.testing.allocator;
+    var h = History.init(alloc);
+    defer h.deinit();
+    h.publish(1, try alloc.dupe(u8, "{\"rev\":1}"));
+    h.publish(2, try alloc.dupe(u8, "{\"rev\":2}"));
+
+    var c = h.cloneDeep();
+    defer c.deinit();
+    try std.testing.expectEqual(h.latest_rev, c.latest_rev);
+    try std.testing.expectEqual(h.total_bytes, c.total_bytes);
+    try std.testing.expectEqual(h.firstRetainedRev(), c.firstRetainedRev());
+
+    // Same cursor → same batches on both.
+    const f1 = try h.fetch(0, alloc);
+    defer History.freeFetch(alloc, f1);
+    const f2 = try c.fetch(0, alloc);
+    defer History.freeFetch(alloc, f2);
+    try std.testing.expectEqual(f1.batches.len, f2.batches.len);
+    try std.testing.expectEqualStrings(f1.batches[0].data, f2.batches[0].data);
+
+    // Publishing on the clone doesn't disturb the source.
+    c.publish(3, try alloc.dupe(u8, "{\"rev\":3}"));
+    try std.testing.expectEqual(@as(u64, 2), h.latest_rev);
+    const f3 = try h.fetch(2, alloc);
+    defer History.freeFetch(alloc, f3);
+    try std.testing.expectEqual(@as(usize, 0), f3.batches.len);
 }

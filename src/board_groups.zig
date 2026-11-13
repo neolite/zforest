@@ -60,6 +60,10 @@ pub const RenderGroup = struct {
     /// cursor. Written only by view builds that actually sync the Dom
     /// (seed/render), never by SSR/snapshot serialization.
     last_rendered_seq: u64 = 0,
+    /// Forces one render even when `global_seq` is unchanged — set by
+    /// `fork`, whose view inputs differ from the cloned Dom's while the
+    /// model may not have moved.
+    needs_render: bool = false,
 
     fn viewEnv(self: *RenderGroup) board_app.ViewEnv {
         return .{
@@ -86,7 +90,8 @@ pub const RenderGroup = struct {
     /// group revision into the log; `publish` ships it.
     pub fn render(self: *RenderGroup) void {
         const seq = board_app.globalSeq();
-        if (self.last_rendered_seq == seq) return;
+        if (!self.needs_render and self.last_rendered_seq == seq) return;
+        self.needs_render = false;
         _ = self.arena.reset(.retain_capacity);
         const a = self.arena.allocator();
         forest.diff(a, board_app.buildView(a, self.viewEnv()), &self.dom, &self.log);
@@ -140,21 +145,25 @@ pub fn registryCount() usize {
     return groups.count();
 }
 
-/// Find or create the group for `key`; a new group is seeded from current
-/// state with a fresh (empty) history — its first publish is rev 1.
-/// `members` is incremented on every call; pair with `leave`.
-pub fn join(gpa: std.mem.Allocator, key: Key) *RenderGroup {
+/// Whether a group is registered under `key`'s canonical encoding —
+/// syncMembership forks (clone-on-fork) only for ABSENT keys; a present
+/// key means joining a foreign stream namespace → snapshot.
+pub fn contains(key: Key) bool {
     var kbuf: [256]u8 = undefined;
     const ks = keyStringInto(&kbuf, key.route, key.reply_to, key.name);
-    if (groups.get(ks)) |g| {
-        g.members += 1;
-        return g;
-    }
+    return groups.get(ks) != null;
+}
+
+/// Allocate a registered-candidate group shell: fresh empty Dom/log/
+/// history/arena, unique incarnation, owned key string. Callers then
+/// either `seed()` (join) or overwrite dom/history/rev (fork) before
+/// `groups.put` + `members = 1`.
+fn createGroup(gpa: std.mem.Allocator, ks: []const u8, route: board_app.Route, reply_to: ?u64) *RenderGroup {
     const g = gpa.create(RenderGroup) catch @panic("OOM");
     g.* = .{
         .gpa = gpa,
         .key_string = undefined,
-        .key = .{ .route = key.route, .reply_to = key.reply_to, .name = &.{} },
+        .key = .{ .route = route, .reply_to = reply_to, .name = &.{} },
         .incarnation = next_incarnation,
         .dom = forest.Dom.init(gpa),
         .log = forest.PatchLog.init(gpa),
@@ -166,7 +175,51 @@ pub fn join(gpa: std.mem.Allocator, key: Key) *RenderGroup {
     // The name is the last \x01-separated field — borrow the owned copy.
     const name_at = std.mem.lastIndexOfScalar(u8, g.key_string, 1).? + 1;
     g.key.name = g.key_string[name_at..];
+    return g;
+}
+
+/// Find or create the group for `key`; a new group is seeded from current
+/// state with a fresh (empty) history — its first publish is rev 1.
+/// `members` is incremented on every call; pair with `leave`.
+pub fn join(gpa: std.mem.Allocator, key: Key) *RenderGroup {
+    var kbuf: [256]u8 = undefined;
+    const ks = keyStringInto(&kbuf, key.route, key.reply_to, key.name);
+    if (groups.get(ks)) |g| {
+        g.members += 1;
+        return g;
+    }
+    const g = createGroup(gpa, ks, key.route, key.reply_to);
     g.seed();
+    groups.put(gpa, g.key_string, g) catch @panic("OOM");
+    g.members = 1;
+    return g;
+}
+
+/// Clone-on-fork (ARCHITECTURE.md "Render groups v2"): create a group
+/// under `key` that CONTINUES `src`'s stream lineage — same `rev`
+/// numbering, a verbatim copy of the retained history ring, and a Dom
+/// tracking exactly what src's clients were patched to. The next
+/// render diffs the NEW view inputs against the cloned Dom and emits
+/// only the transition ops, so the forking client's SSE cursor stays
+/// valid and no snapshot is needed (the session must NOT bump
+/// `membership_epoch` for this transition).
+///
+/// Preconditions: `key` absent from the registry (checked by the
+/// caller via `contains`); `src.members > 0`; all under the server
+/// mutex. The caller still owes `leave(src)` — the fork shares nothing
+/// mutable with src afterwards.
+pub fn fork(gpa: std.mem.Allocator, src: *RenderGroup, key: Key) *RenderGroup {
+    src.publish(); // defensive: render+publish are atomic under the mutex, never clone a pending log
+    var kbuf: [256]u8 = undefined;
+    const ks = keyStringInto(&kbuf, key.route, key.reply_to, key.name);
+    std.debug.assert(groups.get(ks) == null);
+    const g = createGroup(gpa, ks, key.route, key.reply_to);
+    // The fresh dom/history shells hold no allocations — overwrite.
+    g.dom = src.dom.cloneDeep();
+    g.history = src.history.cloneDeep();
+    g.rev = src.rev;
+    g.last_rendered_seq = src.last_rendered_seq;
+    g.needs_render = true;
     groups.put(gpa, g.key_string, g) catch @panic("OOM");
     g.members = 1;
     return g;
