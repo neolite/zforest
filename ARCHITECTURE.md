@@ -191,7 +191,7 @@ panels (properties/history/ops log) are ever wanted inside kulman, this
 stand shows the shape: subscribe `BimSyncCommittedListener`, keep a
 per-session view state, render regions, push on commit.
 
-## Astra review: two-tier graph + snapshot catch-up bug (2026-11)
+## Astra review: two-tier graph + snapshot catch-up bug (2026-11) (full text: `docs/astra-reviews/2026-11-13-two-tier-graph.md`)
 
 Consulted gpt-6-astra on the "global stores + per-session projections"
 design. Verdict: **sound, but not as direct cross-engine edges** — two
@@ -251,7 +251,7 @@ lifecycle, (4) projection delivery, (5) package interfaces. First
 milestone: correct snapshots + revisioned dependency-aware projections
 while KEEPING diff rendering — before hybrid rendering.
 
-## Astra review: what to add to zefx (2026-11)
+## Astra review: what to add to zefx (2026-11) (full text: `docs/astra-reviews/2026-11-13-zefx-roadmap.md`)
 
 Top-3 ranked: (1) make `sample` a trustworthy boundary, (2) explicit
 synchronous batching, (3) equality-aware store writes. `attach` next;
@@ -295,7 +295,7 @@ built-in thread pools/timer threads, debounced SQLite writes without
 durability+ACK, HTTP/SSE/persistence inside zefx, automatic deep
 equality.
 
-## Astra review: model layer + async (2026-11)
+## Astra review: model layer + async (2026-11) (full text: `docs/astra-reviews/2026-11-13-model-layer-async.md`)
 
 **Models: application-level factories, NO new runtime in zefx.**
 `Session` stays lifetime owner but is too broad — extract `CarModel`
@@ -400,7 +400,7 @@ subscriber. Todo/car are inherently per-session; zmon already on
 live-bindings. Render groups are the board-specific fix for the main
 multiplier.
 
-## Astra review: render groups — verdict + corrected design (2026-11)
+## Astra review: render groups — verdict + corrected design (2026-11) (full text: `docs/astra-reviews/2026-11-13-render-groups.md`)
 
 **Core claim VERIFIED with qualifications.** View = f(route, reply_to,
 resolved display name, BoardModel contents). IDs deterministic (no
@@ -699,3 +699,96 @@ one model bump produced a single `patch` rev on both streams; a
 first-POST identity mint migrated the session and its open stream got
 a mid-flight `snapshot` rev=0 (new group), exactly the epoch→snapshot
 contract.
+
+---
+
+## Render groups v2 — clone-on-fork plan (2026-11, not implemented)
+
+**Motivation.** v1 forces a snapshot on EVERY membership change
+(`membership_epoch` bump → SSE snapshot → full DOM rebuild). Astra's
+review already flagged the product cost: reply/cancel transitions on
+thread routes erase inline drafts and focus. The pre-groups solo path
+never had this problem — a session's own `Dom` diffed the new view into
+a minimal patch. v2 restores fine-grained transitions for the common
+case without giving up group dedup.
+
+**Core insight.** What the client trusts is not group identity but
+STREAM LINEAGE: its `lastRev` cursor plus the assumption that
+`history.fetch(cursor)` returns ops computed against the DOM it
+already shows. A snapshot is only needed when the new group's
+`(rev, history)` namespace is incompatible with that cursor. If the
+new group literally continues the parent's revision numbering AND
+history ring, patches keep flowing and the fine-grained diff touches
+only what changed — drafts/focus in untouched regions survive.
+
+**Design — `fork`, not `join`, for absent keys.**
+`syncMembership` on key change:
+
+- new key already in registry → `leave` + `join` + `membership_epoch++`
+  (incompatible namespace → snapshot; unchanged v1 behavior);
+- new key absent AND session has a live group → `fork(old, new_key)`;
+  **no epoch bump** — the stream continues;
+- no old group (first attach) → `join` (seed) + epoch++ as today.
+
+`RenderGroup.fork(gpa, src, key)`:
+- `Dom.cloneDeep()` — NEW method: deep-copy `texts`/`attrs`/
+  `orders`/`when_states` (all owned strings/lists). `bindings` must be
+  empty — board never calls `bindTree`; assert, don't silently copy
+  (live-binding transfer is a separate problem).
+- `History.cloneDeep()` — NEW method: deep-copy each `Entry.data`.
+  Bounded by `max_entries`/`max_bytes` (64 / 2 MiB) — clone cost is
+  capped.
+- Copy `rev` and `last_rendered_seq`; set `needs_render = true` —
+  view inputs differ (reply_to/name), so the group must diff ONCE even
+  when `global_seq` is unchanged. `render()` skip condition becomes
+  `!needs_render and last_rendered_seq == global_seq`.
+- Fresh `PatchLog`, arena, `incarnation`, `members = 1`; registered
+  under the new key. `src.publish()` first (defensive no-op — render
+  and publish are already atomic under the server mutex).
+- Clone BEFORE `leave(src)` so the source is alive; `leave` then just
+  decrements — source survives for its other members.
+
+**Why this is sufficient.** The cloned `Dom` equals the tracked state
+the client's DOM was patched to (invariant: every render publishes
+immediately, so Dom == latest published view). The next `render()`
+diffs the NEW view against it → emits exactly the transition ops
+(e.g. reply form appears, comment thread untouched). `rev` continues
+at `src.rev`; the cloned ring serves lagging cursors — its prefix IS
+the parent's history, so catch-up ops are valid for the client's
+lineage. Fork-of-fork chains work: each clone carries the full
+prefix.
+
+**Epoch semantics refined.** `membership_epoch` now means "stream
+namespace changed", not "membership changed": bump on join-existing,
+first attach, and group recreation under a taken key; NOT on
+clone-fork. `http.zig` needs ZERO changes — the existing contract
+(bump → snapshot) already implements the right policy. Client needs
+zero changes.
+
+**Accepted v2 limit.** Fork-CANCEL (reply_to → null) rejoins the
+existing base group → epoch bump → snapshot → drafts still lost on
+cancel. Avoiding it needs either (a) a join fast-path when the client
+cursor ≤ the group's clone-point rev (requires recording fork
+provenance on groups), or (b) the v3 direction below.
+
+**v3 direction (noted, not planned): decouple stream identity from
+view identity.** A group's `Dom`+`history`+`rev` is a stream
+namespace; its view inputs could change via transition-diff
+(`diff(new_view, old_Dom)` always yields valid ops for that
+namespace's clients). Sessions could then adopt ANY view without
+snapshotting — at the cost of giving up render dedup for divergent
+members. Groups become shared namespaces with opportunistic dedup,
+not view-keyed cells. Bigger redesign; revisit only if v2's cancel
+snapshot proves painful.
+
+**Size estimate.** `Dom.cloneDeep` ~60 lines, `History.cloneDeep` ~15,
+`fork` ~40, `syncMembership` branch ~15, `needs_render` ~5,
+tests ~150 — ~300 lines across `dom.zig`, `history.zig`,
+`board_groups.zig`, `board_app.zig`. Far smaller than v1.
+
+**Test plan.** Unit: clone equivalence (diff clone vs original →
+empty ops), history clone preserves `fetch(cursor)`. Integration:
+fork produces `patch` (not `snapshot`) with contiguous revs; minimal
+ops (reply region only); lagging cursor catch-up through cloned ring;
+fork-of-fork; A→B→A still snapshots; identity mint mid-session no
+longer snapshots; eviction/recreation unchanged.
