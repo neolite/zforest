@@ -1617,3 +1617,179 @@ test "store clock triggers sample with the new value as payload" {
     count.set(1); // src=1, clk=1 → 2
     try std.testing.expectEqual(@as(i32, 2), out.get());
 }
+
+// ─────────────────────────────────────────────
+// batch() tests: outermost-boundary flush, ordering,
+// reentrancy, after-flush policy
+// ─────────────────────────────────────────────
+
+test "batch coalesces emits into a single flush and watcher run" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const ev = createEvent(&eng, i32);
+    const st = createStore(&eng, i32, 0);
+    _ = st.on(ev, &struct {
+        fn reduce(state: i32, p: i32) ?i32 {
+            return state + p;
+        }
+    }.reduce);
+
+    const Probe = struct {
+        var calls: usize = 0;
+        var last: i32 = -1;
+        fn cb(v: i32) void {
+            calls += 1;
+            last = v;
+        }
+    };
+    Probe.calls = 0;
+    Probe.last = -1;
+    _ = st.watch(&Probe.cb);
+
+    const Flushes = struct {
+        n: usize = 0,
+        fn bump(raw: *anyopaque) void {
+            const c: *@This() = @ptrCast(@alignCast(raw));
+            c.n += 1;
+        }
+    };
+    var flushes = Flushes{};
+    eng.onAfterFlush(.{ .ctx = @ptrCast(&flushes), .call = &Flushes.bump });
+
+    eng.batchBegin();
+    ev.emit(1);
+    ev.emit(2);
+    ev.emit(3);
+    // Mid-batch: nothing has run yet.
+    try std.testing.expectEqual(@as(i32, 0), st.get());
+    try std.testing.expectEqual(@as(usize, 0), Probe.calls);
+    try std.testing.expectEqual(@as(usize, 0), flushes.n);
+    eng.batchEnd();
+
+    try std.testing.expectEqual(@as(i32, 6), st.get());
+    try std.testing.expectEqual(@as(usize, 1), Probe.calls);
+    try std.testing.expectEqual(@as(i32, 6), Probe.last);
+    try std.testing.expectEqual(@as(usize, 1), flushes.n);
+}
+
+test "nested batches flush only at the outermost boundary" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const ev = createEvent(&eng, i32);
+    const st = createStore(&eng, i32, 0);
+    _ = st.on(ev, &struct {
+        fn reduce(_: i32, p: i32) ?i32 {
+            return p;
+        }
+    }.reduce);
+
+    eng.batchBegin();
+    eng.batchBegin();
+    ev.emit(1);
+    eng.batchEnd(); // inner — must not flush
+    try std.testing.expectEqual(@as(i32, 0), st.get());
+    ev.emit(2);
+    eng.batchEnd(); // outer — single flush
+    try std.testing.expectEqual(@as(i32, 2), st.get());
+}
+
+test "batch preserves event order and multiplicity" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const ev = createEvent(&eng, i32);
+    const Seen = struct {
+        var buf: [8]i32 = undefined;
+        var n: usize = 0;
+        fn cb(v: i32) void {
+            buf[n] = v;
+            n += 1;
+        }
+    };
+    Seen.n = 0;
+    _ = ev.watch(&Seen.cb);
+
+    eng.batchBegin();
+    ev.emit(1);
+    ev.emit(2);
+    ev.emit(1);
+    ev.emit(3);
+    eng.batchEnd();
+
+    try std.testing.expectEqual(@as(usize, 4), Seen.n);
+    try std.testing.expectEqual(@as(i32, 1), Seen.buf[0]);
+    try std.testing.expectEqual(@as(i32, 2), Seen.buf[1]);
+    try std.testing.expectEqual(@as(i32, 1), Seen.buf[2]);
+    try std.testing.expectEqual(@as(i32, 3), Seen.buf[3]);
+}
+
+test "flush inside a batch defers to the outermost batchEnd" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const ev = createEvent(&eng, i32);
+    const st = createStore(&eng, i32, 0);
+    _ = st.on(ev, &struct {
+        fn reduce(_: i32, p: i32) ?i32 {
+            return p;
+        }
+    }.reduce);
+
+    eng.batchBegin();
+    ev.emit(9);
+    eng.flush(); // explicit flush mid-batch: no-op
+    try std.testing.expectEqual(@as(i32, 0), st.get());
+    eng.batchEnd();
+    try std.testing.expectEqual(@as(i32, 9), st.get());
+}
+
+test "empty batch runs no flush and no after-flush hooks" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const Flushes = struct {
+        n: usize = 0,
+        fn bump(raw: *anyopaque) void {
+            const c: *@This() = @ptrCast(@alignCast(raw));
+            c.n += 1;
+        }
+    };
+    var flushes = Flushes{};
+    eng.onAfterFlush(.{ .ctx = @ptrCast(&flushes), .call = &Flushes.bump });
+
+    eng.batchBegin();
+    eng.batchEnd();
+    try std.testing.expectEqual(@as(usize, 0), flushes.n);
+}
+
+test "reentrant flush from a watcher does not drain queues recursively" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const ev = createEvent(&eng, i32);
+    const st = createStore(&eng, i32, 0);
+    _ = st.on(ev, &struct {
+        fn reduce(state: i32, p: i32) ?i32 {
+            return state + p;
+        }
+    }.reduce);
+
+    const Reentrant = struct {
+        var eng_ptr: ?*Engine = null;
+        var calls: usize = 0;
+        fn cb(_: i32) void {
+            calls += 1;
+            eng_ptr.?.flush(); // must return immediately, not re-drain
+        }
+    };
+    Reentrant.eng_ptr = &eng;
+    Reentrant.calls = 0;
+    _ = st.watch(&Reentrant.cb);
+
+    ev.emit(1);
+    ev.emit(2);
+    try std.testing.expectEqual(@as(i32, 3), st.get());
+    try std.testing.expectEqual(@as(usize, 2), Reentrant.calls);
+}

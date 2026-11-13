@@ -31,6 +31,12 @@ pub const Engine = struct {
     tick_arena: std.heap.ArenaAllocator,
     phase: Phase = .idle,
     tick_id: u32 = 1,
+    /// >0 while inside batchBegin/batchEnd — flush() defers to the
+    /// outermost batchEnd. Notification batching only, not rollback.
+    batch_depth: usize = 0,
+    /// Guards flush() against reentrant drains (e.g. a watcher calling
+    /// eng.flush() mid-flush must not recursively drain the queues).
+    flushing: bool = false,
     pure_queue: std.ArrayListUnmanaged(Thunk) = .empty,
     effect_queue: std.ArrayListUnmanaged(Thunk) = .empty,
     /// Post-settle computations (sample wires). Drained only after the
@@ -93,7 +99,39 @@ pub const Engine = struct {
         queue.clearRetainingCapacity();
     }
 
+    /// Begin a notification batch. Emits, store writes and effect runs
+    /// keep their order and multiplicity but queue up: no reducers run,
+    /// no watcher fires and no after-flush hook runs until the OUTERMOST
+    /// `batchEnd`. Nested batches are supported. This is batching, NOT
+    /// rollback — mutations apply immediately and borrowed payloads must
+    /// stay valid until the outer flush (the tick arena covers them).
+    /// `flush()` called inside a batch is a no-op.
+    pub fn batchBegin(self: *Engine) void {
+        self.batch_depth += 1;
+    }
+
+    /// End a batch. Only the outermost end performs a single flush —
+    /// skipped entirely when the batch queued no work (e.g. every write
+    /// was equality-suppressed). After-flush hooks therefore run at most
+    /// once per batch, with fully settled final state; a hook that emits
+    /// flushes immediately afterwards (it is outside the batch).
+    pub fn batchEnd(self: *Engine) void {
+        std.debug.assert(self.batch_depth > 0);
+        self.batch_depth -= 1;
+        if (self.batch_depth != 0) return;
+        if (self.pure_queue.items.len == 0 and
+            self.effect_queue.items.len == 0 and
+            self.sample_queue.items.len == 0 and
+            self.dirty_indices.items.len == 0) return;
+        self.flush();
+    }
+
     pub fn flush(self: *Engine) void {
+        // Deferred inside a batch; a reentrant call mid-flush must not
+        // recursively drain the queues the outer loop is iterating.
+        if (self.batch_depth > 0 or self.flushing) return;
+        self.flushing = true;
+
         // Drain until stable. Effects may emit new events, which enqueue new
         // pure reducers that must run before ending the tick/resetting arena.
         while (true) {
@@ -139,6 +177,7 @@ pub const Engine = struct {
                 break;
             }
         }
+        self.flushing = false;
 
         // Reset per-tick arena, advance tick
         _ = self.tick_arena.reset(.retain_capacity);

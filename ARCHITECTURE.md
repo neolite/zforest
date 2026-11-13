@@ -488,3 +488,21 @@ ownership — needs ownership change anyway).
 - Ownership: `Engine.assertSameEngine` panics on cross-engine units —
   wired into sample, forward, `store.on`/`reset`, `merge`, `split`,
   `combine`.
+
+## zefx core fixes — item 2: explicit batch (2026-11)
+
+`Engine.batchBegin()`/`batchEnd()` (`src/zefx/engine.zig`): nested
+batches flush only at the outermost end; events keep order/multiplicity;
+no watcher/sample/after-flush work runs mid-batch; `flush()` inside a
+batch is a no-op and a `flushing` guard makes reentrant `flush()`
+mid-drain a no-op too. batchEnd skips the flush entirely when nothing
+queued. **After-flush policy:** hooks run at most once per batch, after
+the single outermost flush with settled state; a hook that emits
+flushes immediately (it is outside the batch). Notification batching,
+not rollback — mutations apply eagerly; borrowed payloads live in the
+tick arena until the outer flush.
+
+Adopted in `mon_app.refreshStores()` (inner batch) + new
+`refreshAndPing()` (outer batch covering stores+ping): syncPull/dispatch
+now cost ONE flush+render per refresh instead of ~14. servePage/
+buildViewNodes get the inner batch for free.
