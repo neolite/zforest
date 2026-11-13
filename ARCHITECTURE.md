@@ -250,3 +250,47 @@ parity, (2) engine ownership/transaction semantics, (3) binding
 lifecycle, (4) projection delivery, (5) package interfaces. First
 milestone: correct snapshots + revisioned dependency-aware projections
 while KEEPING diff rendering — before hybrid rendering.
+
+## Astra review: what to add to zefx (2026-11)
+
+Top-3 ranked: (1) make `sample` a trustworthy boundary, (2) explicit
+synchronous batching, (3) equality-aware store writes. `attach` next;
+async effects and detachable edges deferred until a real requirement.
+
+Concrete defects she found in current zefx:
+- `sample` is advertised but incomplete: `MakeWire.run` discards the
+  clock payload; event sources yield `undefined`; clock-only forwarding
+  has no value path; source-only shapes get no subscriptions; effect
+  targets receive `.emit` though `Effect` exposes `.run`; source reads
+  happen as ordinary clock reducers → may observe unsettled derived
+  state (settle guarantee covers watchers only).
+- zmon `refreshStores()` does 13 `.set()` + `ping.emit()` per refresh —
+  each auto-flushes → ~14 flushes/hooks per tick.
+- `Store.set` not deduping is only half the story: `.on`/`.reset`/`.map`/
+  `combine` write value + markDirty directly — equality policy must live
+  at the common write boundary. String values need care: zmon resets
+  fmt_arena before replacing slices, so old-vs-new comparison can read
+  reused storage.
+
+Design contracts for batching: nested batches flush at outer boundary
+only; events keep order/multiplicity; no watcher/after-flush mid-batch;
+borrowed payloads valid until outer flush; reentrant flush() cannot
+recursively drain; after-flush emissions need explicit policy. It is
+notification batching, NOT rollback/transaction.
+
+Sampling contract she wants: clock-only forwards payload; store/shape
+sources combine with clock in transform+predicate; targets typed
+(store/event/effect); unsupported configs fail at COMPILE time;
+same-engine validation on every input. Event-source "latest value"
+semantics either implemented properly or rejected initially.
+
+Also recommended: engine-ownership validation shipped WITH operator
+work; typed reducer-registration API (all 4 apps currently
+`.reducers.append` by hand); dirty-only watcher dispatch + instrumentation
+before scheduling optimization.
+
+Explicitly NOT to build: Effector compat/aliases/factories, cross-engine
+sample/combine edges, per-item cells before disposal semantics,
+built-in thread pools/timer threads, debounced SQLite writes without
+durability+ACK, HTTP/SSE/persistence inside zefx, automatic deep
+equality.
