@@ -8,9 +8,11 @@ const todo = @import("../todo_app.zig");
 /// become `html` ops, bound nodes become attr/text ops. Reads model
 /// state only — never touches the pending patch log, so a snapshot can
 /// never consume an unpublished action's patches.
-/// `s` is duck-typed: `seq.get()`, `render_arena`, `buildViewNodes(a)`.
-pub fn writeSnapshotJson(s: anytype, writer: *std.Io.Writer) !void {
-    try writer.print("{{\"rev\":{d},\"ops\":", .{s.seq.get()});
+/// `s` is duck-typed: `render_arena`, `buildViewNodes(a)`.
+/// `rev` is passed explicitly: grouped sessions adopt their render
+/// group's revision, which is not necessarily `s.seq.get()`.
+pub fn writeSnapshotJson(s: anytype, rev: u64, writer: *std.Io.Writer) !void {
+    try writer.print("{{\"rev\":{d},\"ops\":", .{rev});
     _ = s.render_arena.reset(.retain_capacity);
     const a = s.render_arena.allocator();
     try forest.writeSnapshotOps(a, s.buildViewNodes(a), writer);
@@ -35,7 +37,7 @@ test "snapshot serializes the view as a full-state ops array" {
 
     var aw: std.Io.Writer.Allocating = .init(alloc);
     defer aw.deinit();
-    try writeSnapshotJson(s, &aw.writer);
+    try writeSnapshotJson(s, s.seq.get(), &aw.writer);
     const json = aw.writer.buffered();
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
