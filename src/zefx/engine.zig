@@ -31,8 +31,18 @@ pub const Engine = struct {
     tick_arena: std.heap.ArenaAllocator,
     phase: Phase = .idle,
     tick_id: u32 = 1,
+    /// >0 while inside batchBegin/batchEnd — flush() defers to the
+    /// outermost batchEnd. Notification batching only, not rollback.
+    batch_depth: usize = 0,
+    /// Guards flush() against reentrant drains (e.g. a watcher calling
+    /// eng.flush() mid-flush must not recursively drain the queues).
+    flushing: bool = false,
     pure_queue: std.ArrayListUnmanaged(Thunk) = .empty,
     effect_queue: std.ArrayListUnmanaged(Thunk) = .empty,
+    /// Post-settle computations (sample wires). Drained only after the
+    /// derived graph has fully settled, so source reads observe final
+    /// state regardless of reducer registration order.
+    sample_queue: std.ArrayListUnmanaged(Thunk) = .empty,
     store_notifiers: std.ArrayListUnmanaged(StoreNotifier) = .empty,
     dirty_indices: std.ArrayListUnmanaged(usize) = .empty,
     graph_cleanups: std.ArrayListUnmanaged(CleanupEntry) = .empty,
@@ -54,6 +64,7 @@ pub const Engine = struct {
         self.tick_arena.deinit();
         self.pure_queue.deinit(self.allocator);
         self.effect_queue.deinit(self.allocator);
+        self.sample_queue.deinit(self.allocator);
         self.store_notifiers.deinit(self.allocator);
         self.dirty_indices.deinit(self.allocator);
         self.after_flush_hooks.deinit(self.allocator);
@@ -88,7 +99,39 @@ pub const Engine = struct {
         queue.clearRetainingCapacity();
     }
 
+    /// Begin a notification batch. Emits, store writes and effect runs
+    /// keep their order and multiplicity but queue up: no reducers run,
+    /// no watcher fires and no after-flush hook runs until the OUTERMOST
+    /// `batchEnd`. Nested batches are supported. This is batching, NOT
+    /// rollback — mutations apply immediately and borrowed payloads must
+    /// stay valid until the outer flush (the tick arena covers them).
+    /// `flush()` called inside a batch is a no-op.
+    pub fn batchBegin(self: *Engine) void {
+        self.batch_depth += 1;
+    }
+
+    /// End a batch. Only the outermost end performs a single flush —
+    /// skipped entirely when the batch queued no work (e.g. every write
+    /// was equality-suppressed). After-flush hooks therefore run at most
+    /// once per batch, with fully settled final state; a hook that emits
+    /// flushes immediately afterwards (it is outside the batch).
+    pub fn batchEnd(self: *Engine) void {
+        if (self.batch_depth == 0) @panic("zefx: batchEnd without batchBegin");
+        self.batch_depth -= 1;
+        if (self.batch_depth != 0) return;
+        if (self.pure_queue.items.len == 0 and
+            self.effect_queue.items.len == 0 and
+            self.sample_queue.items.len == 0 and
+            self.dirty_indices.items.len == 0) return;
+        self.flush();
+    }
+
     pub fn flush(self: *Engine) void {
+        // Deferred inside a batch; a reentrant call mid-flush must not
+        // recursively drain the queues the outer loop is iterating.
+        if (self.batch_depth > 0 or self.flushing) return;
+        self.flushing = true;
+
         // Drain until stable. Effects may emit new events, which enqueue new
         // pure reducers that must run before ending the tick/resetting arena.
         while (true) {
@@ -111,6 +154,13 @@ pub const Engine = struct {
                 drainQueue(&self.pure_queue);
             }
 
+            // Post-settle phase: sample wires read store/shape sources here,
+            // after every reducer and derived propagation has run. A wire may
+            // enqueue more pure work (target store.set / event.emit /
+            // effect.run) — loop back to re-settle before effects run.
+            drainQueue(&self.sample_queue);
+            if (self.pure_queue.items.len > 0 or self.dirty_indices.items.len > 0) continue;
+
             // Phase 2: effects — the graph is fully settled.
             self.phase = .effects;
             // 2a: view watchers on every store dirtied this tick
@@ -121,10 +171,13 @@ pub const Engine = struct {
             // 2b: event watchers / scheduled effects
             drainQueue(&self.effect_queue);
 
-            if (self.pure_queue.items.len == 0 and self.effect_queue.items.len == 0 and self.dirty_indices.items.len == 0) {
+            if (self.pure_queue.items.len == 0 and self.effect_queue.items.len == 0 and
+                self.dirty_indices.items.len == 0 and self.sample_queue.items.len == 0)
+            {
                 break;
             }
         }
+        self.flushing = false;
 
         // Reset per-tick arena, advance tick
         _ = self.tick_arena.reset(.retain_capacity);
@@ -145,5 +198,17 @@ pub const Engine = struct {
 
     pub fn scheduleEffect(self: *Engine, thunk: Thunk) void {
         self.effect_queue.append(self.allocator, thunk) catch @panic("OOM");
+    }
+
+    /// Queue a post-settle computation (sample wires). Runs after pure
+    /// reducers and derived-store propagation have fully settled.
+    pub fn scheduleSample(self: *Engine, thunk: Thunk) void {
+        self.sample_queue.append(self.allocator, thunk) catch @panic("OOM");
+    }
+
+    /// Graph edges must not cross engines: reducer contexts capture the
+    /// owning engine's queues and tick arena. Panic on mismatch.
+    pub fn assertSameEngine(self: *Engine, other: *Engine) void {
+        if (self != other) @panic("zefx: graph units must belong to the same engine");
     }
 };

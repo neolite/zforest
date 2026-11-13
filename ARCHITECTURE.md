@@ -525,3 +525,65 @@ still arena-allocated copies — O(matches), never borrowed, so no
 cross-mutation dangling). Memory O(posts+comments). Covered by a test
 comparing all three idx fns + id lookups against copies of the old
 scans, plus load-path checks in the persist/reload test.
+
+---
+
+## zefx core fixes — item 1: sample repair (2026-11)
+
+`sample` rewritten (`src/zefx/sample.zig`):
+- Wires now only SCHEDULE via a new `Engine.sample_queue`; the engine
+  drains it in a post-settle phase (after pure reducers + derived
+  propagation, before watchers/effects) — source reads always see
+  settled state regardless of reducer registration order. Target writes
+  re-enter the settle loop before effects run.
+- `fn_`/`filter` arity follows inputs: `(source, clock)` when both,
+  `(source)` source-only, `(clock)` clock-only. No `fn_` → result is the
+  source snapshot, else the clock payload (clock-only forwarding fixed).
+- Typed units: clock = `*Event`|`*Store` (store clocks fire on
+  `updates()`, payload = new value); source = `*Store`|shape of `*Store`
+  — **event sources rejected at compile time** (no defined latest-value
+  semantics; `forward()` covers event piping and is now clock-only
+  sample). Target = `*Store`/`*Event`/`*Effect` with payload-type checks;
+  effect targets call `.run` (Effect gained `ParamT` decl).
+- Ownership: `Engine.assertSameEngine` panics on cross-engine units —
+  wired into sample, forward, `store.on`/`reset`, `merge`, `split`,
+  `combine`.
+
+## zefx core fixes — item 2: explicit batch (2026-11)
+
+`Engine.batchBegin()`/`batchEnd()` (`src/zefx/engine.zig`): nested
+batches flush only at the outermost end; events keep order/multiplicity;
+no watcher/sample/after-flush work runs mid-batch; `flush()` inside a
+batch is a no-op and a `flushing` guard makes reentrant `flush()`
+mid-drain a no-op too. batchEnd skips the flush entirely when nothing
+queued. **After-flush policy:** hooks run at most once per batch, after
+the single outermost flush with settled state; a hook that emits
+flushes immediately (it is outside the batch). Notification batching,
+not rollback — mutations apply eagerly; borrowed payloads live in the
+tick arena until the outer flush.
+
+Adopted in `mon_app.refreshStores()` (inner batch) + new
+`refreshAndPing()` (outer batch covering stores+ping): syncPull/dispatch
+now cost ONE flush+render per refresh instead of ~14. servePage/
+buildViewNodes get the inner batch for free.
+
+## zefx core fixes — item 3: equality-aware writes (2026-11)
+
+`Store.writeValue` is now the single write boundary for EVERY mutation
+path — `.set`/`.setState`, `.on` reducers, `.reset`, `map`/`combine`
+derived writes, and sample→store targets all funnel through it
+(`src/zefx/store.zig`, `root.zig` combine trigger). New `eq` field
+(`?*const fn(T,T) bool`): default is comptime scalar equality
+(int/bool/enum/float via `==`); compound types default `null` =
+always-write — NO automatic deep equality. Suppressed writes skip
+prev/value update, markDirty, watchers AND settle propagation; a
+suppressed `.set` doesn't even flush. Opt-in comparator:
+`st.eq = sliceEq([]const u8)` (`zefx.sliceEq` factory) — runs at WRITE
+time, so the old value's backing must still be valid: mon_app's
+fmt_arena slice stores deliberately keep `eq = null` (arena resets
+before the sets would recycle the old slices; Dom already dedupes
+unchanged text ops). `st.eq = null` disables dedup entirely.
+Audit: apps only `.set` seq(+1) (always changes) and mon's slice
+stores — no app relied on equal-value writes for side effects;
+scalar dedup additionally silences zmon's bool/u64 stores
+(st_ok/st_bad pills, st_err_bp) between real changes.

@@ -6,10 +6,34 @@ const Subscription = eng_mod.Subscription;
 const StoreNotifier = eng_mod.StoreNotifier;
 const event_mod = @import("event.zig");
 
+/// Default equality for `Store.eq`: scalar types (ints, bools, enums,
+/// floats) compare with `==`. Compound values — slices, strings,
+/// structs — get `null` (always written) unless the caller opts into an
+/// explicit comparator. No automatic deep equality.
+fn defaultEq(comptime T: type) ?*const fn (T, T) bool {
+    return switch (@typeInfo(T)) {
+        .int, .bool, .@"enum", .float => struct {
+            fn eq(a: T, b: T) bool {
+                return a == b;
+            }
+        }.eq,
+        else => null,
+    };
+}
+
 pub fn Store(comptime T: type) type {
     return struct {
         const Self = @This();
         pub const Value = T;
+        /// Opt-in content comparator `eq(old, new) -> bool`, used by the
+        /// common write boundary (`writeValue`) on EVERY mutation path —
+        /// `.set`/`.on`/`.reset` and derived writes. Default is comptime
+        /// scalar equality; set `st.eq = &myEq` (or `= null` to disable).
+        /// The comparison runs at WRITE time, before the caller may
+        /// recycle the old value's backing storage — slice-valued stores
+        /// backed by reset-on-refresh arenas must keep stable storage or
+        /// skip `eq` (see mon_app's fmt_arena stores).
+        pub const EqFn = *const fn (T, T) bool;
         pub const WatcherFn = *const fn (T) void;
         const CleanupSlot = struct {
             ptr: *anyopaque,
@@ -27,6 +51,8 @@ pub fn Store(comptime T: type) type {
 
         eng: *Engine,
         name_: []const u8 = "",
+        /// Equality policy — see `EqFn`/`defaultEq`. `null` = always write.
+        eq: ?EqFn = defaultEq(T),
         value: T,
         prev: T,
         initial: T,
@@ -56,11 +82,27 @@ pub fn Store(comptime T: type) type {
             return self.get();
         }
 
-        /// Imperatively set a new value. Marks dirty and flushes if idle.
-        pub fn set(self: *Self, val: T) void {
+        /// Common write boundary: every mutation path (.set/.on/.reset/
+        /// map/combine/sample targets) funnels here. When `eq` reports
+        /// old == new the write is suppressed entirely — no prev/value
+        /// update, no markDirty, no watcher or settle propagation.
+        /// Returns true when the value was actually written. Public so
+        /// root.zig operators (combine) share the same boundary.
+        pub fn writeValue(self: *Self, new_val: T) bool {
+            if (self.eq) |eq| {
+                if (eq(self.value, new_val)) return false;
+            }
             self.prev = self.value;
-            self.value = val;
+            self.value = new_val;
             self.markDirty();
+            return true;
+        }
+
+        /// Imperatively set a new value. Equality-suppressed writes are
+        /// dropped silently (no dirty, no flush); otherwise marks dirty
+        /// and flushes if idle.
+        pub fn set(self: *Self, val: T) void {
+            if (!self.writeValue(val)) return;
             if (self.eng.phase == .idle) {
                 self.eng.flush();
             }
@@ -153,6 +195,7 @@ pub fn Store(comptime T: type) type {
             ev: anytype, // *Event(SomePayload)
             reduce: *const fn (T, @TypeOf(ev.*).Payload) ?T,
         ) *Self {
+            self.eng.assertSameEngine(ev.eng);
             self.ensureRegistered();
 
             const EvPayload = @TypeOf(ev.*).Payload;
@@ -183,9 +226,7 @@ pub fn Store(comptime T: type) type {
                         const c: *ReducerCtx = @ptrCast(@alignCast(raw_ctx));
                         const payload: *const EvPayload = @ptrCast(@alignCast(payload_ptr));
                         if (c.reducer(c.store.value, payload.*)) |new_val| {
-                            c.store.prev = c.store.value;
-                            c.store.value = new_val;
-                            c.store.markDirty();
+                            _ = c.store.writeValue(new_val);
                         }
                     }
                 }.trigger,
@@ -200,6 +241,7 @@ pub fn Store(comptime T: type) type {
             ev: anytype,
         ) *Self {
             const EvPayload = @TypeOf(ev.*).Payload;
+            self.eng.assertSameEngine(ev.eng);
 
             const ResetCtx = struct {
                 store: *Self,
@@ -225,9 +267,7 @@ pub fn Store(comptime T: type) type {
                     fn trigger(raw_ctx: *anyopaque, _: *const anyopaque) void {
                         const c: *ResetCtx = @ptrCast(@alignCast(raw_ctx));
                         _ = EvPayload; // keep comptime param alive
-                        c.store.prev = c.store.value;
-                        c.store.value = c.store.initial;
-                        c.store.markDirty();
+                        _ = c.store.writeValue(c.store.initial);
                     }
                 }.trigger,
             }) catch @panic("OOM");
@@ -352,9 +392,7 @@ fn MapHelper(comptime T: type, comptime R: type) type {
                         const c: *MapCtx = @ptrCast(@alignCast(raw));
                         const payload: *const T = @ptrCast(@alignCast(payload_ptr));
                         const new_val = c.mapFn(payload.*);
-                        c.target.prev = c.target.value;
-                        c.target.value = new_val;
-                        c.target.markDirty();
+                        _ = c.target.writeValue(new_val);
                     }
                 }.trigger,
             }) catch @panic("OOM");

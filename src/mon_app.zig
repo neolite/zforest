@@ -121,13 +121,12 @@ pub const Session = struct {
     }
 
     /// SSE-worker hook: when the shared model moved, refresh stores and
-    /// ping — the flush renders this session's diff.
+    /// ping — one batched flush renders this session's diff.
     pub fn syncPull(self: *Session) void {
         const seq_now = m().global_seq.load(.seq_cst);
         if (seq_now == self.seen_seq) return;
         self.seen_seq = seq_now;
-        self.refreshStores();
-        self.ping.emit(.{});
+        self.refreshAndPing();
     }
 
     // ── actions ────────────────────────────────────────────────────
@@ -171,8 +170,7 @@ pub const Session = struct {
         } else {
             return error.InvalidAction;
         }
-        self.refreshStores();
-        self.ping.emit(.{});
+        self.refreshAndPing();
     }
 
     // ── graph wiring ───────────────────────────────────────────────
@@ -213,9 +211,28 @@ pub const Session = struct {
 
     // ── stores ← model ─────────────────────────────────────────────
 
+    /// Store refresh + ping under ONE batch boundary: ~14 individual
+    /// auto-flushes collapse into a single flush (and render) per refresh.
+    /// refreshStores' own inner batch nests harmlessly.
+    fn refreshAndPing(self: *Session) void {
+        const eng = &self.app.eng;
+        eng.batchBegin();
+        defer eng.batchEnd();
+        self.refreshStores();
+        self.ping.emit(.{});
+    }
+
     /// Pull the shared model snapshot into this session's stores. String
-    /// slices live in fmt_arena until the next refresh.
+    /// slices live in fmt_arena until the next refresh. The batch makes
+    /// the ~13 `.set()` calls cost one flush even when called alone
+    /// (servePage / buildViewNodes). Slice stores deliberately keep
+    /// `eq = null`: fmt_arena is reset BEFORE the sets, so the old slice
+    /// would point into recycled memory — content comparison is unsafe
+    /// here (the Dom layer already dedupes unchanged text ops).
     fn refreshStores(self: *Session) void {
+        const eng = &self.app.eng;
+        eng.batchBegin();
+        defer eng.batchEnd();
         _ = self.fmt_arena.reset(.retain_capacity);
         const a = self.fmt_arena.allocator();
         const s = m().snapshot();

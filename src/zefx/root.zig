@@ -61,8 +61,8 @@ pub const BoundDomain = struct {
         return sample_mod.guard(&self.domain.eng, opts);
     }
 
-    pub fn forward(self: BoundDomain, from: anytype, to: anytype) @TypeOf(sample_mod.sample(&self.domain.eng, .{ .clock = from, .source = from, .target = to })) {
-        return sample_mod.sample(&self.domain.eng, .{ .clock = from, .source = from, .target = to });
+    pub fn forward(self: BoundDomain, from: anytype, to: anytype) @TypeOf(sample_mod.forward(&self.domain.eng, from, to)) {
+        return sample_mod.forward(&self.domain.eng, from, to);
     }
 
     pub fn effect(self: BoundDomain, comptime Params: type, comptime Result: type, comptime ErrSet: type, handler: *const fn (Params) ErrSet!Result) *Effect(Params, Result, ErrSet) {
@@ -200,8 +200,8 @@ pub const App = struct {
         return sample_mod.guard(&self.eng, opts);
     }
 
-    pub fn forward(self: *App, from: anytype, to: anytype) @TypeOf(sample_mod.sample(&self.eng, .{ .clock = from, .source = from, .target = to })) {
-        return sample_mod.sample(&self.eng, .{ .clock = from, .source = from, .target = to });
+    pub fn forward(self: *App, from: anytype, to: anytype) @TypeOf(sample_mod.forward(&self.eng, from, to)) {
+        return sample_mod.forward(&self.eng, from, to);
     }
 
     pub fn effect(self: *App, comptime Params: type, comptime Result: type, comptime ErrSet: type, handler: *const fn (Params) ErrSet!Result) *Effect(Params, Result, ErrSet) {
@@ -260,6 +260,20 @@ pub fn createStore(eng: *Engine, comptime T: type, initial: T) *Store(T) {
     return allocStore(eng, T, initial);
 }
 
+/// Returns a slice-content comparator for opt-in store equality:
+/// `st.eq = sliceEq([]const u8);` — S must be a slice type. The
+/// comparator runs at WRITE time; stores whose old value's backing
+/// storage may be recycled before `set` runs (e.g. an arena reset each
+/// refresh — see mon_app's fmt_arena stores) must keep stable storage
+/// or leave `eq` null instead of comparing recycled memory.
+pub fn sliceEq(comptime S: type) *const fn (S, S) bool {
+    return struct {
+        fn eq(a: S, b: S) bool {
+            return std.mem.eql(@typeInfo(S).pointer.child, a, b);
+        }
+    }.eq;
+}
+
 pub fn createEffect_(eng: *Engine, comptime Params: type, comptime Result: type, comptime ErrSet: type, handler: *const fn (Params) ErrSet!Result) *Effect(Params, Result, ErrSet) {
     return allocEffect(eng, Params, Result, ErrSet, handler);
 }
@@ -269,7 +283,7 @@ pub fn createEffect_(eng: *Engine, comptime Params: type, comptime Result: type,
 // ─────────────────────────────────────────────
 
 pub fn forward(eng: *Engine, from: anytype, to: anytype) @TypeOf(to) {
-    return sample(eng, .{ .clock = from, .source = from, .target = to });
+    return sample_mod.forward(eng, from, to);
 }
 
 // ─────────────────────────────────────────────
@@ -306,6 +320,7 @@ pub fn merge(eng: *Engine, sources: anytype) *Event(@typeInfo(@typeInfo(@TypeOf(
                 a.destroy(c);
             }
         }.dtor);
+        eng.assertSameEngine(src.eng);
         src.reducers.append(eng.allocator, .{
             .ctx = @ptrCast(ctx),
             .trigger = &struct {
@@ -339,6 +354,7 @@ fn SplitHelper(comptime T: type, comptime Cases: type) type {
         };
 
         fn create(eng: *Engine, source: anytype, cases: Cases) Result {
+            eng.assertSameEngine(source.eng);
             var result: Result = undefined;
             inline for (case_fields) |fname| {
                 @field(result, fname) = allocEvent(eng, T);
@@ -415,6 +431,7 @@ fn CombineHelper(comptime Shape: type, comptime FnType: type) type {
             inline for (store_fields) |fname| {
                 const src_store = @field(stores, fname);
                 src_store.ensureRegistered();
+                eng.assertSameEngine(src_store.eng);
 
                 const ctx = eng.allocator.create(CombineCtx) catch @panic("OOM");
                 ctx.* = .{ .derived_store = derived, .shape_stores = stores, .combineFn = combineFn };
@@ -438,9 +455,7 @@ fn CombineHelper(comptime Shape: type, comptime FnType: type) type {
             const c: *CombineCtx = @ptrCast(@alignCast(raw));
             const new_snap = shape.readSnapshot(c.shape_stores);
             const new_val = c.combineFn(new_snap);
-            c.derived_store.prev = c.derived_store.value;
-            c.derived_store.value = new_val;
-            c.derived_store.markDirty();
+            _ = c.derived_store.writeValue(new_val);
         }
     };
 }
@@ -482,8 +497,8 @@ test "sample with clock/source/fn updates target store" {
         .clock = inc,
         .source = count,
         .fn_ = &struct {
-            fn map(v: i32) i32 {
-                return v * 2;
+            fn map(src: i32, _: i32) i32 {
+                return src * 2;
             }
         }.map,
         .target = doubled,
@@ -514,8 +529,8 @@ test "guard only forwards values that pass filter" {
         .clock = inc,
         .source = count,
         .filter = &struct {
-            fn allow(v: i32) bool {
-                return v > 5;
+            fn allow(src: i32, _: i32) bool {
+                return src > 5;
             }
         }.allow,
         .target = filtered,
@@ -561,8 +576,8 @@ test "sample without target returns auto-created event" {
         .clock = inc,
         .source = count,
         .fn_ = &struct {
-            fn map(v: i32) i32 {
-                return v * v;
+            fn map(src: i32, _: i32) i32 {
+                return src * src;
             }
         }.map,
     });
@@ -588,7 +603,7 @@ test "sample supports shape source snapshot" {
         .clock = tick,
         .source = .{ .a = a, .b = b },
         .fn_ = &struct {
-            fn map(snap: shape.SnapshotTypeOf(struct { a: *Store(i32), b: *Store(i32) })) i32 {
+            fn map(snap: shape.SnapshotTypeOf(struct { a: *Store(i32), b: *Store(i32) }), _: i32) i32 {
                 return snap.a + snap.b;
             }
         }.map,
@@ -660,8 +675,8 @@ test "effects phase sees final derived state from pure phase" {
         .clock = inc,
         .source = count,
         .fn_ = &struct {
-            fn map(v: i32) i32 {
-                return v * 3;
+            fn map(src: i32, _: i32) i32 {
+                return src * 3;
             }
         }.map,
         .target = tripled,
@@ -764,8 +779,8 @@ test "app facade exposes sample and operators in JS-like style" {
         .clock = inc,
         .source = count,
         .fn_ = &struct {
-            fn map(v: i32) i32 {
-                return v * 2;
+            fn map(src: i32, _: i32) i32 {
+                return src * 2;
             }
         }.map,
         .target = doubled,
@@ -857,8 +872,8 @@ test "bound domain facade works without explicit domain pointer in calls" {
         .clock = inc,
         .source = count,
         .fn_ = &struct {
-            fn map(v: i32) i32 {
-                return v * 2;
+            fn map(src: i32, _: i32) i32 {
+                return src * 2;
             }
         }.map,
         .target = doubled,
@@ -1407,4 +1422,600 @@ test "after-flush hook runs once per flush" {
     ev.emit(1);
     ev.emit(2);
     try std.testing.expectEqual(@as(usize, 2), counter.flushes);
+}
+
+// ─────────────────────────────────────────────
+// sample() repair tests: typed targets, clock payloads,
+// settle-ordered source reads, ownership
+// ─────────────────────────────────────────────
+
+test "clock-only sample forwards the clock payload" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const tick = createEvent(&eng, i32);
+    const out = createEvent(&eng, i32);
+    const last = restore(&eng, out, -1);
+
+    _ = sample(&eng, .{ .clock = tick, .target = out });
+
+    tick.emit(42);
+    tick.emit(7);
+    try std.testing.expectEqual(@as(i32, 7), last.get());
+}
+
+test "clock-only sample fn receives the clock payload" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const tick = createEvent(&eng, i32);
+    const out = createStore(&eng, i32, 0);
+
+    _ = sample(&eng, .{
+        .clock = tick,
+        .fn_ = &struct {
+            fn scale(c: i32) i32 {
+                return c * 10;
+            }
+        }.scale,
+        .target = out,
+    });
+
+    tick.emit(4);
+    tick.emit(9);
+    try std.testing.expectEqual(@as(i32, 90), out.get());
+}
+
+test "sample fn receives source and clock payloads" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const tick = createEvent(&eng, i32);
+    const count = createStore(&eng, i32, 100);
+    const out = createStore(&eng, i32, 0);
+
+    _ = sample(&eng, .{
+        .clock = tick,
+        .source = count,
+        .fn_ = &struct {
+            fn combine(src: i32, clk: i32) i32 {
+                return clk * 1000 + src;
+            }
+        }.combine,
+        .target = out,
+    });
+
+    tick.emit(5); // 5*1000 + 100
+    tick.emit(2); // 2*1000 + 100
+    try std.testing.expectEqual(@as(i32, 2100), out.get());
+}
+
+test "sample reads settled derived state regardless of reducer order" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const inc = createEvent(&eng, i32);
+    const base = createStore(&eng, i32, 0);
+    const doubled = base.map(i32, &struct {
+        fn m(v: i32) i32 {
+            return v * 2;
+        }
+    }.m);
+    const out = createStore(&eng, i32, -1);
+
+    // The sample wire is registered BEFORE base.on — it must still
+    // observe the fully settled derived value, not a stale read.
+    _ = sample(&eng, .{
+        .clock = inc,
+        .source = doubled,
+        .target = out,
+    });
+    _ = base.on(inc, &struct {
+        fn reduce(state: i32, p: i32) ?i32 {
+            return state + p;
+        }
+    }.reduce);
+
+    inc.emit(3); // base=3, doubled=6, out=6
+    try std.testing.expectEqual(@as(i32, 3), base.get());
+    try std.testing.expectEqual(@as(i32, 6), doubled.get());
+    try std.testing.expectEqual(@as(i32, 6), out.get());
+
+    inc.emit(1); // base=4, doubled=8, out=8
+    try std.testing.expectEqual(@as(i32, 8), out.get());
+}
+
+test "source-only sample fires on store updates" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const count = createStore(&eng, i32, 1);
+    const doubled = createStore(&eng, i32, 0);
+
+    _ = sample(&eng, .{
+        .source = count,
+        .fn_ = &struct {
+            fn dbl(v: i32) i32 {
+                return v * 2;
+            }
+        }.dbl,
+        .target = doubled,
+    });
+
+    count.set(5);
+    try std.testing.expectEqual(@as(i32, 10), doubled.get());
+    count.set(3);
+    try std.testing.expectEqual(@as(i32, 6), doubled.get());
+}
+
+test "source-only shape sample fires on member updates" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const a = createStore(&eng, i32, 1);
+    const b = createStore(&eng, i32, 2);
+    const total = createStore(&eng, i32, 0);
+
+    _ = sample(&eng, .{
+        .source = .{ .a = a, .b = b },
+        .fn_ = &struct {
+            fn add(snap: shape.SnapshotTypeOf(struct { a: *Store(i32), b: *Store(i32) })) i32 {
+                return snap.a + snap.b;
+            }
+        }.add,
+        .target = total,
+    });
+
+    a.set(3);
+    try std.testing.expectEqual(@as(i32, 5), total.get());
+    b.set(10);
+    try std.testing.expectEqual(@as(i32, 13), total.get());
+}
+
+test "sample with effect target runs the effect" {
+    var app = createApp(std.testing.allocator);
+    defer app.deinit();
+
+    const FxErr = error{Nope};
+    const fx = app.effect(i32, i32, FxErr, &struct {
+        fn handler(p: i32) FxErr!i32 {
+            return p * 10;
+        }
+    }.handler);
+
+    const count = app.store(i32, 2);
+    const go = app.event(void);
+
+    _ = app.sample(.{
+        .clock = go,
+        .source = count,
+        .target = fx, // result = source value (i32) == effect params
+    });
+
+    const DoneProbe = struct {
+        var last: i32 = -1;
+        fn watch(d: Effect(i32, i32, FxErr).DoneData) void {
+            last = d.result;
+        }
+    };
+    DoneProbe.last = -1;
+    _ = fx.done.watch(&DoneProbe.watch);
+
+    go.emit({});
+    try std.testing.expectEqual(@as(i32, 20), DoneProbe.last);
+    try std.testing.expectEqual(false, fx.pending.get());
+}
+
+test "store clock triggers sample with the new value as payload" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const count = createStore(&eng, i32, 0);
+    const out = createStore(&eng, i32, 0);
+
+    _ = sample(&eng, .{
+        .clock = count, // store clock: fires on updates, payload = new value
+        .source = count,
+        .fn_ = &struct {
+            fn add(src: i32, clk: i32) i32 {
+                return src + clk;
+            }
+        }.add,
+        .target = out,
+    });
+
+    count.set(4); // src=4, clk=4 → 8
+    try std.testing.expectEqual(@as(i32, 8), out.get());
+    count.set(1); // src=1, clk=1 → 2
+    try std.testing.expectEqual(@as(i32, 2), out.get());
+}
+
+// ─────────────────────────────────────────────
+// batch() tests: outermost-boundary flush, ordering,
+// reentrancy, after-flush policy
+// ─────────────────────────────────────────────
+
+test "batch coalesces emits into a single flush and watcher run" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const ev = createEvent(&eng, i32);
+    const st = createStore(&eng, i32, 0);
+    _ = st.on(ev, &struct {
+        fn reduce(state: i32, p: i32) ?i32 {
+            return state + p;
+        }
+    }.reduce);
+
+    const Probe = struct {
+        var calls: usize = 0;
+        var last: i32 = -1;
+        fn cb(v: i32) void {
+            calls += 1;
+            last = v;
+        }
+    };
+    Probe.calls = 0;
+    Probe.last = -1;
+    _ = st.watch(&Probe.cb);
+
+    const Flushes = struct {
+        n: usize = 0,
+        fn bump(raw: *anyopaque) void {
+            const c: *@This() = @ptrCast(@alignCast(raw));
+            c.n += 1;
+        }
+    };
+    var flushes = Flushes{};
+    eng.onAfterFlush(.{ .ctx = @ptrCast(&flushes), .call = &Flushes.bump });
+
+    eng.batchBegin();
+    ev.emit(1);
+    ev.emit(2);
+    ev.emit(3);
+    // Mid-batch: nothing has run yet.
+    try std.testing.expectEqual(@as(i32, 0), st.get());
+    try std.testing.expectEqual(@as(usize, 0), Probe.calls);
+    try std.testing.expectEqual(@as(usize, 0), flushes.n);
+    eng.batchEnd();
+
+    try std.testing.expectEqual(@as(i32, 6), st.get());
+    try std.testing.expectEqual(@as(usize, 1), Probe.calls);
+    try std.testing.expectEqual(@as(i32, 6), Probe.last);
+    try std.testing.expectEqual(@as(usize, 1), flushes.n);
+}
+
+test "nested batches flush only at the outermost boundary" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const ev = createEvent(&eng, i32);
+    const st = createStore(&eng, i32, 0);
+    _ = st.on(ev, &struct {
+        fn reduce(_: i32, p: i32) ?i32 {
+            return p;
+        }
+    }.reduce);
+
+    eng.batchBegin();
+    eng.batchBegin();
+    ev.emit(1);
+    eng.batchEnd(); // inner — must not flush
+    try std.testing.expectEqual(@as(i32, 0), st.get());
+    ev.emit(2);
+    eng.batchEnd(); // outer — single flush
+    try std.testing.expectEqual(@as(i32, 2), st.get());
+}
+
+test "batch preserves event order and multiplicity" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const ev = createEvent(&eng, i32);
+    const Seen = struct {
+        var buf: [8]i32 = undefined;
+        var n: usize = 0;
+        fn cb(v: i32) void {
+            buf[n] = v;
+            n += 1;
+        }
+    };
+    Seen.n = 0;
+    _ = ev.watch(&Seen.cb);
+
+    eng.batchBegin();
+    ev.emit(1);
+    ev.emit(2);
+    ev.emit(1);
+    ev.emit(3);
+    eng.batchEnd();
+
+    try std.testing.expectEqual(@as(usize, 4), Seen.n);
+    try std.testing.expectEqual(@as(i32, 1), Seen.buf[0]);
+    try std.testing.expectEqual(@as(i32, 2), Seen.buf[1]);
+    try std.testing.expectEqual(@as(i32, 1), Seen.buf[2]);
+    try std.testing.expectEqual(@as(i32, 3), Seen.buf[3]);
+}
+
+test "flush inside a batch defers to the outermost batchEnd" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const ev = createEvent(&eng, i32);
+    const st = createStore(&eng, i32, 0);
+    _ = st.on(ev, &struct {
+        fn reduce(_: i32, p: i32) ?i32 {
+            return p;
+        }
+    }.reduce);
+
+    eng.batchBegin();
+    ev.emit(9);
+    eng.flush(); // explicit flush mid-batch: no-op
+    try std.testing.expectEqual(@as(i32, 0), st.get());
+    eng.batchEnd();
+    try std.testing.expectEqual(@as(i32, 9), st.get());
+}
+
+test "empty batch runs no flush and no after-flush hooks" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const Flushes = struct {
+        n: usize = 0,
+        fn bump(raw: *anyopaque) void {
+            const c: *@This() = @ptrCast(@alignCast(raw));
+            c.n += 1;
+        }
+    };
+    var flushes = Flushes{};
+    eng.onAfterFlush(.{ .ctx = @ptrCast(&flushes), .call = &Flushes.bump });
+
+    eng.batchBegin();
+    eng.batchEnd();
+    try std.testing.expectEqual(@as(usize, 0), flushes.n);
+}
+
+test "reentrant flush from a watcher does not drain queues recursively" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const ev = createEvent(&eng, i32);
+    const st = createStore(&eng, i32, 0);
+    _ = st.on(ev, &struct {
+        fn reduce(state: i32, p: i32) ?i32 {
+            return state + p;
+        }
+    }.reduce);
+
+    const Reentrant = struct {
+        var eng_ptr: ?*Engine = null;
+        var calls: usize = 0;
+        fn cb(_: i32) void {
+            calls += 1;
+            eng_ptr.?.flush(); // must return immediately, not re-drain
+        }
+    };
+    Reentrant.eng_ptr = &eng;
+    Reentrant.calls = 0;
+    _ = st.watch(&Reentrant.cb);
+
+    ev.emit(1);
+    ev.emit(2);
+    try std.testing.expectEqual(@as(i32, 3), st.get());
+    try std.testing.expectEqual(@as(usize, 2), Reentrant.calls);
+}
+
+// ─────────────────────────────────────────────
+// equality-aware writes: common write boundary dedup
+// ─────────────────────────────────────────────
+
+test "store.set suppresses equal scalar writes" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const st = createStore(&eng, i32, 0);
+    const Probe = struct {
+        var calls: usize = 0;
+        var last: i32 = -1;
+        fn cb(v: i32) void {
+            calls += 1;
+            last = v;
+        }
+    };
+    Probe.calls = 0;
+    Probe.last = -1;
+    _ = st.watch(&Probe.cb);
+
+    st.set(5);
+    st.set(5); // suppressed — no watcher, no dirty
+    st.set(5);
+    st.set(7);
+    st.set(7);
+
+    try std.testing.expectEqual(@as(i32, 7), st.get());
+    try std.testing.expectEqual(@as(usize, 2), Probe.calls);
+    try std.testing.expectEqual(@as(i32, 7), Probe.last);
+}
+
+test "suppressed set does not flush or run after-flush hooks" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const st = createStore(&eng, i32, 1);
+    const Flushes = struct {
+        n: usize = 0,
+        fn bump(raw: *anyopaque) void {
+            const c: *@This() = @ptrCast(@alignCast(raw));
+            c.n += 1;
+        }
+    };
+    var flushes = Flushes{};
+    eng.onAfterFlush(.{ .ctx = @ptrCast(&flushes), .call = &Flushes.bump });
+
+    st.set(1); // equal → suppressed → no flush at all
+    try std.testing.expectEqual(@as(usize, 0), flushes.n);
+    st.set(2);
+    try std.testing.expectEqual(@as(usize, 1), flushes.n);
+}
+
+test "store.on suppresses reducer results equal to current value" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const ev = createEvent(&eng, i32);
+    const st = createStore(&eng, i32, 0);
+    const Probe = struct {
+        var calls: usize = 0;
+        fn cb(_: i32) void {
+            calls += 1;
+        }
+    };
+    Probe.calls = 0;
+    _ = st.on(ev, &struct {
+        fn reduce(state: i32, p: i32) ?i32 {
+            return state + p;
+        }
+    }.reduce);
+    _ = st.watch(&Probe.cb);
+
+    ev.emit(0); // reducer returns 0 — equal → suppressed
+    ev.emit(3);
+    ev.emit(-3); // back to 0 — changed, fires
+    ev.emit(0); // 0 again — changed from 0? no: state 0 + 0 = 0, equal → suppressed
+
+    try std.testing.expectEqual(@as(i32, 0), st.get());
+    try std.testing.expectEqual(@as(usize, 2), Probe.calls);
+}
+
+test "derived map suppresses equal results down the chain" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const ev = createEvent(&eng, i32);
+    const base = createStore(&eng, i32, 0);
+    _ = base.on(ev, &struct {
+        fn reduce(state: i32, p: i32) ?i32 {
+            return state + p;
+        }
+    }.reduce);
+    const positive = base.map(bool, &struct {
+        fn f(v: i32) bool {
+            return v > 0;
+        }
+    }.f);
+    const Probe = struct {
+        var calls: usize = 0;
+        fn cb(_: bool) void {
+            calls += 1;
+        }
+    };
+    Probe.calls = 0;
+    _ = positive.watch(&Probe.cb);
+
+    ev.emit(-1); // base=-1, positive stays false (initial) → suppressed
+    ev.emit(-1); // base=-2, positive stays false → suppressed
+    ev.emit(-1); // base=-3, still false → suppressed
+    ev.emit(5); // base=2, positive=true → fires
+    ev.emit(-2); // base=0, positive=false → fires
+    ev.emit(-1); // base=-1, false → suppressed
+
+    try std.testing.expectEqual(@as(bool, false), positive.get());
+    try std.testing.expectEqual(@as(usize, 2), Probe.calls); // only the two real flips
+}
+
+test "store.reset suppresses write when already at initial" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const bump = createEvent(&eng, void);
+    const rst = createEvent(&eng, void);
+    const st = createStore(&eng, i32, 0);
+    _ = st.on(bump, &struct {
+        fn reduce(state: i32, _: void) ?i32 {
+            return state + 1;
+        }
+    }.reduce);
+    _ = st.reset(rst);
+    const Probe = struct {
+        var calls: usize = 0;
+        fn cb(_: i32) void {
+            calls += 1;
+        }
+    };
+    Probe.calls = 0;
+    _ = st.watch(&Probe.cb);
+
+    bump.emit({}); // 1
+    rst.emit({}); // 0 — changed
+    rst.emit({}); // already 0 — suppressed
+
+    try std.testing.expectEqual(@as(i32, 0), st.get());
+    try std.testing.expectEqual(@as(usize, 2), Probe.calls);
+}
+
+test "slice stores always write by default — no implicit deep equality" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const st = createStore(&eng, []const u8, "a");
+    const Probe = struct {
+        var calls: usize = 0;
+        fn cb(_: []const u8) void {
+            calls += 1;
+        }
+    };
+    Probe.calls = 0;
+    _ = st.watch(&Probe.cb);
+
+    st.set("a"); // same CONTENT, different storage → still writes
+    st.set("b");
+
+    try std.testing.expectEqual(@as(usize, 2), Probe.calls);
+}
+
+test "sliceEq opts a slice store into content dedup" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const st = createStore(&eng, []const u8, "a");
+    st.eq = sliceEq([]const u8);
+    const Probe = struct {
+        var calls: usize = 0;
+        var last: []const u8 = "";
+        fn cb(v: []const u8) void {
+            calls += 1;
+            last = v;
+        }
+    };
+    Probe.calls = 0;
+    _ = st.watch(&Probe.cb);
+
+    st.set("a"); // equal content → suppressed
+    st.set("b"); // different → writes
+    st.set("b"); // equal → suppressed
+
+    try std.testing.expectEqual(@as(usize, 1), Probe.calls);
+    try std.testing.expectEqualStrings("b", Probe.last);
+}
+
+test "eq = null disables scalar dedup" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const st = createStore(&eng, i32, 0);
+    st.eq = null;
+    const Probe = struct {
+        var calls: usize = 0;
+        fn cb(_: i32) void {
+            calls += 1;
+        }
+    };
+    Probe.calls = 0;
+    _ = st.watch(&Probe.cb);
+
+    st.set(5);
+    st.set(5); // eq disabled → writes anyway
+
+    try std.testing.expectEqual(@as(usize, 2), Probe.calls);
 }
