@@ -178,23 +178,7 @@ pub const Session = struct {
     fn wire(self: *Session) void {
         const eng = &self.app.eng;
 
-        const PingCtx = struct { s: *Session };
-        const pctx = self.gpa.create(PingCtx) catch @panic("OOM");
-        pctx.* = .{ .s = self };
-        self.ping.reducers.append(eng.allocator, .{
-            .ctx = @ptrCast(pctx),
-            .trigger = &struct {
-                fn trig(raw: *anyopaque, _: *const anyopaque) void {
-                    const c: *PingCtx = @ptrCast(@alignCast(raw));
-                    c.s.seq.set(c.s.seq.get() + 1);
-                }
-            }.trig,
-        }) catch @panic("OOM");
-        eng.trackGraphAlloc(@ptrCast(pctx), &struct {
-            fn dtor(a: std.mem.Allocator, p: *anyopaque) void {
-                a.destroy(@as(*PingCtx, @ptrCast(@alignCast(p))));
-            }
-        }.dtor);
+        self.ping.onReducer(self, &Session.onPing);
 
         eng.onAfterFlush(.{
             .ctx = @ptrCast(self),
@@ -207,6 +191,11 @@ pub const Session = struct {
                 }
             }.commit,
         });
+    }
+
+    /// ping reducer — bumps the revision in the pure phase.
+    fn onPing(self: *Session, _: Ping) void {
+        self.seq.set(self.seq.get() + 1);
     }
 
     // ── stores ← model ─────────────────────────────────────────────

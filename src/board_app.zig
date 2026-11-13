@@ -235,23 +235,7 @@ pub const Session = struct {
 
         // Pure-phase reducer: any ping bumps the revision; the after-flush
         // hook then renders the DOM diff into `self.log`.
-        const PingCtx = struct { s: *Session };
-        const pctx = self.gpa.create(PingCtx) catch @panic("OOM");
-        pctx.* = .{ .s = self };
-        self.ping.reducers.append(eng.allocator, .{
-            .ctx = @ptrCast(pctx),
-            .trigger = &struct {
-                fn trig(raw: *anyopaque, _: *const anyopaque) void {
-                    const c: *PingCtx = @ptrCast(@alignCast(raw));
-                    c.s.seq.set(c.s.seq.get() + 1);
-                }
-            }.trig,
-        }) catch @panic("OOM");
-        eng.trackGraphAlloc(@ptrCast(pctx), &struct {
-            fn dtor(a: std.mem.Allocator, p: *anyopaque) void {
-                a.destroy(@as(*PingCtx, @ptrCast(@alignCast(p))));
-            }
-        }.dtor);
+        self.ping.onReducer(self, &Session.onPing);
 
         // After every flush the graph is fully settled → render DOM diff.
         eng.onAfterFlush(.{
@@ -263,6 +247,11 @@ pub const Session = struct {
                 }
             }.render,
         });
+    }
+
+    /// ping reducer — bumps the revision in the pure phase.
+    fn onPing(self: *Session, _: Ping) void {
+        self.seq.set(self.seq.get() + 1);
     }
 
     // ── rendering ───────────────────────────────────────────────────

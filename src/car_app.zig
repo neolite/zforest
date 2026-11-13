@@ -315,24 +315,7 @@ pub const Session = struct {
 
     fn wire(self: *Session) void {
         const eng = &self.app.eng;
-        const MutCtx = struct { s: *Session };
-        const mctx = self.gpa.create(MutCtx) catch @panic("OOM");
-        mctx.* = .{ .s = self };
-        self.mutate.reducers.append(eng.allocator, .{
-            .ctx = @ptrCast(mctx),
-            .trigger = &struct {
-                fn trig(raw: *anyopaque, pp: *const anyopaque) void {
-                    const c: *MutCtx = @ptrCast(@alignCast(raw));
-                    const m: *const Mutation = @ptrCast(@alignCast(pp));
-                    c.s.applyMutation(m.*);
-                }
-            }.trig,
-        }) catch @panic("OOM");
-        eng.trackGraphAlloc(@ptrCast(mctx), &struct {
-            fn dtor(a: std.mem.Allocator, p: *anyopaque) void {
-                a.destroy(@as(*MutCtx, @ptrCast(@alignCast(p))));
-            }
-        }.dtor);
+        self.mutate.onReducer(self, &Session.applyMutation);
 
         eng.onAfterFlush(.{
             .ctx = @ptrCast(self),

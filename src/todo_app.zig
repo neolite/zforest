@@ -260,48 +260,11 @@ pub const Session = struct {
         const eng = &self.app.eng;
 
         // Pure-phase mutation reducer: model change, then bump seq.
-        const MutCtx = struct { s: *Session };
-        const mctx = self.gpa.create(MutCtx) catch @panic("OOM");
-        mctx.* = .{ .s = self };
-        self.mutate.reducers.append(eng.allocator, .{
-            .ctx = @ptrCast(mctx),
-            .trigger = &struct {
-                fn trig(raw: *anyopaque, pp: *const anyopaque) void {
-                    const c: *MutCtx = @ptrCast(@alignCast(raw));
-                    const m: *const Mutation = @ptrCast(@alignCast(pp));
-                    c.s.applyMutation(m.*);
-                }
-            }.trig,
-        }) catch @panic("OOM");
-        eng.trackGraphAlloc(@ptrCast(mctx), &struct {
-            fn dtor(a: std.mem.Allocator, p: *anyopaque) void {
-                a.destroy(@as(*MutCtx, @ptrCast(@alignCast(p))));
-            }
-        }.dtor);
+        self.mutate.onReducer(self, &Session.applyMutation);
 
         // Derived store: remaining count recomputes from seq updates and
         // settles in the pure phase, before any view work.
-        const RemCtx = struct { s: *Session };
-        const rctx = self.gpa.create(RemCtx) catch @panic("OOM");
-        rctx.* = .{ .s = self };
-        self.seq.updates().reducers.append(eng.allocator, .{
-            .ctx = @ptrCast(rctx),
-            .trigger = &struct {
-                fn trig(raw: *anyopaque, _: *const anyopaque) void {
-                    const c: *RemCtx = @ptrCast(@alignCast(raw));
-                    var n: usize = 0;
-                    for (c.s.todos.items) |t| {
-                        if (!t.done) n += 1;
-                    }
-                    c.s.remaining.set(n);
-                }
-            }.trig,
-        }) catch @panic("OOM");
-        eng.trackGraphAlloc(@ptrCast(rctx), &struct {
-            fn dtor(a: std.mem.Allocator, p: *anyopaque) void {
-                a.destroy(@as(*RemCtx, @ptrCast(@alignCast(p))));
-            }
-        }.dtor);
+        self.seq.updates().onReducer(self, &Session.updateRemaining);
 
         // After every flush the graph is fully settled → render DOM diff.
         eng.onAfterFlush(.{
@@ -313,6 +276,15 @@ pub const Session = struct {
                 }
             }.render,
         });
+    }
+
+    /// seq.updates reducer — recounts unfinished todos in the pure phase.
+    fn updateRemaining(self: *Session, _: u64) void {
+        var n: usize = 0;
+        for (self.todos.items) |t| {
+            if (!t.done) n += 1;
+        }
+        self.remaining.set(n);
     }
 
     fn applyMutation(self: *Session, m: Mutation) void {

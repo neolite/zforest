@@ -35,11 +35,6 @@ pub fn Store(comptime T: type) type {
         /// skip `eq` (see mon_app's fmt_arena stores).
         pub const EqFn = *const fn (T, T) bool;
         pub const WatcherFn = *const fn (T) void;
-        const CleanupSlot = struct {
-            ptr: *anyopaque,
-            destroyFn: *const fn (alloc: std.mem.Allocator, ptr: *anyopaque) void,
-        };
-
         pub const CtxWatcherFn = *const fn (ctx: *anyopaque, T) void;
         pub const WatcherSlot = struct {
             generation: u32 = 1,
@@ -63,7 +58,6 @@ pub fn Store(comptime T: type) type {
         store_index: ?usize = null,
         watchers: std.ArrayListUnmanaged(WatcherSlot) = .empty,
         free_watcher_slots: std.ArrayListUnmanaged(usize) = .empty,
-        reducer_cleanups: std.ArrayListUnmanaged(CleanupSlot) = .empty,
         updates_event: ?*event_mod.Event(T) = null,
 
         // --- fluent builder ---
@@ -205,32 +199,15 @@ pub fn Store(comptime T: type) type {
                 reducer: *const fn (T, EvPayload) ?T,
             };
 
-            const ctx = self.eng.allocator.create(ReducerCtx) catch @panic("OOM");
-            ctx.* = .{ .store = self, .reducer = reduce };
-
-            // Track for cleanup
-            self.reducer_cleanups.append(self.eng.allocator, .{
-                .ptr = @ptrCast(ctx),
-                .destroyFn = &struct {
-                    fn destroy(alloc: std.mem.Allocator, ptr: *anyopaque) void {
-                        const typed: *ReducerCtx = @ptrCast(@alignCast(ptr));
-                        alloc.destroy(typed);
+            // The reducer ctx box is engine-tracked by onReducer — it
+            // lives exactly as long as the graph, like every other unit.
+            ev.onReducer(ReducerCtx{ .store = self, .reducer = reduce }, &struct {
+                fn trig(c: ReducerCtx, payload: EvPayload) void {
+                    if (c.reducer(c.store.value, payload)) |new_val| {
+                        _ = c.store.writeValue(new_val);
                     }
-                }.destroy,
-            }) catch @panic("OOM");
-
-            ev.reducers.append(self.eng.allocator, .{
-                .ctx = @ptrCast(ctx),
-                .trigger = &struct {
-                    fn trigger(raw_ctx: *anyopaque, payload_ptr: *const anyopaque) void {
-                        const c: *ReducerCtx = @ptrCast(@alignCast(raw_ctx));
-                        const payload: *const EvPayload = @ptrCast(@alignCast(payload_ptr));
-                        if (c.reducer(c.store.value, payload.*)) |new_val| {
-                            _ = c.store.writeValue(new_val);
-                        }
-                    }
-                }.trigger,
-            }) catch @panic("OOM");
+                }
+            }.trig);
 
             return self;
         }
@@ -247,30 +224,12 @@ pub fn Store(comptime T: type) type {
                 store: *Self,
             };
 
-            const ctx = self.eng.allocator.create(ResetCtx) catch @panic("OOM");
-            ctx.* = .{ .store = self };
-
             self.ensureRegistered();
-            self.reducer_cleanups.append(self.eng.allocator, .{
-                .ptr = @ptrCast(ctx),
-                .destroyFn = &struct {
-                    fn destroy(alloc: std.mem.Allocator, ptr: *anyopaque) void {
-                        const typed: *ResetCtx = @ptrCast(@alignCast(ptr));
-                        alloc.destroy(typed);
-                    }
-                }.destroy,
-            }) catch @panic("OOM");
-
-            ev.reducers.append(self.eng.allocator, .{
-                .ctx = @ptrCast(ctx),
-                .trigger = &struct {
-                    fn trigger(raw_ctx: *anyopaque, _: *const anyopaque) void {
-                        const c: *ResetCtx = @ptrCast(@alignCast(raw_ctx));
-                        _ = EvPayload; // keep comptime param alive
-                        _ = c.store.writeValue(c.store.initial);
-                    }
-                }.trigger,
-            }) catch @panic("OOM");
+            ev.onReducer(ResetCtx{ .store = self }, &struct {
+                fn trig(c: ResetCtx, _: EvPayload) void {
+                    _ = c.store.writeValue(c.store.initial);
+                }
+            }.trig);
 
             return self;
         }
@@ -344,10 +303,6 @@ pub fn Store(comptime T: type) type {
         pub fn deinit(self: *Self) void {
             self.watchers.deinit(self.eng.allocator);
             self.free_watcher_slots.deinit(self.eng.allocator);
-            for (self.reducer_cleanups.items) |slot| {
-                slot.destroyFn(self.eng.allocator, slot.ptr);
-            }
-            self.reducer_cleanups.deinit(self.eng.allocator);
             if (self.updates_event) |ev| {
                 ev.deinit();
                 self.eng.allocator.destroy(ev);
@@ -376,26 +331,11 @@ fn MapHelper(comptime T: type, comptime R: type) type {
                 target: *Derived,
                 mapFn: *const fn (T) R,
             };
-            const ctx = eng.allocator.create(MapCtx) catch @panic("OOM");
-            ctx.* = .{ .target = derived, .mapFn = mapFn };
-            eng.trackGraphAlloc(@ptrCast(ctx), &struct {
-                fn dtor(a: std.mem.Allocator, p: *anyopaque) void {
-                    const c: *MapCtx = @ptrCast(@alignCast(p));
-                    a.destroy(c);
+            source.updates().onReducer(MapCtx{ .target = derived, .mapFn = mapFn }, &struct {
+                fn trig(c: MapCtx, payload: T) void {
+                    _ = c.target.writeValue(c.mapFn(payload));
                 }
-            }.dtor);
-
-            source.updates().reducers.append(eng.allocator, .{
-                .ctx = @ptrCast(ctx),
-                .trigger = &struct {
-                    fn trigger(raw: *anyopaque, payload_ptr: *const anyopaque) void {
-                        const c: *MapCtx = @ptrCast(@alignCast(raw));
-                        const payload: *const T = @ptrCast(@alignCast(payload_ptr));
-                        const new_val = c.mapFn(payload.*);
-                        _ = c.target.writeValue(new_val);
-                    }
-                }.trigger,
-            }) catch @panic("OOM");
+            }.trig);
 
             return derived;
         }

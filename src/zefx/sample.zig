@@ -275,11 +275,11 @@ pub fn sample(eng: *Engine, opts: anytype) SampleReturnType(@TypeOf(opts)) {
 
     // Deferred-execution plumbing: triggers run as ordinary reducers in
     // the pure phase but only ENQUEUE the wire; the engine drains
-    // sample_queue after the graph settles. Payloads ride in the tick
-    // arena, which outlives the whole flush.
+    // sample_queue after the graph settles. The clock payload is copied
+    // into the tick arena, which outlives the whole flush.
     const TrigCtx = struct { eng: *Engine, wire: *WireCtx };
     const WireBox = struct { wire: *WireCtx };
-    const ClockBox = struct { wire: *WireCtx, payload: *const ClockType };
+    const ClockBox = struct { wire: *WireCtx, payload: ClockType };
 
     const SrcStep = struct {
         fn go(raw: *anyopaque) void {
@@ -290,58 +290,46 @@ pub fn sample(eng: *Engine, opts: anytype) SampleReturnType(@TypeOf(opts)) {
     const ClockStep = struct {
         fn go(raw: *anyopaque) void {
             const b: *ClockBox = @ptrCast(@alignCast(raw));
-            b.wire.run(b.payload.*);
-        }
-    };
-    const SrcTrig = struct {
-        fn trig(raw: *anyopaque, _: *const anyopaque) void {
-            const c: *TrigCtx = @ptrCast(@alignCast(raw));
-            const box = c.eng.tickAllocator().create(WireBox) catch @panic("OOM");
-            box.* = .{ .wire = c.wire };
-            c.eng.scheduleSample(.{ .ctx = @ptrCast(box), .call = SrcStep.go });
-        }
-    };
-    const ClockTrig = struct {
-        fn trig(raw: *anyopaque, pp: *const anyopaque) void {
-            const c: *TrigCtx = @ptrCast(@alignCast(raw));
-            const box = c.eng.tickAllocator().create(ClockBox) catch @panic("OOM");
-            box.* = .{ .wire = c.wire, .payload = @ptrCast(@alignCast(pp)) };
-            c.eng.scheduleSample(.{ .ctx = @ptrCast(box), .call = ClockStep.go });
+            b.wire.run(b.payload);
         }
     };
 
     if (has_clock) {
         // Store clocks fire on updates() — payload is the new value.
         const clock_unit = if (comptime is_clock_store) opts.clock.updates() else opts.clock;
-        const ww = eng.allocator.create(TrigCtx) catch @panic("OOM");
-        ww.* = .{ .eng = eng, .wire = wire };
-        track(eng, TrigCtx, ww);
-
-        clock_unit.reducers.append(eng.allocator, .{
-            .ctx = @ptrCast(ww),
-            .trigger = ClockTrig.trig,
-        }) catch @panic("OOM");
+        clock_unit.onReducer(TrigCtx{ .eng = eng, .wire = wire }, &struct {
+            fn trig(c: TrigCtx, clk: ClockType) void {
+                const box = c.eng.tickAllocator().create(ClockBox) catch @panic("OOM");
+                box.* = .{ .wire = c.wire, .payload = clk };
+                c.eng.scheduleSample(.{ .ctx = @ptrCast(box), .call = ClockStep.go });
+            }
+        }.trig);
     } else {
         // Source-only: re-sample on every source store update. A shape
         // fires once per member update — use `clock` to coalesce.
-        const ww = eng.allocator.create(TrigCtx) catch @panic("OOM");
-        ww.* = .{ .eng = eng, .wire = wire };
-        track(eng, TrigCtx, ww);
-
         if (comptime is_source_shape) {
             const ShapeInfo = @typeInfo(@TypeOf(opts.source)).@"struct";
             inline for (ShapeInfo.field_names) |fname| {
                 const member = @field(opts.source, fname);
-                member.updates().reducers.append(eng.allocator, .{
-                    .ctx = @ptrCast(ww),
-                    .trigger = SrcTrig.trig,
-                }) catch @panic("OOM");
+                // Each member's updates() payload type differs — the
+                // anonymous call fn is instantiated per field.
+                const MV = @typeInfo(@TypeOf(member)).pointer.child.Value;
+                member.updates().onReducer(TrigCtx{ .eng = eng, .wire = wire }, &struct {
+                    fn trig(c: TrigCtx, _: MV) void {
+                        const box = c.eng.tickAllocator().create(WireBox) catch @panic("OOM");
+                        box.* = .{ .wire = c.wire };
+                        c.eng.scheduleSample(.{ .ctx = @ptrCast(box), .call = SrcStep.go });
+                    }
+                }.trig);
             }
         } else {
-            opts.source.updates().reducers.append(eng.allocator, .{
-                .ctx = @ptrCast(ww),
-                .trigger = SrcTrig.trig,
-            }) catch @panic("OOM");
+            opts.source.updates().onReducer(TrigCtx{ .eng = eng, .wire = wire }, &struct {
+                fn trig(c: TrigCtx, _: SourceType) void {
+                    const box = c.eng.tickAllocator().create(WireBox) catch @panic("OOM");
+                    box.* = .{ .wire = c.wire };
+                    c.eng.scheduleSample(.{ .ctx = @ptrCast(box), .call = SrcStep.go });
+                }
+            }.trig);
         }
     }
 

@@ -102,6 +102,52 @@ pub fn Event(comptime T: type) type {
             self.unwatch(sub);
         }
 
+        /// Register a typed pure-phase reducer on this event — the
+        /// supported way to subscribe arbitrary logic; `.reducers.append`
+        /// remains the low-level escape hatch.
+        ///
+        /// `call` runs during the pure phase for every emit as
+        /// `call(ctx, payload)` — the payload type is inferred from the
+        /// event, mismatches fail at compile time. `ctx` is stored BY
+        /// VALUE in a box the helper allocates on the engine allocator
+        /// and frees via `trackGraphAlloc` at engine deinit; it may be
+        /// any type. Pointers are borrowed (the pointee must outlive the
+        /// engine — same contract as `watchCtx`); values are copied, so
+        /// pass a small struct (e.g. `{ .s = session }`).
+        ///
+        /// Reducers cannot be unwatched — the slot lives until the event
+        /// is deinitialized. The reducer runs on THIS event's engine, so
+        /// no cross-engine edge is possible.
+        pub fn onReducer(
+            self: *Self,
+            ctx: anytype,
+            comptime call: *const fn (@TypeOf(ctx), T) void,
+        ) void {
+            const CtxT = @TypeOf(ctx);
+            const Box = struct { ctx: CtxT };
+            const box = self.eng.allocator.create(Box) catch @panic("OOM");
+            box.* = .{ .ctx = ctx };
+            self.reducers.append(self.eng.allocator, .{
+                .ctx = @ptrCast(box),
+                .trigger = &struct {
+                    fn trig(raw: *anyopaque, pp: *const anyopaque) void {
+                        const b: *Box = @ptrCast(@alignCast(raw));
+                        if (comptime T == void) {
+                            call(b.ctx, {});
+                        } else {
+                            const payload: *const T = @ptrCast(@alignCast(pp));
+                            call(b.ctx, payload.*);
+                        }
+                    }
+                }.trig,
+            }) catch @panic("OOM");
+            self.eng.trackGraphAlloc(@ptrCast(box), &struct {
+                fn dtor(a: std.mem.Allocator, p: *anyopaque) void {
+                    a.destroy(@as(*Box, @ptrCast(@alignCast(p))));
+                }
+            }.dtor);
+        }
+
         /// Fire the event. Schedules pure (reducers) and effect (watchers) thunks.
         pub fn emit(self: *Self, payload: T) void {
             const tick_alloc = self.eng.tickAllocator();
@@ -202,25 +248,11 @@ fn EventMapHelper(comptime T: type, comptime R: type) type {
                 target: *Derived,
                 mapFn: *const fn (T) R,
             };
-            const ctx = eng.allocator.create(MapCtx) catch @panic("OOM");
-            ctx.* = .{ .target = derived, .mapFn = mapFn };
-            eng.trackGraphAlloc(@ptrCast(ctx), &struct {
-                fn dtor(a: std.mem.Allocator, p: *anyopaque) void {
-                    const c: *MapCtx = @ptrCast(@alignCast(p));
-                    a.destroy(c);
+            source.onReducer(MapCtx{ .target = derived, .mapFn = mapFn }, &struct {
+                fn trig(c: MapCtx, payload: T) void {
+                    c.target.emit(c.mapFn(payload));
                 }
-            }.dtor);
-
-            source.reducers.append(eng.allocator, .{
-                .ctx = @ptrCast(ctx),
-                .trigger = &struct {
-                    fn trigger(raw: *anyopaque, payload_ptr: *const anyopaque) void {
-                        const c: *MapCtx = @ptrCast(@alignCast(raw));
-                        const payload: *const T = @ptrCast(@alignCast(payload_ptr));
-                        c.target.emit(c.mapFn(payload.*));
-                    }
-                }.trigger,
-            }) catch @panic("OOM");
+            }.trig);
 
             return derived;
         }
@@ -245,27 +277,13 @@ fn EventFilterHelper(comptime T: type) type {
                 target: *Event(T),
                 filterFn: *const fn (T) bool,
             };
-            const ctx = eng.allocator.create(FilterCtx) catch @panic("OOM");
-            ctx.* = .{ .target = derived, .filterFn = filterFn };
-            eng.trackGraphAlloc(@ptrCast(ctx), &struct {
-                fn dtor(a: std.mem.Allocator, p: *anyopaque) void {
-                    const c: *FilterCtx = @ptrCast(@alignCast(p));
-                    a.destroy(c);
-                }
-            }.dtor);
-
-            source.reducers.append(eng.allocator, .{
-                .ctx = @ptrCast(ctx),
-                .trigger = &struct {
-                    fn trigger(raw: *anyopaque, payload_ptr: *const anyopaque) void {
-                        const c: *FilterCtx = @ptrCast(@alignCast(raw));
-                        const payload: *const T = @ptrCast(@alignCast(payload_ptr));
-                        if (c.filterFn(payload.*)) {
-                            c.target.emit(payload.*);
-                        }
+            source.onReducer(FilterCtx{ .target = derived, .filterFn = filterFn }, &struct {
+                fn trig(c: FilterCtx, payload: T) void {
+                    if (c.filterFn(payload)) {
+                        c.target.emit(payload);
                     }
-                }.trigger,
-            }) catch @panic("OOM");
+                }
+            }.trig);
 
             return derived;
         }

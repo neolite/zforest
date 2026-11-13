@@ -587,3 +587,34 @@ Audit: apps only `.set` seq(+1) (always changes) and mon's slice
 stores — no app relied on equal-value writes for side effects;
 scalar dedup additionally silences zmon's bool/u64 stores
 (st_ok/st_bad pills, st_err_bp) between real changes.
+
+---
+<!-- zefx/api-sugar item 1 -->
+## Typed reducer registration: `Event.onReducer` (2026-11)
+
+`Event(T).onReducer(ctx, call)` (`src/zefx/event.zig`) is now the
+supported way to hang pure-phase logic on an event — `call` is a
+comptime `*const fn (@TypeOf(ctx), T) void`, so the payload type is
+inferred and mismatches fail at compile time (incl. `void` payloads).
+The helper stores `ctx` BY VALUE in a box allocated on
+`eng.allocator` and freed via `trackGraphAlloc` at engine deinit —
+callers pass e.g. `self` (`*Session`, borrowed; pointee must outlive
+the engine, same contract as `watchCtx`) or a small value struct.
+Reducers can't be unwatched; `.reducers.append` stays as the
+low-level escape hatch. No `assertSameEngine` needed: the reducer
+lives on the event's own engine, so no cross-engine edge exists.
+
+Migrated EVERY former hand-rolled site: all four apps
+(board/mon ping→seq bump, todo mutate+seq.updates→remaining,
+car mutate→applyMutation — `applyMutation`'s existing signature fit
+`fn(*Session, Mutation) void` directly), plus all zefx internals:
+`Event.map`/`filter`, `Store.on`/`reset`/`map`, `merge`, `split`,
+`combine`, and all three `sample` wire triggers. Net ~50 lines of
+boilerplate deleted. Two semantic notes: (a) `Store.on`/`reset`
+reducer ctxs moved cleanup from the store's `reducer_cleanups` list
+(removed) to engine `graph_cleanups` — identical lifetime in
+practice since stores only die at engine deinit; (b) sample's clock
+payload now rides BY VALUE in the tick-arena `ClockBox` (was a
+pointer into the reducer-call ctx) — one extra copy per clock fire,
+same lifetime guarantees; shape-member triggers instantiate a
+per-field call fn since `updates()` payload types differ.

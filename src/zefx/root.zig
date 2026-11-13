@@ -312,25 +312,12 @@ pub fn merge(eng: *Engine, sources: anytype) *Event(@typeInfo(@typeInfo(@TypeOf(
     inline for (src_info.field_names) |fname| {
         const src = @field(sources, fname);
         const FwdCtx = struct { tgt: *Event(T) };
-        const ctx = eng.allocator.create(FwdCtx) catch @panic("OOM");
-        ctx.* = .{ .tgt = target };
-        eng.trackGraphAlloc(@ptrCast(ctx), &struct {
-            fn dtor(a: std.mem.Allocator, p: *anyopaque) void {
-                const c: *FwdCtx = @ptrCast(@alignCast(p));
-                a.destroy(c);
-            }
-        }.dtor);
         eng.assertSameEngine(src.eng);
-        src.reducers.append(eng.allocator, .{
-            .ctx = @ptrCast(ctx),
-            .trigger = &struct {
-                fn trigger(raw: *anyopaque, payload_ptr: *const anyopaque) void {
-                    const c: *FwdCtx = @ptrCast(@alignCast(raw));
-                    const payload: *const T = @ptrCast(@alignCast(payload_ptr));
-                    c.tgt.emit(payload.*);
-                }
-            }.trigger,
-        }) catch @panic("OOM");
+        src.onReducer(FwdCtx{ .tgt = target }, &struct {
+            fn trig(c: FwdCtx, payload: T) void {
+                c.tgt.emit(payload);
+            }
+        }.trig);
     }
     return target;
 }
@@ -360,30 +347,17 @@ fn SplitHelper(comptime T: type, comptime Cases: type) type {
                 @field(result, fname) = allocEvent(eng, T);
             }
 
-            const ctx = eng.allocator.create(SplitCtx) catch @panic("OOM");
-            ctx.* = .{ .result = result, .cases = cases };
-            eng.trackGraphAlloc(@ptrCast(ctx), &struct {
-                fn dtor(a: std.mem.Allocator, p: *anyopaque) void {
-                    const c: *SplitCtx = @ptrCast(@alignCast(p));
-                    a.destroy(c);
-                }
-            }.dtor);
-
-            source.reducers.append(eng.allocator, .{
-                .ctx = @ptrCast(ctx),
-                .trigger = &triggerFn,
-            }) catch @panic("OOM");
+            const ctx = SplitCtx{ .result = result, .cases = cases };
+            source.onReducer(ctx, &triggerFn);
 
             return result;
         }
 
-        fn triggerFn(raw: *anyopaque, payload_ptr: *const anyopaque) void {
-            const c: *SplitCtx = @ptrCast(@alignCast(raw));
-            const payload: *const T = @ptrCast(@alignCast(payload_ptr));
+        fn triggerFn(c: SplitCtx, payload: T) void {
             inline for (case_fields) |fname| {
                 const filterFn = @field(c.cases, fname);
-                if (filterFn(payload.*)) {
-                    @field(c.result, fname).emit(payload.*);
+                if (filterFn(payload)) {
+                    @field(c.result, fname).emit(payload);
                 }
             }
         }
@@ -433,29 +407,24 @@ fn CombineHelper(comptime Shape: type, comptime FnType: type) type {
                 src_store.ensureRegistered();
                 eng.assertSameEngine(src_store.eng);
 
-                const ctx = eng.allocator.create(CombineCtx) catch @panic("OOM");
-                ctx.* = .{ .derived_store = derived, .shape_stores = stores, .combineFn = combineFn };
-                eng.trackGraphAlloc(@ptrCast(ctx), &struct {
-                    fn dtor(a: std.mem.Allocator, p: *anyopaque) void {
-                        const c: *CombineCtx = @ptrCast(@alignCast(p));
-                        a.destroy(c);
+                // Each member's updates() payload type differs — the
+                // anonymous call fn is instantiated per field.
+                const SP = @typeInfo(@TypeOf(src_store)).pointer.child.Value;
+                const ctx = CombineCtx{
+                    .derived_store = derived,
+                    .shape_stores = stores,
+                    .combineFn = combineFn,
+                };
+                src_store.updates().onReducer(ctx, &struct {
+                    fn trig(c: CombineCtx, _: SP) void {
+                        const new_snap = shape.readSnapshot(c.shape_stores);
+                        const new_val = c.combineFn(new_snap);
+                        _ = c.derived_store.writeValue(new_val);
                     }
-                }.dtor);
-
-                src_store.updates().reducers.append(eng.allocator, .{
-                    .ctx = @ptrCast(ctx),
-                    .trigger = &triggerFn,
-                }) catch @panic("OOM");
+                }.trig);
             }
 
             return derived;
-        }
-
-        fn triggerFn(raw: *anyopaque, _: *const anyopaque) void {
-            const c: *CombineCtx = @ptrCast(@alignCast(raw));
-            const new_snap = shape.readSnapshot(c.shape_stores);
-            const new_val = c.combineFn(new_snap);
-            _ = c.derived_store.writeValue(new_val);
         }
     };
 }
@@ -2018,4 +1987,109 @@ test "eq = null disables scalar dedup" {
     st.set(5); // eq disabled → writes anyway
 
     try std.testing.expectEqual(@as(usize, 2), Probe.calls);
+}
+
+// ─────────────────────────────────────────────
+// onReducer: typed reducer registration
+// ─────────────────────────────────────────────
+
+test "event.onReducer runs typed reducer with borrowed pointer ctx" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const ev = createEvent(&eng, i32);
+    const Acc = struct {
+        sum: i32 = 0,
+        fn add(self: *@This(), v: i32) void {
+            self.sum += v;
+        }
+    };
+    var acc = Acc{};
+    ev.onReducer(&acc, &Acc.add);
+
+    ev.emit(2);
+    ev.emit(3);
+    ev.emit(5);
+
+    try std.testing.expectEqual(@as(i32, 10), acc.sum);
+}
+
+test "event.onReducer stores a value ctx in an engine-tracked box" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const ev = createEvent(&eng, i32);
+    var out: i32 = 0;
+    // ctx passed BY VALUE — the helper owns the box; the inner pointer
+    // keeps the effect observable.
+    const Ctx = struct { target: *i32 };
+    ev.onReducer(Ctx{ .target = &out }, &struct {
+        fn trig(c: Ctx, v: i32) void {
+            c.target.* = v * 2;
+        }
+    }.trig);
+
+    ev.emit(4);
+    ev.emit(7);
+
+    try std.testing.expectEqual(@as(i32, 14), out);
+}
+
+test "event.onReducer supports void payloads" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const ev = createEvent(&eng, void);
+    const Probe = struct {
+        calls: usize = 0,
+        fn bump(self: *@This(), _: void) void {
+            self.calls += 1;
+        }
+    };
+    var probe = Probe{};
+    ev.onReducer(&probe, &Probe.bump);
+
+    ev.emit({});
+    ev.emit({});
+
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+}
+
+test "onReducer reducer writes settle before derived stores and watchers" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const go = createEvent(&eng, void);
+    const base = createStore(&eng, i32, 1);
+    const doubled = base.map(i32, &struct {
+        fn m(v: i32) i32 {
+            return v * 2;
+        }
+    }.m);
+
+    // A hand-registered reducer (via onReducer) mutates `base` in the
+    // pure phase; `doubled` must settle before the effects phase.
+    const Ctx = struct { store: *Store(i32) };
+    go.onReducer(Ctx{ .store = base }, &struct {
+        fn trig(c: Ctx, _: void) void {
+            _ = c.store.writeValue(c.store.get() + 1);
+        }
+    }.trig);
+
+    const Probe = struct {
+        var seen: i32 = -1;
+        var ptr: ?*Store(i32) = null;
+        fn onBase(_: i32) void {
+            seen = ptr.?.get();
+        }
+    };
+    Probe.ptr = doubled;
+    _ = base.watch(&Probe.onBase);
+
+    go.emit({});
+    go.emit({});
+
+    try std.testing.expectEqual(@as(i32, 3), base.get());
+    try std.testing.expectEqual(@as(i32, 6), doubled.get());
+    try std.testing.expectEqual(@as(i32, 6), Probe.seen);
 }
