@@ -44,6 +44,19 @@ const sse_heartbeat_ticks = 200; // 200 * 50ms ≈ 10s
 ///     the session can pick up auxiliary cookies (board's `zfxu`).
 ///   - Optional `validPath(path) bool` — pure route check run before a
 ///     session is created for a GET; false → 404 without minting one.
+///   - Optional render-group hooks (board uses them; other apps need
+///     none of these and keep the legacy per-session path):
+///       - `publishPending()` — drain the session's pending rendered
+///         batch into retained history (through its render group when
+///         grouped). Called after dispatch and on every SSE poll.
+///       - `streamRev() u64` / `streamHistory() *History` — the revision
+///         and ring subscribers track/fetch from (the group's when
+///         grouped; defaults are `seq.get()` / `&history`).
+///       - `membershipEpoch() u64` — bumped on every render-group
+///         join/leave/re-key. ANY change between polls forces the
+///         snapshot path: patch revisions are group-local and never
+///         imply baseline equality across groups (cursor 40 vs group
+///         latest 7 returns empty, not a gap — a silent stall).
 ///
 /// Session registry. Demo cap: `max_sessions`, oldest session is evicted
 /// (documented teardown policy — no persistence, no timers needed).
@@ -318,14 +331,20 @@ fn handle(
         } else null;
         s.dispatch(body_v.action, body_v.arg, body_v.value, fields) catch |err| return statusOf(err);
 
-        // Publish the serialized batch to this session's history for SSE
-        // replay; the response itself is only an ACK.
-        var jaw: std.Io.Writer.Allocating = .init(srv.gpa);
-        defer jaw.deinit();
-        s.log.writeJson(&jaw.writer) catch @panic("OOM");
-        const rev = s.seq.get();
-        s.history.publish(rev, jaw.toOwnedSlice() catch @panic("OOM"));
-        s.log.clear();
+        // Publish the serialized batch to retained history for SSE
+        // replay; the response itself is only an ACK. Grouped sessions
+        // publish through their render group via the optional hook;
+        // sessions without it keep the inline log→history path.
+        const rev = if (@hasDecl(Session, "streamRev")) s.streamRev() else s.seq.get();
+        if (@hasDecl(Session, "publishPending")) {
+            s.publishPending();
+        } else {
+            var jaw: std.Io.Writer.Allocating = .init(srv.gpa);
+            defer jaw.deinit();
+            s.log.writeJson(&jaw.writer) catch @panic("OOM");
+            s.history.publish(rev, jaw.toOwnedSlice() catch @panic("OOM"));
+            s.log.clear();
+        }
 
         // Per-action Set-Cookie hook (e.g. minted on first POST) — the
         // value stays valid in `extra` because the session owns it.
@@ -439,6 +458,10 @@ fn serveEvents(comptime Session: type, srv: *Server(Session), req: *std.http.Ser
 
     var cursor: u64 = 0;
     var incarnation: u64 = 0;
+    // Membership epoch observed on this stream (render-group sessions
+    // only; 0 for sessions without the decl). Any change forces the
+    // snapshot path — see the contract docs above.
+    var conn_epoch: u64 = 0;
     var connected = false; // rev 0 is a valid cursor, so track state instead
     var ticks: u32 = 0;
     while (true) {
@@ -463,28 +486,42 @@ fn serveEvents(comptime Session: type, srv: *Server(Session), req: *std.http.Ser
                 // otherwise the diff cursor silently skips a transition
                 // and later patches are computed against stale tracking.
                 sess.syncPull();
-                if (sess.seq.get() > sess.history.latest_rev) {
+                // Drain any pending batch — grouped sessions publish
+                // through their render group via the optional hook;
+                // sessions without it keep the inline publish path.
+                if (@hasDecl(Session, "publishPending")) {
+                    sess.publishPending();
+                } else if (sess.seq.get() > sess.history.latest_rev) {
                     var jaw: std.Io.Writer.Allocating = .init(srv.gpa);
                     defer jaw.deinit();
                     sess.log.writeJson(&jaw.writer) catch @panic("OOM");
                     sess.history.publish(sess.seq.get(), jaw.toOwnedSlice() catch @panic("OOM"));
                     sess.log.clear();
                 }
-                if (!connected) {
+                const rev = if (@hasDecl(Session, "streamRev")) sess.streamRev() else sess.seq.get();
+                const epoch = if (@hasDecl(Session, "membershipEpoch")) sess.membershipEpoch() else 0;
+                // A membership change (group join/leave/re-key, incl.
+                // A→B→A between polls) invalidates cursor↔baseline
+                // equality: revisions are group-local, so the only safe
+                // transition is a fresh snapshot adopting the new rev.
+                const remapped = connected and epoch != conn_epoch;
+                if (!connected or remapped) {
                     connected = true;
                     incarnation = sess.incarnation;
-                    cursor = sess.seq.get();
+                    conn_epoch = epoch;
+                    cursor = rev;
                     fw.writer.writeAll("event: snapshot\ndata: ") catch @panic("OOM");
-                    stream_mod.writeSnapshotJson(sess, &fw.writer) catch @panic("OOM");
+                    stream_mod.writeSnapshotJson(sess, rev, &fw.writer) catch @panic("OOM");
                     fw.writer.writeAll("\n\n") catch @panic("OOM");
                 } else {
-                    const f = sess.history.fetch(cursor, srv.gpa) catch @panic("OOM");
+                    const hist = if (@hasDecl(Session, "streamHistory")) sess.streamHistory() else &sess.history;
+                    const f = hist.fetch(cursor, srv.gpa) catch @panic("OOM");
                     defer History.freeFetch(srv.gpa, f);
                     switch (f) {
                         .gap => {
-                            cursor = sess.seq.get();
+                            cursor = rev;
                             fw.writer.writeAll("event: snapshot\ndata: ") catch @panic("OOM");
-                            stream_mod.writeSnapshotJson(sess, &fw.writer) catch @panic("OOM");
+                            stream_mod.writeSnapshotJson(sess, rev, &fw.writer) catch @panic("OOM");
                             fw.writer.writeAll("\n\n") catch @panic("OOM");
                         },
                         .batches => |batches| {

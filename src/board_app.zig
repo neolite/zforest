@@ -10,6 +10,7 @@ const std = @import("std");
 const zefx = @import("zefx");
 const forest = @import("forest");
 const board = @import("board.zig");
+const board_groups = @import("board_groups.zig");
 const History = @import("server/history.zig").History;
 
 /// The shared model, installed by board_main before serve(). All access
@@ -20,12 +21,34 @@ fn m() *board.BoardModel {
     return model orelse @panic("board model not initialized");
 }
 
+/// Shared-model mutation counter — the render groups' dedup cursor.
+pub fn globalSeq() u64 {
+    return m().global_seq.load(.seq_cst);
+}
+
 /// Request routes: "/" home, "/b/<slug>", "/t/<post>", "/t/<post>/c/<comment>".
 pub const Route = union(enum) {
     home,
     board: usize,
     thread: u64,
     comment: u64,
+};
+
+/// Everything the view tree reads from session/group state: route,
+/// inline-reply target, the resolved `#who` display name, and the cursor
+/// `buildView` marks caught-up — the session's `seen_seq` or the render
+/// group's `last_rendered_seq`. Group members share one env's worth of
+/// inputs; that identity IS the render-group key (see board_groups.zig).
+pub const ViewEnv = struct {
+    route: Route,
+    reply_to: ?u64 = null,
+    /// Resolved display name for the `#who` chip ("Anon#N" / "anon") —
+    /// post/comment authors still resolve their own tokens via `nameOf`.
+    name: []const u8 = "anon",
+    /// Cursor `buildView` stamps with `global_seq` — written only by view
+    /// builds that actually sync tracked Dom state (diff/seed), never by
+    /// incidental SSR/snapshot serialization of an already-current group.
+    seen: ?*u64 = null,
 };
 
 pub fn parseRoute(path: []const u8) ?Route {
@@ -71,8 +94,21 @@ pub const Session = struct {
     /// Scratch for the Set-Cookie value emitted on the minting POST.
     out_cookie_buf: [600]u8 = undefined,
     out_cookie: []const u8 = &.{},
-    /// Last `model.global_seq` this session rendered — syncPull's cursor.
+    /// Last `model.global_seq` this session rendered — syncPull's cursor
+    /// for UNGROUPED (never page-served) sessions; grouped sessions dedup
+    /// on their group's `last_rendered_seq` instead.
     seen_seq: u64 = 0,
+    /// Set by the first successful servePage — gates render grouping so
+    /// sessions that never served a page keep the solo diff path.
+    attached: bool = false,
+    /// Render-group membership (board_groups.zig): sessions with equal
+    /// (route, reply_to, resolved name) share one Dom/history/revision.
+    group: ?*board_groups.RenderGroup = null,
+    /// Bumped on every group join/leave/re-key — the SSE stream compares
+    /// it per poll; ANY change forces a snapshot + revision adopt because
+    /// group-local revision numbers don't imply baseline equality (this
+    /// also covers A→B→A between polls).
+    membership_epoch: u64 = 0,
 
     ping: *zefx.Event(Ping),
     seq: *zefx.Store(u64),
@@ -94,6 +130,10 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session) void {
+        // Release group membership first — the last leaver destroys the
+        // group; eviction must not corrupt shared group state.
+        if (self.group) |g| board_groups.leave(self.gpa, g);
+        self.group = null;
         if (self.csrf_token.len != 0) self.gpa.free(self.csrf_token);
         if (self.user_token.len != 0) self.gpa.free(self.user_token);
         self.dom.deinit();
@@ -164,22 +204,114 @@ pub const Session = struct {
         return true;
     }
 
-    /// Full-page render for a navigating client: resolve the route, drop
-    /// tracked DOM state, write the page body, then reseed so subsequent
-    /// diffs emit only real changes.
+    /// Full-page render for a navigating client: resolve the route, sync
+    /// render-group membership, bring the group current with the model,
+    /// then write the page body. The shared group Dom is NEVER reset or
+    /// reseeded here — a fresh group was seeded privately at join, and an
+    /// existing group's Dom already matches the view this page ships.
     pub fn servePage(self: *Session, path: []const u8, writer: anytype) !bool {
         if (!self.setRoute(path)) return false;
-        self.dom.reset();
+        self.attached = true;
+        self.syncMembership();
+        self.ensureGroupCurrent();
         try self.writeView(writer);
-        self.seedDom();
         return true;
     }
 
-    /// SSE-worker hook: when the shared model moved, re-render so the
-    /// diff produces this session's patch batch (published by the caller).
+    /// SSE-worker hook: when the shared model moved past what the session
+    /// (or its group) last rendered, ping → flush → render. Grouped
+    /// sessions dedup on the GROUP's `last_rendered_seq`, so N members on
+    /// one group cost one buildView+diff per model version.
     pub fn syncPull(self: *Session) void {
-        if (m().global_seq.load(.seq_cst) == self.seen_seq) return;
+        const rendered = if (self.group) |g| g.last_rendered_seq else self.seen_seq;
+        if (m().global_seq.load(.seq_cst) == rendered) return;
         self.ping.emit(.{});
+    }
+
+    // ── render groups ──────────────────────────────────────────────
+
+    /// The session's current group-key inputs — recomputed on every
+    /// render so an identity minted by a (possibly failed) dispatch is
+    /// picked up BEFORE the group is chosen/rendered.
+    fn groupKey(self: *Session) board_groups.Key {
+        return .{ .route = self.route, .reply_to = self.reply_to, .name = nameOf(self.user_token) };
+    }
+
+    /// Join/migrate the render group when the key changed. Bumps
+    /// `membership_epoch` on every actual transition — the SSE stream
+    /// treats any bump as "send a snapshot and adopt the new revision",
+    /// since patch revisions are group-local.
+    fn syncMembership(self: *Session) void {
+        if (!self.attached) return;
+        const key = self.groupKey();
+        var kbuf: [256]u8 = undefined;
+        const ks = board_groups.keyStringInto(&kbuf, key.route, key.reply_to, key.name);
+        if (self.group) |g| {
+            if (std.mem.eql(u8, g.key_string, ks)) return;
+            board_groups.leave(self.gpa, g);
+            self.group = null;
+        }
+        self.group = board_groups.join(self.gpa, key);
+        self.membership_epoch +%= 1;
+    }
+
+    /// Bring the group current with the shared model — render+publish
+    /// when `global_seq` moved. servePage calls this BEFORE writing SSR
+    /// so the group's tracked Dom always matches the shipped page.
+    fn ensureGroupCurrent(self: *Session) void {
+        const g = self.group orelse return;
+        g.render(); // no-op when last_rendered_seq == global_seq
+        g.publish(); // no-op when nothing pending
+    }
+
+    fn viewEnv(self: *Session) ViewEnv {
+        return .{
+            .route = self.route,
+            .reply_to = self.reply_to,
+            .name = nameOf(self.user_token),
+            .seen = &self.seen_seq,
+        };
+    }
+
+    // ── optional server contract (grouped sessions) ────────────────
+    // See the Session contract in server/http.zig: sessions WITHOUT
+    // these decls keep the legacy per-session publish/fetch path.
+
+    /// Drain the pending rendered batch into retained history. Grouped
+    /// sessions publish through their group (the render hook already did
+    /// — this is the safety net); unattached sessions keep the inline
+    /// log→history path the generic server used before grouping.
+    pub fn publishPending(self: *Session) void {
+        if (self.group) |g| {
+            g.publish();
+            return;
+        }
+        if (self.seq.get() <= self.history.latest_rev) {
+            self.log.clear();
+            return;
+        }
+        var jaw: std.Io.Writer.Allocating = .init(self.gpa);
+        defer jaw.deinit();
+        self.log.writeJson(&jaw.writer) catch @panic("OOM");
+        self.history.publish(self.seq.get(), jaw.toOwnedSlice() catch @panic("OOM"));
+        self.log.clear();
+    }
+
+    /// Revision subscribers (SSE cursor, snapshot `rev`, ACK) should
+    /// track — the group's local revision when grouped, else `seq`.
+    pub fn streamRev(self: *Session) u64 {
+        return if (self.group) |g| g.rev else self.seq.get();
+    }
+
+    /// History ring subscribers fetch from — the group's when grouped.
+    pub fn streamHistory(self: *Session) *History {
+        return if (self.group) |g| &g.history else &self.history;
+    }
+
+    /// Membership epoch for the SSE stream: bumped on every group
+    /// join/leave/re-key; any change forces a snapshot + revision adopt.
+    pub fn membershipEpoch(self: *Session) u64 {
+        return self.membership_epoch;
     }
 
     // ── actions ────────────────────────────────────────────────────
@@ -268,9 +400,23 @@ pub const Session = struct {
     // ── rendering ───────────────────────────────────────────────────
 
     fn render(self: *Session) void {
+        if (self.attached) {
+            // Grouped path: re-key first (reply_to/identity may have
+            // changed inside dispatch), then render+publish through the
+            // group — deduped on `last_rendered_seq`, so member pings
+            // after the first see the group already current.
+            self.syncMembership();
+            if (self.group) |g| {
+                g.render();
+                g.publish();
+                return;
+            }
+        }
+        // Solo path: sessions that never served a page (tests, dead
+        // routes) keep the original per-session diff.
         _ = self.render_arena.reset(.retain_capacity);
         const a = self.render_arena.allocator();
-        forest.diff(a, buildView(a, self), &self.dom, &self.log);
+        forest.diff(a, buildView(a, self.viewEnv()), &self.dom, &self.log);
         self.log.revision = self.seq.get();
     }
 
@@ -278,17 +424,19 @@ pub const Session = struct {
     pub fn writeView(self: *Session, writer: anytype) !void {
         _ = self.render_arena.reset(.retain_capacity);
         const a = self.render_arena.allocator();
-        try forest.writeHtml(a, buildView(a, self), writer);
+        try forest.writeHtml(a, buildView(a, self.viewEnv()), writer);
     }
 
     /// The session's current view nodes — the SSE snapshot writer
     /// serializes them via `forest.writeSnapshotOps`.
     pub fn buildViewNodes(self: *Session, a: std.mem.Allocator) []const forest.Node {
-        return buildView(a, self);
+        return buildView(a, self.viewEnv());
     }
 
     /// Seed tracked DOM state to match markup already emitted in the page,
-    /// so the first diff renders only real changes.
+    /// so the first diff renders only real changes. Solo-path helper —
+    /// grouped sessions never call this (the group's Dom is seeded at
+    /// join and synced by render, never reset).
     pub fn seedDom(self: *Session) void {
         self.render();
         self.log.clear();
@@ -347,12 +495,12 @@ fn commentHref(a: std.mem.Allocator, post_id: u64, cid: u64) []const u8 {
 // ── view components ───────────────────────────────────────────────
 
 /// Sidebar: real links (full navigation) + the poster identity chip.
-fn navView(a: std.mem.Allocator, s: *Session) forest.Node {
+fn navView(a: std.mem.Allocator, env: ViewEnv) forest.Node {
     var links: std.ArrayListUnmanaged(forest.Node) = .empty;
-    const home_on = s.route == .home;
+    const home_on = env.route == .home;
     links.append(a, forest.el(a, .a, .{ .href = "/", .class = if (home_on) "on" else null }, "⌂")) catch @panic("OOM");
     for (board.boards, 0..) |b, i| {
-        const on = switch (s.route) {
+        const on = switch (env.route) {
             .board => |bi| bi == i,
             else => false,
         };
@@ -362,8 +510,9 @@ fn navView(a: std.mem.Allocator, s: *Session) forest.Node {
         }, b.title)) catch @panic("OOM");
     }
     // Identity chip is bound (`#who` + .text) so the first POST's minted
-    // "Anon#N" name patches in live.
-    links.append(a, forest.el(a, .span, .{ .id = "who", .class = "who", .text = nameOf(s.user_token) }, .{})) catch @panic("OOM");
+    // "Anon#N" name patches in live. `env.name` is the RESOLVED display
+    // name — identical for every member of a render group.
+    links.append(a, forest.el(a, .span, .{ .id = "who", .class = "who", .text = env.name }, .{})) catch @panic("OOM");
     return forest.el(a, .div, .{ .class = "bnav" }, links.toOwnedSlice(a) catch @panic("OOM"));
 }
 
@@ -480,11 +629,11 @@ fn replyForm(a: std.mem.Allocator, post_str: []const u8, parent_str: []const u8)
 /// One comment node: meta (id, Anon, time, «ответить»), text, the inline
 /// reply `when` anchor, and a nested keyed `<ul>` of children.
 /// `post_str` is the thread's post id pre-formatted once per view.
-fn commentNode(a: std.mem.Allocator, s: *Session, c: *const board.Comment, post_str: []const u8) forest.Node {
+fn commentNode(a: std.mem.Allocator, env: ViewEnv, c: *const board.Comment, post_str: []const u8) forest.Node {
     const mm = m();
     const id_str = std.fmt.allocPrint(a, "cm-{d}", .{c.id}) catch @panic("OOM");
     const rep_id = std.fmt.allocPrint(a, "w-rep-{d}", .{c.id}) catch @panic("OOM");
-    const replying = s.reply_to != null and s.reply_to.? == c.id;
+    const replying = env.reply_to != null and env.reply_to.? == c.id;
     const num = u64str(a, c.id);
     const hash = std.fmt.allocPrint(a, "#{d}", .{c.id}) catch @panic("OOM");
 
@@ -513,7 +662,7 @@ fn commentNode(a: std.mem.Allocator, s: *Session, c: *const board.Comment, post_
     const kid_idx = mm.childIdx(a, c.id) catch @panic("OOM");
     var ck: std.ArrayListUnmanaged(forest.Node) = .empty;
     for (kid_idx) |ci| {
-        ck.append(a, commentNode(a, s, &mm.comments.items[ci], post_str)) catch @panic("OOM");
+        ck.append(a, commentNode(a, env, &mm.comments.items[ci], post_str)) catch @panic("OOM");
     }
     kids.append(a, forest.el(a, .ul, .{ .lid = "kids", .class = "kids" }, forest.each(ck.toOwnedSlice(a) catch @panic("OOM")))) catch @panic("OOM");
 
@@ -586,7 +735,7 @@ fn boardView(a: std.mem.Allocator, idx: usize) forest.Node {
     return forest.fragment(a, kids.toOwnedSlice(a) catch @panic("OOM"));
 }
 
-fn threadView(a: std.mem.Allocator, s: *Session, post_id: u64) forest.Node {
+fn threadView(a: std.mem.Allocator, env: ViewEnv, post_id: u64) forest.Node {
     const mm = m();
     const p = mm.post(post_id) orelse {
         return notFoundView(a, "Тред не найден.");
@@ -600,14 +749,14 @@ fn threadView(a: std.mem.Allocator, s: *Session, post_id: u64) forest.Node {
     const post_str = u64str(a, post_id);
     var ck: std.ArrayListUnmanaged(forest.Node) = .empty;
     for (tops) |ci| {
-        ck.append(a, commentNode(a, s, &mm.comments.items[ci], post_str)) catch @panic("OOM");
+        ck.append(a, commentNode(a, env, &mm.comments.items[ci], post_str)) catch @panic("OOM");
     }
     kids.append(a, forest.el(a, .ul, .{ .id = "comments", .class = "comments" }, forest.each(ck.toOwnedSlice(a) catch @panic("OOM")))) catch @panic("OOM");
     kids.append(a, forest.when(a, .{ .id = "w-comments-empty" }, tops.len == 0, forest.el(a, .p, .{ .class = "empty" }, "Нет комментариев — будь первым."))) catch @panic("OOM");
     return forest.fragment(a, kids.toOwnedSlice(a) catch @panic("OOM"));
 }
 
-fn commentView(a: std.mem.Allocator, s: *Session, cid: u64) forest.Node {
+fn commentView(a: std.mem.Allocator, env: ViewEnv, cid: u64) forest.Node {
     const mm = m();
     const c = mm.comment(cid) orelse {
         return notFoundView(a, "Комментарий не найден.");
@@ -633,24 +782,26 @@ fn commentView(a: std.mem.Allocator, s: *Session, cid: u64) forest.Node {
     // Arena-allocate the single-row slice — a `&.{…}` temporary would
     // dangle once the statement ends (the keyed list outlives it).
     const only = a.alloc(forest.Node, 1) catch @panic("OOM");
-    only[0] = commentNode(a, s, c, u64str(a, p.id));
+    only[0] = commentNode(a, env, c, u64str(a, p.id));
     kids.append(a, forest.el(a, .ul, .{ .id = "comments", .class = "comments" }, forest.each(only))) catch @panic("OOM");
     return forest.fragment(a, kids.toOwnedSlice(a) catch @panic("OOM"));
 }
 
 /// The `<main>` inner content: sidebar + the active route's page.
-/// Also the `seen_seq` sync point — every shipped view marks the session
-/// as caught up to the shared model's mutation counter.
-fn buildView(a: std.mem.Allocator, s: *Session) []const forest.Node {
-    s.seen_seq = m().global_seq.load(.seq_cst);
-    const content = switch (s.route) {
+/// `env.seen` is the caught-up cursor — every shipped view marks it
+/// synced to the shared model's mutation counter (the session's
+/// `seen_seq`, or a render group's `last_rendered_seq` on group
+/// seed/render builds only).
+pub fn buildView(a: std.mem.Allocator, env: ViewEnv) []const forest.Node {
+    if (env.seen) |p| p.* = m().global_seq.load(.seq_cst);
+    const content = switch (env.route) {
         .home => homeView(a),
         .board => |i| boardView(a, i),
-        .thread => |pid| threadView(a, s, pid),
-        .comment => |cid| commentView(a, s, cid),
+        .thread => |pid| threadView(a, env, pid),
+        .comment => |cid| commentView(a, env, cid),
     };
     const nodes = a.alloc(forest.Node, 2) catch @panic("OOM");
-    nodes[0] = navView(a, s);
+    nodes[0] = navView(a, env);
     nodes[1] = forest.el(a, .div, .{ .class = "bmain" }, content);
     return nodes;
 }
@@ -1042,4 +1193,179 @@ test "heal path: cookie token with no users row bumps global_seq on POST" {
     try std.testing.expectError(error.InvalidAction, s.dispatch("hack", null, null, null));
     try std.testing.expectEqualStrings("Anon#1", mm.userName("tok-forged").?);
     try std.testing.expect(mm.global_seq.load(.seq_cst) > seq0);
+}
+
+// ── render groups ─────────────────────────────────────────────────
+
+fn serveBoth(alloc: std.mem.Allocator, a: *Session, b: *Session, path: []const u8) !void {
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    try std.testing.expect(try a.servePage(path, &aw.writer));
+    _ = aw.writer.consumeAll();
+    try std.testing.expect(try b.servePage(path, &aw.writer));
+}
+
+test "render groups: equal keys share one group; one render per model bump" {
+    const alloc = std.testing.allocator;
+    const mm = testModel(alloc);
+    defer mm.deinit();
+    model = mm;
+    defer model = null;
+
+    const a = createSession(alloc, std.testing.io);
+    defer a.deinit();
+    const b = createSession(alloc, std.testing.io);
+    defer b.deinit();
+    try serveBoth(alloc, a, b, "/");
+
+    // Same (route, reply_to=null, name="anon") → same group, 2 members.
+    const g = a.group.?;
+    try std.testing.expect(a.group.? == b.group.?);
+    try std.testing.expectEqual(@as(usize, 2), g.members);
+    try std.testing.expectEqual(@as(u64, 0), g.rev); // seeded, nothing published
+    try std.testing.expectEqual(@as(usize, 1), board_groups.registryCount());
+
+    // Model bump → the FIRST member's syncPull renders+publishes once;
+    // the second sees last_rendered_seq already current — dedup proof:
+    // rev (one per render) advances by exactly 1 for two sessions.
+    _ = try mm.addPost("b", "tok1", "grouped post");
+    a.syncPull();
+    try std.testing.expectEqual(@as(u64, 1), g.rev);
+    try std.testing.expectEqual(g.rev, g.history.latest_rev);
+    b.syncPull();
+    try std.testing.expectEqual(@as(u64, 1), g.rev);
+
+    // Both members track the group's revision + history ring.
+    try std.testing.expectEqual(g.rev, a.streamRev());
+    try std.testing.expectEqual(g.rev, b.streamRev());
+    try std.testing.expect(a.streamHistory() == b.streamHistory());
+    // publishPending is a no-op — the render already shipped the batch.
+    a.publishPending();
+    b.publishPending();
+    try std.testing.expectEqual(@as(u64, 1), g.rev);
+
+    // The shared history serves both cursors independently.
+    const f = try g.history.fetch(0, alloc);
+    defer History.freeFetch(alloc, f);
+    try std.testing.expectEqual(@as(usize, 1), f.batches.len);
+}
+
+test "render groups: reply_to re-key forks and A→B→A rejoins the same group" {
+    const alloc = std.testing.allocator;
+    const mm = testModel(alloc);
+    defer mm.deinit();
+    model = mm;
+    defer model = null;
+
+    _ = try mm.addPost("b", "tok1", "p");
+    const c1 = try mm.addComment(1, null, "tok1", "c");
+
+    const a = createSession(alloc, std.testing.io);
+    defer a.deinit();
+    const b = createSession(alloc, std.testing.io);
+    defer b.deinit();
+    try serveBoth(alloc, a, b, "/t/1");
+    const base = a.group.?;
+    try std.testing.expect(a.group.? == b.group.?);
+    const e0 = a.membershipEpoch();
+
+    // reply_to is a group-key input: setting it + ping migrates `a` to a
+    // forked group while `b` stays on the base group.
+    a.reply_to = c1.id;
+    a.ping.emit(.{});
+    try std.testing.expect(a.membershipEpoch() == e0 + 1);
+    try std.testing.expect(a.group.? != base);
+    try std.testing.expect(b.group.? == base);
+    try std.testing.expectEqual(@as(usize, 2), board_groups.registryCount());
+
+    // A→B→A between renders: cancel returns to the SAME still-alive base
+    // group instance (b keeps it alive); epoch bumped twice total.
+    a.reply_to = null;
+    a.ping.emit(.{});
+    try std.testing.expect(a.membershipEpoch() == e0 + 2);
+    try std.testing.expect(a.group.? == base);
+    try std.testing.expectEqual(@as(usize, 1), board_groups.registryCount()); // fork destroyed
+}
+
+test "render groups: minted identity re-keys the session out of the anon group" {
+    const alloc = std.testing.allocator;
+    const mm = testModel(alloc);
+    defer mm.deinit();
+    model = mm;
+    defer model = null;
+
+    _ = try mm.addPost("b", "tok1", "p");
+    const a = createSession(alloc, std.testing.io);
+    defer a.deinit();
+    const d = createSession(alloc, std.testing.io);
+    defer d.deinit();
+    try serveBoth(alloc, a, d, "/t/1");
+    const anon_group = a.group.?;
+    const e0 = d.membershipEpoch();
+
+    // First POST mints "Anon#1" — the resolved name is part of the group
+    // key, so d migrates out of the shared anon group even though
+    // reply_to/route are unchanged.
+    var f: std.json.ObjectMap = .empty;
+    defer f.deinit(alloc);
+    try f.put(alloc, "post", .{ .string = "1" });
+    try f.put(alloc, "text", .{ .string = "hi" });
+    try d.dispatch("comment", null, null, &f);
+    try std.testing.expect(d.membershipEpoch() > e0);
+    try std.testing.expect(d.group.? != anon_group);
+    try std.testing.expectEqualStrings("Anon#1", d.group.?.key.name);
+    try std.testing.expect(a.group.? == anon_group); // a unaffected
+    try std.testing.expectEqual(@as(usize, 2), board_groups.registryCount());
+}
+
+test "render groups: last leave destroys the group; recreate gets a new incarnation" {
+    const alloc = std.testing.allocator;
+    const mm = testModel(alloc);
+    defer mm.deinit();
+    model = mm;
+    defer model = null;
+
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    const a = createSession(alloc, std.testing.io);
+    try std.testing.expect(try a.servePage("/", &aw.writer));
+    const g1 = a.group.?;
+    const inc1 = g1.incarnation;
+    try std.testing.expectEqual(@as(usize, 1), board_groups.registryCount());
+    a.deinit(); // manual — no defer, exercises release-on-deinit
+    try std.testing.expectEqual(@as(usize, 0), board_groups.registryCount());
+
+    const b = createSession(alloc, std.testing.io);
+    defer b.deinit();
+    _ = aw.writer.consumeAll();
+    try std.testing.expect(try b.servePage("/", &aw.writer));
+    try std.testing.expect(b.group.?.incarnation != inc1);
+    try std.testing.expectEqual(@as(usize, 1), board_groups.registryCount());
+}
+
+test "render groups: unattached sessions keep the solo diff path" {
+    const alloc = std.testing.allocator;
+    const mm = testModel(alloc);
+    defer mm.deinit();
+    model = mm;
+    defer model = null;
+
+    // Never served a page → no group → dispatch renders into the
+    // session's own log exactly like before grouping existed.
+    const s = createSession(alloc, std.testing.io);
+    defer s.deinit();
+    s.seedDom();
+    alloc.free(patchJson(s, alloc));
+    try std.testing.expect(s.group == null);
+    try std.testing.expect(!s.attached);
+
+    var f: std.json.ObjectMap = .empty;
+    defer f.deinit(alloc);
+    try f.put(alloc, "board", .{ .string = "b" });
+    try f.put(alloc, "text", .{ .string = "solo" });
+    try s.dispatch("post", null, null, &f);
+    const j = patchJson(s, alloc);
+    defer alloc.free(j);
+    try std.testing.expect(std.mem.indexOf(u8, j, "\"op\":") != null);
+    try std.testing.expectEqual(@as(usize, 0), board_groups.registryCount());
 }

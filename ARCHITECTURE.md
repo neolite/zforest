@@ -587,3 +587,48 @@ Audit: apps only `.set` seq(+1) (always changes) and mon's slice
 stores — no app relied on equal-value writes for side effects;
 scalar dedup additionally silences zmon's bool/u64 stores
 (st_ok/st_bad pills, st_err_bp) between real changes.
+
+## Render groups — implementation (2026-11)
+
+The accepted design above is implemented on `perf/render-groups`:
+
+- `src/board_groups.zig` (board-owned, per the verdict): `Key`
+  (route, reply_to, resolved name), `RenderGroup` (incarnation,
+  members, Dom, PatchLog, History, scratch arena, `rev`,
+  `last_rendered_seq`), module registry `join`/`leave`, canonical
+  `keyStringInto`, `registryCount`. Groups are seeded privately at join
+  (diff against empty Dom, batch discarded) with a fresh history; the
+  last `leave` destroys the group and frees the map at empty.
+- `src/board_app.zig`: `ViewEnv` (route/reply_to/name/`seen` cursor)
+  is now the single input bundle — `buildView` is `pub` and takes it,
+  so group renders and session SSR/snapshot builds share one code path.
+  `Session` gains `attached` (set by first servePage — ungated sessions
+  keep the solo path), `group`, `membership_epoch`. `syncMembership`
+  recomputes the key on EVERY render (covers identity minted by failed
+  dispatches) and bumps the epoch on every join/leave/re-key.
+  `render()` routes through `g.render()`+`g.publish()` when grouped —
+  dedup is `last_rendered_seq` vs `global_seq`, so N members cost one
+  buildView+diff per model version. `publishPending`/`streamRev`/
+  `streamHistory`/`membershipEpoch` are the optional server contract.
+- `src/server/http.zig`: generic hooks only — `@hasDecl` gates
+  `publishPending` (POST + SSE poll), `streamRev`/`streamHistory`
+  (ACK rev, snapshot rev, patch cursor), and `membershipEpoch` (any
+  change between polls → snapshot path + adopt new group rev). Apps
+  without the decls run the byte-identical legacy path.
+- `src/server/stream.zig`: `writeSnapshotJson(s, rev, w)` takes the rev
+  explicitly (group-local, ≠ `seq.get()`).
+
+**Deviations from the accepted design:** none functional. Two notes:
+- `servePage` calls `ensureGroupCurrent()` (render+publish if stale)
+  before SSR — a joining member can trigger the pending group render,
+  which also keeps dormant groups fresh; the group Dom is never reset.
+- The meta `zforest-rev` still carries `seq.get()` (per-session ping
+  count). Harmless: the first SSE event is always a snapshot that
+  adopts the group rev unconditionally, and `applySnapshot` resets
+  `lastRev` even when it moves backwards across groups.
+
+**Verified live:** two anonymous sessions on `/` share one group —
+one model bump produced a single `patch` rev on both streams; a
+first-POST identity mint migrated the session and its open stream got
+a mid-flight `snapshot` rev=0 (new group), exactly the epoch→snapshot
+contract.
