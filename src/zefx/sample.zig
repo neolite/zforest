@@ -337,6 +337,96 @@ pub fn sample(eng: *Engine, opts: anytype) SampleReturnType(@TypeOf(opts)) {
 }
 
 // ─────────────────────────────────────────────
+// attach() — the sample pipeline as a first-class named unit
+// ─────────────────────────────────────────────
+// attach(eng, opts) accepts the same options as sample() — `source`
+// (store or shape of stores), `clock` (event or store), `filter`,
+// `fn_`, optional `target`, optional `name` — but ALWAYS returns the
+// attached unit itself: a real `*Event(Result)` owned by the engine
+// that fires the sampled result on every trigger. Because it is an
+// ordinary event it can be watched, mapped, filtered, used as a
+// `clock`/`target` in further sample/forward wiring, or fed to
+// `onReducer`.
+//
+// `.target`, when present, is ADDITIONAL fan-out: each result is also
+// delivered to it (store → set, event → emit, effect → run), with the
+// same compile-time payload checks sample applies. Unlike sample(),
+// attach never returns the target — the attached event is the stable
+// identity apps hold onto.
+//
+// Semantics are inherited wholesale from sample(): wires only schedule
+// and the engine runs them post-settle, so source reads observe final
+// derived state; every input is assertSameEngine-checked.
+
+/// Rebuild a sample options struct with `.target` forced to `AttachedT`:
+/// every other field is carried over verbatim (unknown fields like
+/// `name` pass through harmlessly — sample ignores them), an existing
+/// `target` field's type is replaced, or `target` is appended when the
+/// caller didn't provide one.
+fn AttachWireOpts(comptime O: type, comptime AttachedT: type) type {
+    const info = @typeInfo(O).@"struct";
+    const has_t = @hasField(O, "target");
+    const N = info.field_names.len + (if (has_t) @as(usize, 0) else 1);
+    var names: [N][]const u8 = undefined;
+    var types: [N]type = undefined;
+    var n: usize = 0;
+    inline for (info.field_names, info.field_types) |name, ft| {
+        if (comptime std.mem.eql(u8, name, "target")) continue;
+        names[n] = name;
+        types[n] = ft;
+        n += 1;
+    }
+    names[n] = "target";
+    types[n] = AttachedT;
+    n += 1;
+    return @Struct(.auto, null, &names, &types, &@splat(.{}));
+}
+
+pub fn attach(eng: *Engine, opts: anytype) *event_mod.Event(ResultOf(@TypeOf(opts))) {
+    const O = @TypeOf(opts);
+    if (!@hasField(O, "source") and !@hasField(O, "clock"))
+        @compileError("attach requires at least `source` or `clock`");
+    const ResultT = ResultOf(O);
+    const EvT = event_mod.Event(ResultT);
+
+    // The attached unit — tracked like every other graph unit.
+    const attached = eng.allocator.create(EvT) catch @panic("OOM");
+    attached.* = .{ .eng = eng };
+    eng.trackGraphAlloc(@ptrCast(attached), &struct {
+        fn dtor(a: std.mem.Allocator, p: *anyopaque) void {
+            const e: *EvT = @ptrCast(@alignCast(p));
+            e.deinit();
+            a.destroy(e);
+        }
+    }.dtor);
+    if (@hasField(O, "name")) attached.name_ = opts.name;
+
+    // Main wire: identical inputs to opts, but the sampled result is
+    // emitted on the attached event (an ordinary event target).
+    const WireOptsT = AttachWireOpts(O, *EvT);
+    var wopts: WireOptsT = undefined;
+    inline for (@typeInfo(WireOptsT).@"struct".field_names) |fname| {
+        // comptime-known condition: only the taken branch is analyzed,
+        // so `attached` is never assigned to a non-target field.
+        if (comptime std.mem.eql(u8, fname, "target")) {
+            @field(wopts, fname) = attached;
+        } else {
+            @field(wopts, fname) = @field(opts, fname);
+        }
+    }
+    _ = sample(eng, wopts);
+
+    // Optional fan-out to the caller's target — a clock-only sample
+    // forwards the attached event's payload, so store/event/effect
+    // targets and their payload checks come from sample for free.
+    if (@hasField(O, "target")) {
+        _ = sample(eng, .{ .clock = attached, .target = opts.target });
+    }
+
+    return attached;
+}
+
+// ─────────────────────────────────────────────
 // forward(from, to) — clock-only sample: the clock payload passes
 // through untouched to the target (event → emit, store → set,
 // effect → run). `from` may be *Event or *Store.

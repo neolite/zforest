@@ -14,6 +14,7 @@ pub const Effect = effect_mod.Effect;
 pub const shape = @import("shape.zig");
 pub const sample = sample_mod.sample;
 pub const guard = sample_mod.guard;
+pub const attach = sample_mod.attach;
 pub const Domain = App;
 pub const Runtime = struct {
     gpa: std.heap.DebugAllocator(.{}) = undefined,
@@ -59,6 +60,10 @@ pub const BoundDomain = struct {
 
     pub fn guard(self: BoundDomain, opts: anytype) @TypeOf(sample_mod.guard(&self.domain.eng, opts)) {
         return sample_mod.guard(&self.domain.eng, opts);
+    }
+
+    pub fn attach(self: BoundDomain, opts: anytype) @TypeOf(sample_mod.attach(&self.domain.eng, opts)) {
+        return sample_mod.attach(&self.domain.eng, opts);
     }
 
     pub fn forward(self: BoundDomain, from: anytype, to: anytype) @TypeOf(sample_mod.forward(&self.domain.eng, from, to)) {
@@ -198,6 +203,10 @@ pub const App = struct {
 
     pub fn guard(self: *App, opts: anytype) @TypeOf(sample_mod.guard(&self.eng, opts)) {
         return sample_mod.guard(&self.eng, opts);
+    }
+
+    pub fn attach(self: *App, opts: anytype) @TypeOf(sample_mod.attach(&self.eng, opts)) {
+        return sample_mod.attach(&self.eng, opts);
     }
 
     pub fn forward(self: *App, from: anytype, to: anytype) @TypeOf(sample_mod.forward(&self.eng, from, to)) {
@@ -2092,4 +2101,141 @@ test "onReducer reducer writes settle before derived stores and watchers" {
     try std.testing.expectEqual(@as(i32, 3), base.get());
     try std.testing.expectEqual(@as(i32, 6), doubled.get());
     try std.testing.expectEqual(@as(i32, 6), Probe.seen);
+}
+
+// ─────────────────────────────────────────────
+// attach(): sample pipeline as a named unit
+// ─────────────────────────────────────────────
+
+test "attach returns a named event that fires alongside its target" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const tick = createEvent(&eng, void);
+    const a = createStore(&eng, i32, 2);
+    const b = createStore(&eng, i32, 3);
+    const out = createStore(&eng, i32, 0);
+
+    const attached = attach(&eng, .{
+        .clock = tick,
+        .source = .{ .a = a, .b = b },
+        .fn_ = &struct {
+            fn add(snap: shape.SnapshotTypeOf(struct { a: *Store(i32), b: *Store(i32) }), _: void) i32 {
+                return snap.a + snap.b;
+            }
+        }.add,
+        .target = out,
+    });
+
+    // The attached unit is a first-class event — restore() turns it
+    // into a store of its last payload for observation.
+    const last = restore(&eng, attached, -1);
+
+    a.set(10);
+    tick.emit({});
+    try std.testing.expectEqual(@as(i32, 13), out.get());
+    try std.testing.expectEqual(@as(i32, 13), last.get());
+
+    b.set(1);
+    tick.emit({});
+    try std.testing.expectEqual(@as(i32, 11), out.get());
+    try std.testing.expectEqual(@as(i32, 11), last.get());
+}
+
+test "attach without target yields a unit usable as further wiring input" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const src = createStore(&eng, i32, 1);
+    // Source-only attach: fires on every source update.
+    const attached = attach(&eng, .{
+        .source = src,
+        .fn_ = &struct {
+            fn dbl(v: i32) i32 {
+                return v * 2;
+            }
+        }.dbl,
+        .name = "doubled",
+    });
+    try std.testing.expectEqualStrings("doubled", attached.name_);
+
+    // attached → downstream event via ordinary wiring.
+    const mirrored = createEvent(&eng, i32);
+    _ = forward(&eng, attached, mirrored);
+    const last = restore(&eng, mirrored, -1);
+
+    src.set(4);
+    try std.testing.expectEqual(@as(i32, 8), last.get());
+    src.set(5);
+    try std.testing.expectEqual(@as(i32, 10), last.get());
+}
+
+test "attach combines shape source into effect params (zcar booking shape)" {
+    var app = createApp(std.testing.allocator);
+    defer app.deinit();
+
+    const BookingParams = struct {
+        car: i32,
+        items: usize,
+        total: u32,
+    };
+    const Snap = shape.SnapshotTypeOf(struct {
+        vehicle: *Store(i32),
+        cart: *Store(usize),
+        quote: *Store(u32),
+    });
+
+    const bookFx = app.effect(BookingParams, u32, anyerror, &struct {
+        fn handler(p: BookingParams) anyerror!u32 {
+            return p.total + @as(u32, @intCast(p.items));
+        }
+    }.handler);
+
+    const vehicle = app.store(i32, 7);
+    const cart = app.store(usize, 3);
+    const quote = app.store(u32, 1200);
+    const submit = app.event(void);
+
+    // bookingSubmitted → sample vehicle+cart+quote into one validated
+    // params payload and run the booking effect.
+    const bookingSubmitted = app.attach(.{
+        .clock = submit,
+        .source = .{ .vehicle = vehicle, .cart = cart, .quote = quote },
+        .fn_ = &struct {
+            fn params(snap: Snap, _: void) BookingParams {
+                return .{ .car = snap.vehicle, .items = snap.cart, .total = snap.quote };
+            }
+        }.params,
+        .target = bookFx,
+    });
+
+    const DoneProbe = struct {
+        var calls: usize = 0;
+        var last: ?BookingParams = null;
+        fn watch(d: Effect(BookingParams, u32, anyerror).DoneData) void {
+            calls += 1;
+            last = d.params;
+        }
+    };
+    DoneProbe.calls = 0;
+    DoneProbe.last = null;
+    _ = bookFx.done.watch(&DoneProbe.watch);
+
+    const SeenProbe = struct {
+        var calls: usize = 0;
+        fn cb(_: BookingParams) void {
+            calls += 1;
+        }
+    };
+    SeenProbe.calls = 0;
+    _ = bookingSubmitted.watch(&SeenProbe.cb);
+
+    submit.emit({});
+    try std.testing.expectEqual(@as(usize, 1), SeenProbe.calls);
+    try std.testing.expectEqual(@as(usize, 1), DoneProbe.calls);
+    const p = DoneProbe.last.?;
+    try std.testing.expectEqual(@as(i32, 7), p.car);
+    try std.testing.expectEqual(@as(usize, 3), p.items);
+    try std.testing.expectEqual(@as(u32, 1200), p.total);
+    try std.testing.expectEqual(false, bookFx.pending.get());
 }

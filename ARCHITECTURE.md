@@ -618,3 +618,37 @@ payload now rides BY VALUE in the tick-arena `ClockBox` (was a
 pointer into the reducer-call ctx) — one extra copy per clock fire,
 same lifetime guarantees; shape-member triggers instantiate a
 per-field call fn since `updates()` payload types differ.
+
+---
+<!-- zefx/api-sugar item 2 -->
+## `attach()` — sample pipeline as a named unit (2026-11)
+
+`attach(eng, opts)` (`src/zefx/sample.zig`, exported as `zefx.attach`
++ `App.attach`/`BoundDomain.attach`) accepts sample's options —
+`source` (store|shape), `clock` (event|store), `filter`, `fn_`,
+optional `target`, optional `name` — but ALWAYS returns the attached
+unit: a real engine-owned `*Event(Result)` that fires the sampled
+result on every trigger. It is an ordinary event: watch/map/filter,
+use as `clock`/`target` in further sample/forward, or `onReducer`.
+
+Key semantic choice: `.target` is ADDITIONAL fan-out, not the return
+value (unlike `sample`, which returns its target). Implementation:
+`AttachWireOpts` comptime-rebuilds the opts struct with `.target`
+forced to the attached event, delegates the wire to `sample()`
+(so post-settle scheduling, payload checks, and assertSameEngine all
+inherited), then — when the caller passed `.target` — adds a second
+clock-only `sample(attached → target)` for store/event/effect fan-out.
+Both deliveries settle inside the same flush; the attached event's
+own watchers observe post-target state.
+
+Zig gotcha hit: `std.mem.eql` yields a runtime `bool` — inside
+`inline for` BOTH branches get analyzed per field, so the target
+slot assignment needs `if (comptime std.mem.eql(...))` for lazy
+branch analysis.
+
+Deferred (per Astra's ranking): effect-creating attach
+(`attach({effect, source, mapParams})` — params merging into a new
+effect), `batch` flag, clock arrays. Use case validated by test:
+zcar booking shape — shape source {vehicle,cart,quote} + submit
+clock + fn → BookingParams → effect target, with the attached event
+itself observable.
