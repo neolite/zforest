@@ -506,3 +506,24 @@ Adopted in `mon_app.refreshStores()` (inner batch) + new
 `refreshAndPing()` (outer batch covering stores+ping): syncPull/dispatch
 now cost ONE flush+render per refresh instead of ~14. servePage/
 buildViewNodes get the inner batch for free.
+
+## zefx core fixes — item 3: equality-aware writes (2026-11)
+
+`Store.writeValue` is now the single write boundary for EVERY mutation
+path — `.set`/`.setState`, `.on` reducers, `.reset`, `map`/`combine`
+derived writes, and sample→store targets all funnel through it
+(`src/zefx/store.zig`, `root.zig` combine trigger). New `eq` field
+(`?*const fn(T,T) bool`): default is comptime scalar equality
+(int/bool/enum/float via `==`); compound types default `null` =
+always-write — NO automatic deep equality. Suppressed writes skip
+prev/value update, markDirty, watchers AND settle propagation; a
+suppressed `.set` doesn't even flush. Opt-in comparator:
+`st.eq = sliceEq([]const u8)` (`zefx.sliceEq` factory) — runs at WRITE
+time, so the old value's backing must still be valid: mon_app's
+fmt_arena slice stores deliberately keep `eq = null` (arena resets
+before the sets would recycle the old slices; Dom already dedupes
+unchanged text ops). `st.eq = null` disables dedup entirely.
+Audit: apps only `.set` seq(+1) (always changes) and mon's slice
+stores — no app relied on equal-value writes for side effects;
+scalar dedup additionally silences zmon's bool/u64 stores
+(st_ok/st_bad pills, st_err_bp) between real changes.

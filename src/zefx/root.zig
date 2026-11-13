@@ -260,6 +260,20 @@ pub fn createStore(eng: *Engine, comptime T: type, initial: T) *Store(T) {
     return allocStore(eng, T, initial);
 }
 
+/// Returns a slice-content comparator for opt-in store equality:
+/// `st.eq = sliceEq([]const u8);` — S must be a slice type. The
+/// comparator runs at WRITE time; stores whose old value's backing
+/// storage may be recycled before `set` runs (e.g. an arena reset each
+/// refresh — see mon_app's fmt_arena stores) must keep stable storage
+/// or leave `eq` null instead of comparing recycled memory.
+pub fn sliceEq(comptime S: type) *const fn (S, S) bool {
+    return struct {
+        fn eq(a: S, b: S) bool {
+            return std.mem.eql(@typeInfo(S).pointer.child, a, b);
+        }
+    }.eq;
+}
+
 pub fn createEffect_(eng: *Engine, comptime Params: type, comptime Result: type, comptime ErrSet: type, handler: *const fn (Params) ErrSet!Result) *Effect(Params, Result, ErrSet) {
     return allocEffect(eng, Params, Result, ErrSet, handler);
 }
@@ -441,9 +455,7 @@ fn CombineHelper(comptime Shape: type, comptime FnType: type) type {
             const c: *CombineCtx = @ptrCast(@alignCast(raw));
             const new_snap = shape.readSnapshot(c.shape_stores);
             const new_val = c.combineFn(new_snap);
-            c.derived_store.prev = c.derived_store.value;
-            c.derived_store.value = new_val;
-            c.derived_store.markDirty();
+            _ = c.derived_store.writeValue(new_val);
         }
     };
 }
@@ -1792,4 +1804,218 @@ test "reentrant flush from a watcher does not drain queues recursively" {
     ev.emit(2);
     try std.testing.expectEqual(@as(i32, 3), st.get());
     try std.testing.expectEqual(@as(usize, 2), Reentrant.calls);
+}
+
+// ─────────────────────────────────────────────
+// equality-aware writes: common write boundary dedup
+// ─────────────────────────────────────────────
+
+test "store.set suppresses equal scalar writes" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const st = createStore(&eng, i32, 0);
+    const Probe = struct {
+        var calls: usize = 0;
+        var last: i32 = -1;
+        fn cb(v: i32) void {
+            calls += 1;
+            last = v;
+        }
+    };
+    Probe.calls = 0;
+    Probe.last = -1;
+    _ = st.watch(&Probe.cb);
+
+    st.set(5);
+    st.set(5); // suppressed — no watcher, no dirty
+    st.set(5);
+    st.set(7);
+    st.set(7);
+
+    try std.testing.expectEqual(@as(i32, 7), st.get());
+    try std.testing.expectEqual(@as(usize, 2), Probe.calls);
+    try std.testing.expectEqual(@as(i32, 7), Probe.last);
+}
+
+test "suppressed set does not flush or run after-flush hooks" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const st = createStore(&eng, i32, 1);
+    const Flushes = struct {
+        n: usize = 0,
+        fn bump(raw: *anyopaque) void {
+            const c: *@This() = @ptrCast(@alignCast(raw));
+            c.n += 1;
+        }
+    };
+    var flushes = Flushes{};
+    eng.onAfterFlush(.{ .ctx = @ptrCast(&flushes), .call = &Flushes.bump });
+
+    st.set(1); // equal → suppressed → no flush at all
+    try std.testing.expectEqual(@as(usize, 0), flushes.n);
+    st.set(2);
+    try std.testing.expectEqual(@as(usize, 1), flushes.n);
+}
+
+test "store.on suppresses reducer results equal to current value" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const ev = createEvent(&eng, i32);
+    const st = createStore(&eng, i32, 0);
+    const Probe = struct {
+        var calls: usize = 0;
+        fn cb(_: i32) void {
+            calls += 1;
+        }
+    };
+    Probe.calls = 0;
+    _ = st.on(ev, &struct {
+        fn reduce(state: i32, p: i32) ?i32 {
+            return state + p;
+        }
+    }.reduce);
+    _ = st.watch(&Probe.cb);
+
+    ev.emit(0); // reducer returns 0 — equal → suppressed
+    ev.emit(3);
+    ev.emit(-3); // back to 0 — changed, fires
+    ev.emit(0); // 0 again — changed from 0? no: state 0 + 0 = 0, equal → suppressed
+
+    try std.testing.expectEqual(@as(i32, 0), st.get());
+    try std.testing.expectEqual(@as(usize, 2), Probe.calls);
+}
+
+test "derived map suppresses equal results down the chain" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const ev = createEvent(&eng, i32);
+    const base = createStore(&eng, i32, 0);
+    _ = base.on(ev, &struct {
+        fn reduce(state: i32, p: i32) ?i32 {
+            return state + p;
+        }
+    }.reduce);
+    const positive = base.map(bool, &struct {
+        fn f(v: i32) bool {
+            return v > 0;
+        }
+    }.f);
+    const Probe = struct {
+        var calls: usize = 0;
+        fn cb(_: bool) void {
+            calls += 1;
+        }
+    };
+    Probe.calls = 0;
+    _ = positive.watch(&Probe.cb);
+
+    ev.emit(-1); // base=-1, positive stays false (initial) → suppressed
+    ev.emit(-1); // base=-2, positive stays false → suppressed
+    ev.emit(-1); // base=-3, still false → suppressed
+    ev.emit(5); // base=2, positive=true → fires
+    ev.emit(-2); // base=0, positive=false → fires
+    ev.emit(-1); // base=-1, false → suppressed
+
+    try std.testing.expectEqual(@as(bool, false), positive.get());
+    try std.testing.expectEqual(@as(usize, 2), Probe.calls); // only the two real flips
+}
+
+test "store.reset suppresses write when already at initial" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const bump = createEvent(&eng, void);
+    const rst = createEvent(&eng, void);
+    const st = createStore(&eng, i32, 0);
+    _ = st.on(bump, &struct {
+        fn reduce(state: i32, _: void) ?i32 {
+            return state + 1;
+        }
+    }.reduce);
+    _ = st.reset(rst);
+    const Probe = struct {
+        var calls: usize = 0;
+        fn cb(_: i32) void {
+            calls += 1;
+        }
+    };
+    Probe.calls = 0;
+    _ = st.watch(&Probe.cb);
+
+    bump.emit({}); // 1
+    rst.emit({}); // 0 — changed
+    rst.emit({}); // already 0 — suppressed
+
+    try std.testing.expectEqual(@as(i32, 0), st.get());
+    try std.testing.expectEqual(@as(usize, 2), Probe.calls);
+}
+
+test "slice stores always write by default — no implicit deep equality" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const st = createStore(&eng, []const u8, "a");
+    const Probe = struct {
+        var calls: usize = 0;
+        fn cb(_: []const u8) void {
+            calls += 1;
+        }
+    };
+    Probe.calls = 0;
+    _ = st.watch(&Probe.cb);
+
+    st.set("a"); // same CONTENT, different storage → still writes
+    st.set("b");
+
+    try std.testing.expectEqual(@as(usize, 2), Probe.calls);
+}
+
+test "sliceEq opts a slice store into content dedup" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const st = createStore(&eng, []const u8, "a");
+    st.eq = sliceEq([]const u8);
+    const Probe = struct {
+        var calls: usize = 0;
+        var last: []const u8 = "";
+        fn cb(v: []const u8) void {
+            calls += 1;
+            last = v;
+        }
+    };
+    Probe.calls = 0;
+    _ = st.watch(&Probe.cb);
+
+    st.set("a"); // equal content → suppressed
+    st.set("b"); // different → writes
+    st.set("b"); // equal → suppressed
+
+    try std.testing.expectEqual(@as(usize, 1), Probe.calls);
+    try std.testing.expectEqualStrings("b", Probe.last);
+}
+
+test "eq = null disables scalar dedup" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const st = createStore(&eng, i32, 0);
+    st.eq = null;
+    const Probe = struct {
+        var calls: usize = 0;
+        fn cb(_: i32) void {
+            calls += 1;
+        }
+    };
+    Probe.calls = 0;
+    _ = st.watch(&Probe.cb);
+
+    st.set(5);
+    st.set(5); // eq disabled → writes anyway
+
+    try std.testing.expectEqual(@as(usize, 2), Probe.calls);
 }

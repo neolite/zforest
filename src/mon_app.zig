@@ -221,7 +221,10 @@ pub const Session = struct {
     /// Pull the shared model snapshot into this session's stores. String
     /// slices live in fmt_arena until the next refresh. The batch makes
     /// the ~13 `.set()` calls cost one flush even when called alone
-    /// (servePage / buildViewNodes).
+    /// (servePage / buildViewNodes). Slice stores deliberately keep
+    /// `eq = null`: fmt_arena is reset BEFORE the sets, so the old slice
+    /// would point into recycled memory — content comparison is unsafe
+    /// here (the Dom layer already dedupes unchanged text ops).
     fn refreshStores(self: *Session) void {
         const eng = &self.app.eng;
         eng.batchBegin();
