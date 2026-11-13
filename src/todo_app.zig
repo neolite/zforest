@@ -86,6 +86,10 @@ pub const Session = struct {
     /// Per-session CSRF token rendered into the page and verified on POST.
     /// Owned by the session; set by the server at creation.
     csrf_token: []u8 = &.{},
+    /// Store-stamped incarnation (see the Session contract in
+    /// server/http.zig): distinguishes this session from a previous one
+    /// evicted+recreated under the same (cookie token, route) key.
+    incarnation: u64 = 0,
     /// Extra `Set-Cookie` header emitted on /action responses ("" = none).
     /// Set by dispatch when minting the session user; owned by the server.
     out_cookie: []const u8 = &.{},

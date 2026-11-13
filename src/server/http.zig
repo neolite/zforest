@@ -18,6 +18,13 @@ const sse_heartbeat_ticks = 200; // 200 * 50ms ≈ 10s
 ///   - `pub fn create(gpa: std.mem.Allocator, io: std.Io) *Self` — wired
 ///     constructor (`io` is for entropy: session/user token minting).
 ///   - `deinit()`, `csrf_token: []u8`, `setCsrf(token: []u8)`.
+///   - `incarnation: u64` — a plain field the session declares (any
+///     default); `SessionStore.create` stamps a fresh value on every
+///     creation. SSE streams compare it across polls to detect a
+///     session evicted+recreated under the same (token, route) key —
+///     the new session's seq/history restarted, so the old cursor
+///     could never be satisfied. Compile-enforced: a session type
+///     without the field fails to build.
 ///   - `history: History` — retained patch batches for SSE replay.
 ///   - `seq: *zefx.Store(u64)` (or anything exposing `.get()`) — revision.
 ///   - `dispatch(action, arg, value, fields) !void` — the DOM event
@@ -55,6 +62,10 @@ pub fn SessionStore(comptime Session: type) type {
         io: std.Io,
         by_key: std.StringHashMapUnmanaged(*Session) = .empty,
         order: std.ArrayListUnmanaged([]u8) = .empty,
+        /// Monotonic incarnation source — every `create` stamps the next
+        /// value, so a recreated (token, route) session is always
+        /// distinguishable from the evicted one it replaced.
+        next_incarnation: u64 = 1,
 
         pub fn init(gpa: std.mem.Allocator, io: std.Io) Self {
             return .{ .gpa = gpa, .io = io };
@@ -105,6 +116,8 @@ pub fn SessionStore(comptime Session: type) type {
             var rb: [16]u8 = undefined;
             self.io.random(&rb);
             s.setCsrf(std.fmt.allocPrint(self.gpa, "{x:0>32}", .{std.mem.readInt(u128, &rb, .little)}) catch @panic("OOM"));
+            s.incarnation = self.next_incarnation;
+            self.next_incarnation += 1;
             self.by_key.put(self.gpa, key, s) catch @panic("OOM");
             self.order.append(self.gpa, key) catch @panic("OOM");
             return s;
@@ -400,7 +413,11 @@ fn writeChunk(out: *std.Io.Writer, data: []const u8) !void {
 ///
 /// Every poll re-acquires the model mutex, copies owned payload out, and
 /// releases the lock before writing to the socket — a session can be
-/// evicted between iterations, so no session pointer is retained.
+/// evicted between iterations, so no session pointer is retained. A
+/// (token, route) session evicted AND recreated between polls is caught
+/// by the incarnation stamp: the new session's restarted revisions can
+/// never satisfy this stream's cursor, so the stream ends with
+/// `session_expired` instead of silently stalling.
 fn serveEvents(comptime Session: type, srv: *Server(Session), req: *std.http.Server.Request) !void {
     var cookie_hdr: ?[]const u8 = null;
     var it = req.iterateHeaders();
@@ -421,6 +438,7 @@ fn serveEvents(comptime Session: type, srv: *Server(Session), req: *std.http.Ser
     defer fw.deinit();
 
     var cursor: u64 = 0;
+    var incarnation: u64 = 0;
     var connected = false; // rev 0 is a valid cursor, so track state instead
     var ticks: u32 = 0;
     while (true) {
@@ -430,7 +448,15 @@ fn serveEvents(comptime Session: type, srv: *Server(Session), req: *std.http.Ser
             srv.mutex.lockUncancelable(srv.io);
             defer srv.mutex.unlock(srv.io);
             const s = srv.store.lookup(token, route);
-            if (s) |sess| {
+            // Eviction + recreation between polls yields a NEW session
+            // under the same (token, route) key — its seq/history
+            // restarted near 0, so this stream's cursor could never be
+            // satisfied: a silent stall. A changed incarnation means
+            // exactly that; treat it like eviction. The client's
+            // session_expired handler reloads into a fresh snapshot.
+            const reincarnated = if (s) |cand| connected and cand.incarnation != incarnation else false;
+            if (s != null and !reincarnated) {
+                const sess = s.?;
                 // Catch up shared-model state BEFORE snapshotting: the
                 // snapshot reads the current model, so the session's
                 // tracked DOM/history must reach the same revision first —
@@ -446,6 +472,7 @@ fn serveEvents(comptime Session: type, srv: *Server(Session), req: *std.http.Ser
                 }
                 if (!connected) {
                     connected = true;
+                    incarnation = sess.incarnation;
                     cursor = sess.seq.get();
                     fw.writer.writeAll("event: snapshot\ndata: ") catch @panic("OOM");
                     stream_mod.writeSnapshotJson(sess, &fw.writer) catch @panic("OOM");
@@ -574,6 +601,59 @@ pub fn serve(gpa: std.mem.Allocator, io: std.Io, bind: std.Io.net.Ip4Address, co
             stream.close(io);
         };
     }
+}
+
+// ─────────────────────────────────────────────
+// tests
+// ─────────────────────────────────────────────
+
+/// Minimal session for store-mechanics tests — the full view/dispatch
+/// contract is only needed by `handle`/`serveEvents`, not the store.
+const TestSession = struct {
+    incarnation: u64 = 0,
+    csrf_token: []u8 = &.{},
+    gpa: std.mem.Allocator,
+
+    fn create(gpa: std.mem.Allocator, io: std.Io) *TestSession {
+        _ = io;
+        const s = gpa.create(TestSession) catch @panic("OOM");
+        s.* = .{ .gpa = gpa };
+        return s;
+    }
+
+    fn deinit(self: *TestSession) void {
+        if (self.csrf_token.len != 0) self.gpa.free(self.csrf_token);
+        self.gpa.destroy(self);
+    }
+
+    fn setCsrf(self: *TestSession, token: []u8) void {
+        if (self.csrf_token.len != 0) self.gpa.free(self.csrf_token);
+        self.csrf_token = token;
+    }
+};
+
+test "session store stamps a fresh incarnation per create, across eviction" {
+    const alloc = std.testing.allocator;
+    var store = SessionStore(TestSession).init(alloc, std.testing.io);
+    defer store.deinit();
+
+    const a = store.create("tok", "/");
+    const b = store.create("tok", "/other");
+    try std.testing.expect(a.incarnation != 0);
+    try std.testing.expect(b.incarnation != a.incarnation);
+
+    // Fill past the cap so the oldest keys are evicted FIFO; recreating
+    // "tok"/"/" must yield a DIFFERENT incarnation — an SSE cursor into
+    // the dead session's history can never alias the new one's revs.
+    var i: usize = 0;
+    while (i < max_sessions) : (i += 1) {
+        var kb: [32]u8 = undefined;
+        const k = std.fmt.bufPrint(&kb, "tok/f{d}", .{i}) catch unreachable;
+        _ = store.create(k, "/");
+    }
+    try std.testing.expect(store.lookup("tok", "/") == null);
+    const a2 = store.create("tok", "/");
+    try std.testing.expect(a2.incarnation != a.incarnation);
 }
 
 test {

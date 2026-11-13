@@ -82,6 +82,10 @@ pub const Session = struct {
     history: History,
     render_arena: std.heap.ArenaAllocator,
     csrf_token: []u8 = &.{},
+    /// Store-stamped incarnation (see the Session contract in
+    /// server/http.zig): distinguishes this session from a previous one
+    /// evicted+recreated under the same (cookie token, route) key.
+    incarnation: u64 = 0,
 
     const Ping = struct {};
 
@@ -878,7 +882,7 @@ test "thread SSR emits nested keyed comment trees and reply anchors" {
     const s2 = createSession(alloc, std.testing.io);
     defer s2.deinit();
     s2.seedDom();
-    s2.syncPull(); // global_seq unchanged by `reply` → no render at all
+    s2.syncPull(); // seedDom already synced seen_seq → no render at all
     try std.testing.expectEqual(@as(usize, 0), s2.log.patches.items.len);
 }
 
@@ -985,4 +989,57 @@ test "comment on another session patches the board counter live" {
     // any dynamic value must reach the diff, unbound content goes stale.
     try std.testing.expect(std.mem.indexOf(u8, j, "\"op\":\"text\",\"id\":\"post-1/go\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, j, "тред (1)") != null);
+}
+
+test "identity minted by a failed POST fans out via global_seq" {
+    const alloc = std.testing.allocator;
+    const mm = testModel(alloc);
+    defer mm.deinit();
+    model = mm;
+    defer model = null;
+
+    const s = createSession(alloc, std.testing.io);
+    defer s.deinit();
+    s.seedDom(); // #who renders "anon" for the empty user_token
+
+    // First contact is an INVALID action: ensureUser still mints the
+    // zfxu identity (a model mutation → global_seq bump) before the
+    // action itself is rejected without ping.emit.
+    try std.testing.expectError(error.InvalidAction, s.dispatch("hack", null, null, null));
+    try std.testing.expect(s.user_token.len != 0);
+    const seq1 = mm.global_seq.load(.seq_cst);
+    try std.testing.expect(seq1 != 0);
+
+    // The SSE path must pick the identity change up even though the
+    // failed POST published no batch of its own — #who patches live.
+    s.syncPull();
+    const j = patchJson(s, alloc);
+    defer alloc.free(j);
+    try std.testing.expect(std.mem.indexOf(u8, j, "\"op\":\"text\",\"id\":\"who\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, j, "Anon#1") != null);
+
+    // A second failed POST is an ensureUser no-op → no bump → no render.
+    try std.testing.expectError(error.InvalidAction, s.dispatch("hack", null, null, null));
+    try std.testing.expectEqual(seq1, mm.global_seq.load(.seq_cst));
+    s.syncPull();
+    try std.testing.expectEqual(@as(usize, 0), s.log.patches.items.len);
+}
+
+test "heal path: cookie token with no users row bumps global_seq on POST" {
+    const alloc = std.testing.allocator;
+    const mm = testModel(alloc);
+    defer mm.deinit();
+    model = mm;
+    defer model = null;
+
+    const s = createSession(alloc, std.testing.io);
+    defer s.deinit();
+    s.seedDom();
+
+    // Simulate a stale/forged zfxu cookie: token present, no users row.
+    s.user_token = try alloc.dupe(u8, "tok-forged");
+    const seq0 = mm.global_seq.load(.seq_cst);
+    try std.testing.expectError(error.InvalidAction, s.dispatch("hack", null, null, null));
+    try std.testing.expectEqualStrings("Anon#1", mm.userName("tok-forged").?);
+    try std.testing.expect(mm.global_seq.load(.seq_cst) > seq0);
 }

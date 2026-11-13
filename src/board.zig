@@ -238,7 +238,13 @@ pub const BoardModel = struct {
     }
 
     /// Get-or-create the user row for `token`; returns the display name.
-    /// New users get "Anon#<base36(rownum)>".
+    /// New users get "Anon#<base36(rownum)>". An actual insert bumps
+    /// `global_seq` like any other mutation — the resolved name is
+    /// rendered output (#who chip, post/comment authors), so identity
+    /// changes must fan out even when the triggering action fails. A
+    /// no-op lookup must NOT bump: every POST would re-render all
+    /// sessions for nothing. (Any future field-update path must bump
+    /// too.)
     pub fn ensureUser(self: *BoardModel, token: []const u8) ModelError![]const u8 {
         if (self.users.get(token)) |name| return name;
         var st = self.db.prepare(self.gpa, "INSERT INTO users (token, created) VALUES (?, ?)") catch |e| return dbErr(e);
@@ -249,6 +255,7 @@ pub const BoardModel = struct {
         const name = self.anonName(@intCast(self.users.count() + 1)) catch @panic("OOM");
         const tkey = self.gpa.dupe(u8, token) catch @panic("OOM");
         self.users.put(self.gpa, tkey, name) catch @panic("OOM");
+        self.bump();
         return name;
     }
 
@@ -458,6 +465,21 @@ test "board model: add/load, ordering, ids, validation" {
 
     const seq = m.global_seq.load(.seq_cst);
     try std.testing.expect(seq >= 5); // 2 posts + 3 comments
+}
+
+test "board model: ensureUser bumps global_seq only on real mutation" {
+    const alloc = std.testing.allocator;
+    var m = try BoardModel.init(alloc, ":memory:");
+    defer m.deinit();
+
+    const s0 = m.global_seq.load(.seq_cst);
+    _ = try m.ensureUser("tok-a");
+    try std.testing.expectEqual(s0 + 1, m.global_seq.load(.seq_cst));
+    // Repeat lookups are no-ops — no fan-out for unchanged identity.
+    _ = try m.ensureUser("tok-a");
+    try std.testing.expectEqual(s0 + 1, m.global_seq.load(.seq_cst));
+    _ = try m.ensureUser("tok-b");
+    try std.testing.expectEqual(s0 + 2, m.global_seq.load(.seq_cst));
 }
 
 test "board model persists and reloads from a file db" {

@@ -72,6 +72,10 @@ pub const Session = struct {
     view_arena: std.heap.ArenaAllocator,
     view_nodes: ?[]const forest.Node = null,
     csrf_token: []u8 = &.{},
+    /// Store-stamped incarnation (see the Session contract in
+    /// server/http.zig): distinguishes this session from a previous one
+    /// evicted+recreated under the same (cookie token, route) key.
+    incarnation: u64 = 0,
 
     const Ping = struct {};
 

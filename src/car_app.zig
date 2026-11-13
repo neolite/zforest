@@ -57,6 +57,10 @@ pub const Session = struct {
     history: History,
     render_arena: std.heap.ArenaAllocator,
     csrf_token: []u8 = &.{},
+    /// Store-stamped incarnation (see the Session contract in
+    /// server/http.zig): distinguishes this session from a previous one
+    /// evicted+recreated under the same (cookie token, route) key.
+    incarnation: u64 = 0,
     out_cookie: []const u8 = &.{},
 
     pub fn create(gpa: std.mem.Allocator, io: std.Io) *Session {

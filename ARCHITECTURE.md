@@ -467,3 +467,34 @@ childIdx/boardPostIdx O(n) scans — strong); dep-regions; memoized
 buildView (unmeasured "half"); numeric Dom ids; shared bytes only
 after proving identical transitions (History takes exclusive
 ownership — needs ownership change anyway).
+
+---
+
+## Bug fixes: identity fan-out + SSE session incarnation (2026-11)
+
+Two defects from the render-groups review, both fixed:
+
+- `BoardModel.ensureUser` now bumps `global_seq` when it actually
+  inserts a users row (repeat lookups still don't bump — every POST
+  would otherwise re-render all sessions). An invalid first POST that
+  mints `zfxu` identity previously returned an error with no
+  `ping.emit`, so `syncPull` saw an unchanged `global_seq` and `#who`
+  stayed "anon" until an unrelated mutation. Caller audit: the only
+  mutating callers are `Session.dispatch` (mint + heal paths, both
+  covered) and `board_seed.apply` (init-time, harmless); GET/`servePage`
+  never call `ensureUser` — `readCookies` only stashes the token, so
+  page loads can't mutate the model. Note: a failed first POST still
+  doesn't emit `Set-Cookie` (dispatch errors return before the
+  `out_cookie` hook) — the in-memory token persists for the session's
+  lifetime but the browser only gets `zfxu` on a successful POST;
+  pre-existing quirk, unchanged.
+- Sessions carry `incarnation: u64`, stamped by `SessionStore.create`
+  from a per-store monotonic counter (compile-enforced contract field —
+  all four apps declare it). `serveEvents` captures it on first
+  lookup; a mismatch means the (token, route) session was evicted and
+  recreated between polls — the new session's seq/history restarted
+  near 0, so the old cursor could never be satisfied (silent stall).
+  The stream now ends with `session_expired`; client.js already
+  reloads on that event and the reconnect gets a fresh snapshot — no
+  client change. A→B→A recreation can't alias: incarnations never
+  repeat within a store.
