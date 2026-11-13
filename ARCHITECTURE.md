@@ -399,3 +399,71 @@ complements, doesn't replace, groups); lazy render when no SSE
 subscriber. Todo/car are inherently per-session; zmon already on
 live-bindings. Render groups are the board-specific fix for the main
 multiplier.
+
+## Astra review: render groups — verdict + corrected design (2026-11)
+
+**Core claim VERIFIED with qualifications.** View = f(route, reply_to,
+resolved display name, BoardModel contents). IDs deterministic (no
+session data). Hashmap iteration is NOT a problem: view paths scan
+ordered arrays (`posts.items`/`comments.items`), `users`/`post_counts`
+are get-only; Zig 0.17.1 auto-hashing is Wyhash seed 0 anyway.
+Qualifications: `buildView` writes `seen_seq` (not pure); equal views
+≠ byte-identical batches (seq rev embedded in serialization); SSR head
+carries per-session CSRF+rev — share body only.
+
+**EXISTING BUGS found (independent of groups):**
+- `BoardModel.ensureUser()` mutates `users` WITHOUT `bump()` — an
+  invalid first POST can establish identity then return without ping;
+  syncPull sees unchanged global_seq → `#who` name stays stale.
+- SSE lookup `(cookie,route)` each poll + eviction/recreation between
+  polls → new session found with lower rev → stream can stall forever.
+  Needs a session incarnation check.
+- Correction to earlier note: two tabs with SAME cookie+route share
+  ONE Session (reply_to is shared, not per-tab). Route is the only
+  session-split dimension.
+
+**FATAL FLAW in naive "join free":** equal view inputs ≠ compatible
+revision history. Live SSE switching groups: cursor 40 vs group B
+latest 7 → `fetch` returns EMPTY (not gap) → transition silently lost;
+B at 50 → applies unrelated patches. Revision numbers don't imply
+baseline equality.
+
+**Corrected design (Astra's accepted version):**
+- RenderGroupRegistry lives in a BOARD-OWNED runtime module (not the
+  generic http server); group key = (canonical route, reply_to,
+  resolved display name); group owns incarnation, member count, Dom,
+  log, History, group-local revision, last rendered model version.
+- Session keeps identity/CSRF/route + group ref + session incarnation
+  + membership epoch. Membership change (incl. A→B→A between polls) →
+  sync destination → SNAPSHOT → adopt revision. Epoch, not pointer.
+- NO Dom/history cloning in v1: new group seeded from current state +
+  fresh history; joining connection gets snapshot. Clone+deep-copy
+  ring only as later measured optimization.
+- Centralize render+rev+serialize+publish (remove duplicate
+  POST/SSE publish sites). servePage must sync group BEFORE SSR and
+  never reset shared Dom. Fresh-group Dom + ordinary diff is unsafe
+  (client `create` doesn't dedupe ids) → enter via snapshot.
+- Identity minting recomputes key BEFORE render (covers failed
+  dispatches that still minted identity).
+- Route changes keep full-page navigation (sessions already keyed by
+  route; snapshots can't rebuild page scaffold anyway).
+- Thread-route snapshots replace whole comments subtree → reply/
+  cancel transitions via snapshot erase other inline drafts/focus —
+  product cost to note.
+- Dedup key is group's rendered MODEL VERSION checked under mutex —
+  "once per group per flush" is wrong (flushes are per session engine).
+- Lazy-render correction: dormant sessions without SSE don't eagerly
+  render; multiplier = ACTIVE SSE sessions per model version; polls
+  coalesce multiple mutations.
+
+**Estimate: 400–800 prod lines + 300–600 test lines, 5–8 files.** Not
+a pointer-sharing patch. Acceptance cases: two unequal cursors, late
+join with unpublished changes, dest rev lower/equal/higher, A→B→A
+between polls, identity mint on failed dispatch, eviction/recreation,
+same-route second-tab GET.
+
+**Cheaper alternatives ranked:** two-tier global projections (kills
+childIdx/boardPostIdx O(n) scans — strong); dep-regions; memoized
+buildView (unmeasured "half"); numeric Dom ids; shared bytes only
+after proving identical transitions (History takes exclusive
+ownership — needs ownership change anyway).
