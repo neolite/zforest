@@ -431,6 +431,19 @@ fn serveEvents(comptime Session: type, srv: *Server(Session), req: *std.http.Ser
             defer srv.mutex.unlock(srv.io);
             const s = srv.store.lookup(token, route);
             if (s) |sess| {
+                // Catch up shared-model state BEFORE snapshotting: the
+                // snapshot reads the current model, so the session's
+                // tracked DOM/history must reach the same revision first —
+                // otherwise the diff cursor silently skips a transition
+                // and later patches are computed against stale tracking.
+                sess.syncPull();
+                if (sess.seq.get() > sess.history.latest_rev) {
+                    var jaw: std.Io.Writer.Allocating = .init(srv.gpa);
+                    defer jaw.deinit();
+                    sess.log.writeJson(&jaw.writer) catch @panic("OOM");
+                    sess.history.publish(sess.seq.get(), jaw.toOwnedSlice() catch @panic("OOM"));
+                    sess.log.clear();
+                }
                 if (!connected) {
                     connected = true;
                     cursor = sess.seq.get();
@@ -438,17 +451,6 @@ fn serveEvents(comptime Session: type, srv: *Server(Session), req: *std.http.Ser
                     stream_mod.writeSnapshotJson(sess, &fw.writer) catch @panic("OOM");
                     fw.writer.writeAll("\n\n") catch @panic("OOM");
                 } else {
-                    // Shared-model sessions (board) re-render when the
-                    // global mutation counter moved; publish any produced
-                    // batch (even patch-empty — keeps cursors contiguous).
-                    sess.syncPull();
-                    if (sess.seq.get() > sess.history.latest_rev) {
-                        var jaw: std.Io.Writer.Allocating = .init(srv.gpa);
-                        defer jaw.deinit();
-                        sess.log.writeJson(&jaw.writer) catch @panic("OOM");
-                        sess.history.publish(sess.seq.get(), jaw.toOwnedSlice() catch @panic("OOM"));
-                        sess.log.clear();
-                    }
                     const f = sess.history.fetch(cursor, srv.gpa) catch @panic("OOM");
                     defer History.freeFetch(srv.gpa, f);
                     switch (f) {

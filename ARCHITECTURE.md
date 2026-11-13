@@ -190,3 +190,63 @@ server-rendered UI — React owns all rendering there. If server-driven
 panels (properties/history/ops log) are ever wanted inside kulman, this
 stand shows the shape: subscribe `BimSyncCommittedListener`, keep a
 per-session view state, render regions, push on commit.
+
+## Astra review: two-tier graph + snapshot catch-up bug (2026-11)
+
+Consulted gpt-6-astra on the "global stores + per-session projections"
+design. Verdict: **sound, but not as direct cross-engine edges** — two
+independently scheduled graphs joined by a *revisioned subscription
+module*; global commits enqueue session work, never render synchronously.
+`sample`/`combine` edges must stay inside one engine (they install
+reducer contexts without ownership checks — mixed-engine wiring leaves
+dangling contexts / skipped flushes).
+
+Key contracts she defined:
+- Two revisions: global (committed shared state) and session (contiguous
+  published batches). Relax "one batch per global rev" to "one coherent
+  batch per session update incorporating one complete global revision" —
+  coalescing 40→45 must not mix fields from different revisions.
+- Back-pressure: one pending-work record per session (latest rev +
+  accumulated invalidations); coalesce before DOM binding execution —
+  `Engine.flush` scans every registered store and `Store.set` does not
+  suppress equal values, so M×K leaf subscriptions would tax commits.
+- Lifecycle: detachable *subscriptions* are fine before detachable
+  graphs (generational watcher handles exist); queued deliveries must
+  own payloads — `Event.emit` copies values, not slice backing memory.
+- Session = (cookie, route), NOT tab — two tabs on one route share
+  reply_to/DOM/history today.
+
+### Bug found and fixed
+
+`serveEvents` wrote the initial SSE snapshot WITHOUT `syncPull`: the
+snapshot reads the current shared model and `buildView` advances
+`seen_seq`, but session DOM/history stay behind — the transition is
+skipped forever and later diffs compute against stale tracking (wrong
+ops for `when`/keyed/remove; client logs errors, rev still advances).
+Fixed: `syncPull` + history publish now run before the snapshot branch,
+under the same mutex — "catch up, reconcile, publish, then capture
+snapshot and cursor".
+
+### Other findings (not yet addressed)
+
+- Attr protocol parity: server emits arbitrary attrs, client.js
+  whitelists a small set — live `data-x` test attrs are ignored by
+  browsers; client patch failures log but revision still advances.
+- Hybrid live+diff invariants: `Dom.findBinding` matches only
+  kind+id+attr (store A→B rebinding leaves stale subscription);
+  `Binder.variant_nodes` borrows render-arena branch trees (lifetime
+  bug on arena reset); `removeTracked` misses nested keyed-list orders
+  and absolute descendant IDs escape prefix cleanup; `when()` eagerly
+  evaluates — it is NOT a live condition binding (only `variant` is).
+- Board projection costs: `childIdx` scans all comments per node —
+  parent/post indexes beat notification-mechanism changes.
+- `Effect.run` executes synchronously inside flush; `Store.set` does
+  not dedupe equal values.
+- Client-local primitives: worthwhile but fixed vocabulary only, explicit
+  ownership (local counter owns its text; server never patches it).
+
+Priority order she gave: (1) snapshot/revision correctness + protocol
+parity, (2) engine ownership/transaction semantics, (3) binding
+lifecycle, (4) projection delivery, (5) package interfaces. First
+milestone: correct snapshots + revisioned dependency-aware projections
+while KEEPING diff rendering — before hybrid rendering.
