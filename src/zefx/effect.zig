@@ -11,6 +11,9 @@ pub fn Effect(comptime Params: type, comptime Result: type, comptime ErrSet: typ
 
         pub const DoneData = struct { params: Params, result: Result };
         pub const FailData = struct { params: Params, err: ErrSet };
+        /// Declared so graph operators (sample targets) can check the
+        /// params type at comptime without unpacking HandlerFn.
+        pub const ParamT = Params;
         pub const FinallyData = union(enum) { done: DoneData, fail: FailData };
         pub const HandlerFn = *const fn (Params) ErrSet!Result;
 

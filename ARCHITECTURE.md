@@ -467,3 +467,24 @@ childIdx/boardPostIdx O(n) scans — strong); dep-regions; memoized
 buildView (unmeasured "half"); numeric Dom ids; shared bytes only
 after proving identical transitions (History takes exclusive
 ownership — needs ownership change anyway).
+
+## zefx core fixes — item 1: sample repair (2026-11)
+
+`sample` rewritten (`src/zefx/sample.zig`):
+- Wires now only SCHEDULE via a new `Engine.sample_queue`; the engine
+  drains it in a post-settle phase (after pure reducers + derived
+  propagation, before watchers/effects) — source reads always see
+  settled state regardless of reducer registration order. Target writes
+  re-enter the settle loop before effects run.
+- `fn_`/`filter` arity follows inputs: `(source, clock)` when both,
+  `(source)` source-only, `(clock)` clock-only. No `fn_` → result is the
+  source snapshot, else the clock payload (clock-only forwarding fixed).
+- Typed units: clock = `*Event`|`*Store` (store clocks fire on
+  `updates()`, payload = new value); source = `*Store`|shape of `*Store`
+  — **event sources rejected at compile time** (no defined latest-value
+  semantics; `forward()` covers event piping and is now clock-only
+  sample). Target = `*Store`/`*Event`/`*Effect` with payload-type checks;
+  effect targets call `.run` (Effect gained `ParamT` decl).
+- Ownership: `Engine.assertSameEngine` panics on cross-engine units —
+  wired into sample, forward, `store.on`/`reset`, `merge`, `split`,
+  `combine`.

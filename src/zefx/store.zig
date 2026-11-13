@@ -153,6 +153,7 @@ pub fn Store(comptime T: type) type {
             ev: anytype, // *Event(SomePayload)
             reduce: *const fn (T, @TypeOf(ev.*).Payload) ?T,
         ) *Self {
+            self.eng.assertSameEngine(ev.eng);
             self.ensureRegistered();
 
             const EvPayload = @TypeOf(ev.*).Payload;
@@ -200,6 +201,7 @@ pub fn Store(comptime T: type) type {
             ev: anytype,
         ) *Self {
             const EvPayload = @TypeOf(ev.*).Payload;
+            self.eng.assertSameEngine(ev.eng);
 
             const ResetCtx = struct {
                 store: *Self,

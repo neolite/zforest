@@ -33,6 +33,10 @@ pub const Engine = struct {
     tick_id: u32 = 1,
     pure_queue: std.ArrayListUnmanaged(Thunk) = .empty,
     effect_queue: std.ArrayListUnmanaged(Thunk) = .empty,
+    /// Post-settle computations (sample wires). Drained only after the
+    /// derived graph has fully settled, so source reads observe final
+    /// state regardless of reducer registration order.
+    sample_queue: std.ArrayListUnmanaged(Thunk) = .empty,
     store_notifiers: std.ArrayListUnmanaged(StoreNotifier) = .empty,
     dirty_indices: std.ArrayListUnmanaged(usize) = .empty,
     graph_cleanups: std.ArrayListUnmanaged(CleanupEntry) = .empty,
@@ -54,6 +58,7 @@ pub const Engine = struct {
         self.tick_arena.deinit();
         self.pure_queue.deinit(self.allocator);
         self.effect_queue.deinit(self.allocator);
+        self.sample_queue.deinit(self.allocator);
         self.store_notifiers.deinit(self.allocator);
         self.dirty_indices.deinit(self.allocator);
         self.after_flush_hooks.deinit(self.allocator);
@@ -111,6 +116,13 @@ pub const Engine = struct {
                 drainQueue(&self.pure_queue);
             }
 
+            // Post-settle phase: sample wires read store/shape sources here,
+            // after every reducer and derived propagation has run. A wire may
+            // enqueue more pure work (target store.set / event.emit /
+            // effect.run) — loop back to re-settle before effects run.
+            drainQueue(&self.sample_queue);
+            if (self.pure_queue.items.len > 0 or self.dirty_indices.items.len > 0) continue;
+
             // Phase 2: effects — the graph is fully settled.
             self.phase = .effects;
             // 2a: view watchers on every store dirtied this tick
@@ -121,7 +133,9 @@ pub const Engine = struct {
             // 2b: event watchers / scheduled effects
             drainQueue(&self.effect_queue);
 
-            if (self.pure_queue.items.len == 0 and self.effect_queue.items.len == 0 and self.dirty_indices.items.len == 0) {
+            if (self.pure_queue.items.len == 0 and self.effect_queue.items.len == 0 and
+                self.dirty_indices.items.len == 0 and self.sample_queue.items.len == 0)
+            {
                 break;
             }
         }
@@ -145,5 +159,17 @@ pub const Engine = struct {
 
     pub fn scheduleEffect(self: *Engine, thunk: Thunk) void {
         self.effect_queue.append(self.allocator, thunk) catch @panic("OOM");
+    }
+
+    /// Queue a post-settle computation (sample wires). Runs after pure
+    /// reducers and derived-store propagation have fully settled.
+    pub fn scheduleSample(self: *Engine, thunk: Thunk) void {
+        self.sample_queue.append(self.allocator, thunk) catch @panic("OOM");
+    }
+
+    /// Graph edges must not cross engines: reducer contexts capture the
+    /// owning engine's queues and tick arena. Panic on mismatch.
+    pub fn assertSameEngine(self: *Engine, other: *Engine) void {
+        if (self != other) @panic("zefx: graph units must belong to the same engine");
     }
 };
