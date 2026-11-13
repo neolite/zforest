@@ -832,12 +832,14 @@ fn sortBar(a: std.mem.Allocator, sort: Sort) forest.Node {
     return forest.el(a, .div, .{ .class = "sort-bar" }, .{
         forest.text("сортировка: "),
         forest.el(a, .button, .{
+            .id = "sort-new",
             .class = if (sort == .new) "mini sort-on" else "mini",
             .on = .{ .click = "sort" },
             .arg = "new",
         }, "новые"),
         forest.text(" "),
         forest.el(a, .button, .{
+            .id = "sort-top",
             .class = if (sort == .top) "mini sort-on" else "mini",
             .on = .{ .click = "sort" },
             .arg = "top",
@@ -1598,8 +1600,12 @@ test "like/sort actions: per-account votes, sort re-keys the group" {
     try std.testing.expectEqual(epoch_before, a.membership_epoch);
     try std.testing.expect(a.group != null);
     try std.testing.expect(std.mem.indexOf(u8, a.group.?.key_string, "top") != null);
+    // The stored Key (not just the string) must carry the sort — the
+    // group's viewEnv renders from it.
+    try std.testing.expectEqual(Sort.top, a.group.?.key.sort);
     try a.dispatch("sort", "new", null, null);
     a.syncMembership();
     try std.testing.expectEqual(Sort.new, a.sort);
+    try std.testing.expectEqual(Sort.new, a.group.?.key.sort);
     try std.testing.expect(std.mem.indexOf(u8, a.group.?.key_string, "new") != null);
 }

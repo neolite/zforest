@@ -71,6 +71,7 @@ pub const RenderGroup = struct {
         return .{
             .route = self.key.route,
             .reply_to = self.key.reply_to,
+            .sort = self.key.sort,
             .name = self.key.name,
             .seen = &self.last_rendered_seq,
         };
@@ -162,12 +163,12 @@ pub fn contains(key: Key) bool {
 /// history/arena, unique incarnation, owned key string. Callers then
 /// either `seed()` (join) or overwrite dom/history/rev (fork) before
 /// `groups.put` + `members = 1`.
-fn createGroup(gpa: std.mem.Allocator, ks: []const u8, route: board_app.Route, reply_to: ?u64) *RenderGroup {
+fn createGroup(gpa: std.mem.Allocator, ks: []const u8, key: Key) *RenderGroup {
     const g = gpa.create(RenderGroup) catch @panic("OOM");
     g.* = .{
         .gpa = gpa,
         .key_string = undefined,
-        .key = .{ .route = route, .reply_to = reply_to, .name = &.{} },
+        .key = .{ .route = key.route, .reply_to = key.reply_to, .name = &.{}, .sort = key.sort },
         .incarnation = next_incarnation,
         .dom = forest.Dom.init(gpa),
         .log = forest.PatchLog.init(gpa),
@@ -192,7 +193,7 @@ pub fn join(gpa: std.mem.Allocator, key: Key) *RenderGroup {
         g.members += 1;
         return g;
     }
-    const g = createGroup(gpa, ks, key.route, key.reply_to);
+    const g = createGroup(gpa, ks, key);
     g.seed();
     groups.put(gpa, g.key_string, g) catch @panic("OOM");
     g.members = 1;
@@ -217,7 +218,7 @@ pub fn fork(gpa: std.mem.Allocator, src: *RenderGroup, key: Key) *RenderGroup {
     var kbuf: [256]u8 = undefined;
     const ks = keyStringInto(&kbuf, key.route, key.reply_to, key.name, key.sort);
     std.debug.assert(groups.get(ks) == null);
-    const g = createGroup(gpa, ks, key.route, key.reply_to);
+    const g = createGroup(gpa, ks, key);
     // The fresh dom/history shells hold no allocations — overwrite.
     g.dom = src.dom.cloneDeep();
     g.history = src.history.cloneDeep();
