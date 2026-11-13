@@ -358,3 +358,44 @@ durability guarantee in the ACK contract.
 Order: fix sample+batching → extract CarModel → owned async
 invocation/completion with controllable test executor → ordered board
 writer. HTTP/SQLite/workers/timers stay outside zefx.
+
+## Per-session state cost → render groups (2026-11)
+
+Inventory: per-session cost is NOT the engine graph (tiny for board:
+ping+seq+after-flush hook) but `Dom` (full client-DOM mirror:
+texts/attrs/when_states/keyed hashmaps), `History` (64 batches/2MB),
+`render_arena`, and — the real multiplier — **work**: every
+`global_seq++` makes EVERY session run buildView (full tree + string
+formatting) + diff + serialize + publish, all serialized on
+`srv.mutex`. N sessions → N full renders per mutation.
+
+Key fact: `buildView` is a pure function of `(route, reply_to,
+user identity, live BoardModel)`; `seen_seq` is a dirty flag, not an
+input (updated inside buildView). DOM ids are deterministic. Two
+sessions with equal inputs produce byte-identical trees → identical
+diffs → identical ops → identical batches, and their `Dom`s stay
+equivalent forever (same view sequence). `History.fetch` already
+supports multiple cursors on one ring.
+
+**Render groups**: `Session.group: *RenderGroup{key=(route,reply_to,
+user_name), dom, history, view_sig}`. One buildView+diff+serialize per
+group per flush; shared History serves all SSE cursors. Memory:
+Dom+history per group not per session (32 lurker sessions → ~1-3
+mirrors). Fork on divergence: join existing group free (Dom already
+matches), or clone Dom O(nodes)+copy ring once — rare (reply click).
+Everything stays under `srv.mutex`; shared frame arena for buildView
+is safe. Caveat: distinct names/reply_to fragment groups; lurkers
+share 1-2 groups per route.
+
+Do NOT: clone engine graphs (pointer soup, and board's is tiny); share
+mutable Dom across differing view-inputs; dedupe by cookie (two tabs
+same user/route differ in reply_to → correctly different groups).
+
+Cheaper independent layers: memoized buildView per flush (~half the
+win, no COW); dep-regions (dirty regions by touched{post_id,parent_id}
+— also shareable per region); numeric Dom ids instead of string paths;
+two-tier global projections (global engine computes lists/counts once —
+complements, doesn't replace, groups); lazy render when no SSE
+subscriber. Todo/car are inherently per-session; zmon already on
+live-bindings. Render groups are the board-specific fix for the main
+multiplier.
