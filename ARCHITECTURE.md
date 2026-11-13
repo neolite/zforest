@@ -498,3 +498,30 @@ Two defects from the render-groups review, both fixed:
   reloads on that event and the reconnect gets a fresh snapshot — no
   client change. A→B→A recreation can't alias: incarnations never
   repeat within a store.
+
+---
+
+## Board model indexes (2026-11)
+
+`BoardModel` keeps maintained indexes so every view-path lookup is
+O(matches), not O(all rows) — the `childIdx`-per-comment-node scan was
+O(comments²) per thread render. Added: `post_by_id`/`comment_by_id`
+(id → `items` index; `post`/`comment`/`findPost`/`findComment` and
+addComment's post/parent validation, incl. the commentView ancestor
+walk, are now O(1)); `posts_by_board` (slug →
+`StringHashMapUnmanaged(ArrayListUnmanaged(usize))`, keys borrow
+`Post.board` slices so index teardown must precede freeing post
+strings); `tops_by_post` + `children_by_parent` (post id / parent
+comment id → ascending comment indices — the `parent == null`
+partition is identical to the old scan filters). All lists preserve
+`items` insertion order; `boardPostIdx` walks its ascending list
+backward for newest-first, same order as the old collect+reverse.
+Maintenance: `indexPost`/`indexComment` run right after the append on
+the only mutation paths (`load`, `addPost`, `addComment` — verified
+no delete/reorder exists); `indexComment` subsumes the old
+`noteComment`/`post_counts` update. Query signatures and the
+`![]usize`-in-arena return contract are unchanged (result slices are
+still arena-allocated copies — O(matches), never borrowed, so no
+cross-mutation dangling). Memory O(posts+comments). Covered by a test
+comparing all three idx fns + id lookups against copies of the old
+scans, plus load-path checks in the persist/reload test.

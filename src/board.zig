@@ -118,6 +118,19 @@ pub const BoardModel = struct {
     /// post id -> comment count, maintained on load/addComment so
     /// `commentCount` is O(1) instead of a full scan per post card.
     post_counts: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    /// Maintained indexes (load + addPost/addComment — there is no
+    /// delete path) so view lookups are O(matches), not O(all rows):
+    /// `post_by_id`/`comment_by_id` map ids to `items` indices;
+    /// `posts_by_board` maps a board slug to ascending post indices
+    /// (keys borrow `Post.board` slices — deinit order matters);
+    /// `tops_by_post`/`children_by_parent` map a post id / parent
+    /// comment id to ascending comment indices. All lists keep
+    /// `items` insertion order, identical to the old full scans.
+    post_by_id: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+    comment_by_id: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+    posts_by_board: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) = .empty,
+    tops_by_post: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(usize)) = .empty,
+    children_by_parent: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(usize)) = .empty,
     /// Shared id space across posts+comments: display "#N".
     next_id: u64 = 1,
     /// Bumped on every mutation; sessions poll it for cross-session fan-out.
@@ -138,6 +151,20 @@ pub const BoardModel = struct {
     }
 
     pub fn deinit(self: *BoardModel) void {
+        // Index teardown first: `posts_by_board` keys borrow
+        // `Post.board` slices, so the maps must go before the post
+        // strings they point into are freed.
+        var pbit = self.posts_by_board.iterator();
+        while (pbit.next()) |e| e.value_ptr.deinit(self.gpa);
+        self.posts_by_board.deinit(self.gpa);
+        var tbit = self.tops_by_post.iterator();
+        while (tbit.next()) |e| e.value_ptr.deinit(self.gpa);
+        self.tops_by_post.deinit(self.gpa);
+        var cbit = self.children_by_parent.iterator();
+        while (cbit.next()) |e| e.value_ptr.deinit(self.gpa);
+        self.children_by_parent.deinit(self.gpa);
+        self.post_by_id.deinit(self.gpa);
+        self.comment_by_id.deinit(self.gpa);
         for (self.posts.items) |p| {
             self.gpa.free(p.board);
             self.gpa.free(p.user);
@@ -205,6 +232,7 @@ pub const BoardModel = struct {
                     self.gpa.free(p.text);
                 }
                 try self.posts.append(self.gpa, p);
+                self.indexPost(self.posts.items.len - 1);
                 self.next_id = @max(self.next_id, p.id + 1);
             }
         }
@@ -226,8 +254,8 @@ pub const BoardModel = struct {
                     self.gpa.free(c.text);
                 }
                 try self.comments.append(self.gpa, c);
+                self.indexComment(self.comments.items.len - 1);
                 self.next_id = @max(self.next_id, c.id + 1);
-                self.noteComment(c.post);
             }
         }
     }
@@ -267,17 +295,11 @@ pub const BoardModel = struct {
     }
 
     fn findPost(self: *const BoardModel, id: u64) ?usize {
-        for (self.posts.items, 0..) |p, i| {
-            if (p.id == id) return i;
-        }
-        return null;
+        return self.post_by_id.get(id);
     }
 
     fn findComment(self: *const BoardModel, id: u64) ?usize {
-        for (self.comments.items, 0..) |c, i| {
-            if (c.id == id) return i;
-        }
-        return null;
+        return self.comment_by_id.get(id);
     }
 
     pub fn post(self: *const BoardModel, id: u64) ?*const Post {
@@ -291,13 +313,17 @@ pub const BoardModel = struct {
     }
 
     /// Newest-first post indices for a board — allocated in `a`.
+    /// Reads the `posts_by_board` index (ascending) backward instead of
+    /// scanning every post.
     pub fn boardPostIdx(self: *const BoardModel, a: std.mem.Allocator, board: []const u8) ![]usize {
         var out: std.ArrayListUnmanaged(usize) = .empty;
-        for (self.posts.items, 0..) |p, i| {
-            if (std.mem.eql(u8, p.board, board)) try out.append(a, i);
+        if (self.posts_by_board.get(board)) |l| {
+            var i = l.items.len;
+            while (i > 0) {
+                i -= 1;
+                try out.append(a, l.items[i]);
+            }
         }
-        // Reverse into newest-first.
-        std.mem.reverse(usize, out.items);
         return out.toOwnedSlice(a);
     }
 
@@ -312,27 +338,52 @@ pub const BoardModel = struct {
         return out.toOwnedSlice(a);
     }
 
-    /// Top-level comments of a post (parent == null), ascending id.
+    /// Top-level comments of a post (parent == null), ascending id —
+    /// served by the `tops_by_post` index.
     pub fn topCommentIdx(self: *const BoardModel, a: std.mem.Allocator, post_id: u64) ![]usize {
         var out: std.ArrayListUnmanaged(usize) = .empty;
-        for (self.comments.items, 0..) |c, i| {
-            if (c.post == post_id and c.parent == null) try out.append(a, i);
-        }
+        if (self.tops_by_post.get(post_id)) |l| try out.appendSlice(a, l.items);
         return out.toOwnedSlice(a);
     }
 
     /// Children of a comment (parent == id), ascending id — the recursive
-    /// tree walk used by the view layer.
+    /// tree walk used by the view layer, served by `children_by_parent`.
     pub fn childIdx(self: *const BoardModel, a: std.mem.Allocator, parent_id: u64) ![]usize {
         var out: std.ArrayListUnmanaged(usize) = .empty;
-        for (self.comments.items, 0..) |c, i| {
-            if (c.parent != null and c.parent.? == parent_id) try out.append(a, i);
-        }
+        if (self.children_by_parent.get(parent_id)) |l| try out.appendSlice(a, l.items);
         return out.toOwnedSlice(a);
     }
 
-    fn noteComment(self: *BoardModel, post_id: u64) void {
-        const gop = self.post_counts.getOrPut(self.gpa, post_id) catch @panic("OOM");
+    /// Maintain every index derived from `posts.items[idx]` — called
+    /// right after the append in `load`/`addPost`, the only mutation
+    /// paths (there is no delete).
+    fn indexPost(self: *BoardModel, idx: usize) void {
+        const p = &self.posts.items[idx];
+        self.post_by_id.put(self.gpa, p.id, idx) catch @panic("OOM");
+        const gop = self.posts_by_board.getOrPut(self.gpa, p.board) catch @panic("OOM");
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        gop.value_ptr.*.append(self.gpa, idx) catch @panic("OOM");
+    }
+
+    /// Maintain every index derived from `comments.items[idx]` — the
+    /// comment counterpart of `indexPost`; also folds in the old
+    /// `noteComment` post-count update. `tops_by_post` and
+    /// `children_by_parent` partition the comments exactly like the
+    /// old scans: parent == null goes to the post's top list, anything
+    /// else to the parent's child list.
+    fn indexComment(self: *BoardModel, idx: usize) void {
+        const c = &self.comments.items[idx];
+        self.comment_by_id.put(self.gpa, c.id, idx) catch @panic("OOM");
+        if (c.parent) |pid| {
+            const gop = self.children_by_parent.getOrPut(self.gpa, pid) catch @panic("OOM");
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            gop.value_ptr.*.append(self.gpa, idx) catch @panic("OOM");
+        } else {
+            const gop = self.tops_by_post.getOrPut(self.gpa, c.post) catch @panic("OOM");
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            gop.value_ptr.*.append(self.gpa, idx) catch @panic("OOM");
+        }
+        const gop = self.post_counts.getOrPut(self.gpa, c.post) catch @panic("OOM");
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* += 1;
     }
@@ -364,6 +415,7 @@ pub const BoardModel = struct {
             .ts = ts,
         };
         self.posts.append(self.gpa, p) catch @panic("OOM");
+        self.indexPost(self.posts.items.len - 1);
         self.next_id += 1;
         self.bump();
         return p;
@@ -399,8 +451,8 @@ pub const BoardModel = struct {
             .ts = ts,
         };
         self.comments.append(self.gpa, c) catch @panic("OOM");
+        self.indexComment(self.comments.items.len - 1);
         self.next_id += 1;
-        self.noteComment(post_id);
         self.bump();
         return c;
     }
@@ -467,6 +519,99 @@ test "board model: add/load, ordering, ids, validation" {
     try std.testing.expect(seq >= 5); // 2 posts + 3 comments
 }
 
+test "board indexes reproduce the old scan semantics and track addComment" {
+    const alloc = std.testing.allocator;
+    var m = try BoardModel.init(alloc, ":memory:");
+    defer m.deinit();
+
+    _ = try m.ensureUser("tok-idx");
+    const p1 = try m.addPost("b", "tok-idx", "alpha");
+    const p2 = try m.addPost("tech", "tok-idx", "beta");
+    const p3 = try m.addPost("b", "tok-idx", "gamma");
+    const c1 = try m.addComment(p1.id, null, "tok-idx", "t1");
+    const c2 = try m.addComment(p1.id, c1.id, "tok-idx", "r1");
+    const c3 = try m.addComment(p2.id, null, "tok-idx", "other post");
+    const c4 = try m.addComment(p1.id, null, "tok-idx", "t2");
+    const c5 = try m.addComment(p1.id, c2.id, "tok-idx", "r2");
+    _ = c3;
+    _ = c5;
+
+    // Reference copies of the pre-index scans — the contract the
+    // indexes must reproduce exactly (order + contents).
+    const RefScan = struct {
+        fn tops(mm: *const BoardModel, post_id: u64, a: std.mem.Allocator) ![]usize {
+            var out: std.ArrayListUnmanaged(usize) = .empty;
+            for (mm.comments.items, 0..) |c, i| {
+                if (c.post == post_id and c.parent == null) try out.append(a, i);
+            }
+            return out.toOwnedSlice(a);
+        }
+        fn kids(mm: *const BoardModel, parent_id: u64, a: std.mem.Allocator) ![]usize {
+            var out: std.ArrayListUnmanaged(usize) = .empty;
+            for (mm.comments.items, 0..) |c, i| {
+                if (c.parent != null and c.parent.? == parent_id) try out.append(a, i);
+            }
+            return out.toOwnedSlice(a);
+        }
+        fn boardPosts(mm: *const BoardModel, slug: []const u8, a: std.mem.Allocator) ![]usize {
+            var out: std.ArrayListUnmanaged(usize) = .empty;
+            for (mm.posts.items, 0..) |p, i| {
+                if (std.mem.eql(u8, p.board, slug)) try out.append(a, i);
+            }
+            std.mem.reverse(usize, out.items);
+            return out.toOwnedSlice(a);
+        }
+    };
+
+    const expectSame = struct {
+        fn f(a: std.mem.Allocator, got: []usize, want: []usize) !void {
+            defer a.free(got);
+            defer a.free(want);
+            try std.testing.expectEqual(want.len, got.len);
+            for (want, got) |w, g| try std.testing.expectEqual(w, g);
+        }
+    }.f;
+
+    // Every query shape agrees with the scans, for present and absent keys.
+    for ([_]u64{ p1.id, p2.id, p3.id, 999 }) |pid| {
+        try expectSame(alloc, try m.topCommentIdx(alloc, pid), try RefScan.tops(m, pid, alloc));
+    }
+    for (m.comments.items) |c| {
+        try expectSame(alloc, try m.childIdx(alloc, c.id), try RefScan.kids(m, c.id, alloc));
+    }
+    for (boards) |b| {
+        try expectSame(alloc, try m.boardPostIdx(alloc, b.slug), try RefScan.boardPosts(m, b.slug, alloc));
+    }
+
+    // Id lookups resolve to the same rows a scan would have found.
+    for (m.posts.items, 0..) |p, i| {
+        try std.testing.expectEqual(i, m.findPost(p.id).?);
+        try std.testing.expect(m.post(p.id).? == &m.posts.items[i]);
+    }
+    for (m.comments.items, 0..) |c, i| {
+        try std.testing.expectEqual(i, m.findComment(c.id).?);
+        try std.testing.expect(m.comment(c.id).? == &m.comments.items[i]);
+    }
+
+    // addComment updates the indexes immediately, preserving order.
+    const c6 = try m.addComment(p1.id, c4.id, "tok-idx", "late reply");
+    const c7 = try m.addComment(p1.id, c1.id, "tok-idx", "second reply");
+    const kids1 = try m.childIdx(alloc, c1.id);
+    defer alloc.free(kids1);
+    try std.testing.expectEqual(@as(usize, 2), kids1.len);
+    try std.testing.expectEqual(c2.id, m.comments.items[kids1[0]].id);
+    try std.testing.expectEqual(c7.id, m.comments.items[kids1[1]].id);
+    const kids4 = try m.childIdx(alloc, c4.id);
+    defer alloc.free(kids4);
+    try std.testing.expectEqual(@as(usize, 1), kids4.len);
+    try std.testing.expectEqual(c6.id, m.comments.items[kids4[0]].id);
+    const tops = try m.topCommentIdx(alloc, p1.id);
+    defer alloc.free(tops);
+    try std.testing.expectEqual(@as(usize, 2), tops.len);
+    try std.testing.expectEqual(c1.id, m.comments.items[tops[0]].id);
+    try std.testing.expectEqual(c4.id, m.comments.items[tops[1]].id);
+}
+
 test "board model: ensureUser bumps global_seq only on real mutation" {
     const alloc = std.testing.allocator;
     var m = try BoardModel.init(alloc, ":memory:");
@@ -497,6 +642,8 @@ test "board model persists and reloads from a file db" {
         var m = try BoardModel.init(alloc, path);
         _ = try m.ensureUser("tok-persist");
         _ = try m.addPost("tech", "tok-persist", "survives restart");
+        const c = try m.addComment(1, null, "tok-persist", "persisted comment");
+        _ = try m.addComment(1, c.id, "tok-persist", "persisted reply");
         m.deinit();
     }
     {
@@ -505,6 +652,13 @@ test "board model persists and reloads from a file db" {
         try std.testing.expectEqual(@as(usize, 1), m.posts.items.len);
         try std.testing.expectEqualStrings("survives restart", m.posts.items[0].text);
         try std.testing.expectEqualStrings("Anon#1", m.userName("tok-persist").?);
+        // Indexes were rebuilt by load(): tops/kids resolve without scans.
+        const tops = try m.topCommentIdx(alloc, 1);
+        defer alloc.free(tops);
+        try std.testing.expectEqual(@as(usize, 1), tops.len);
+        const kids = try m.childIdx(alloc, m.comments.items[tops[0]].id);
+        defer alloc.free(kids);
+        try std.testing.expectEqual(@as(usize, 1), kids.len);
         // next_id continues the shared sequence.
         const p = try m.addPost("b", "tok-persist", "second life");
         try std.testing.expect(p.id > 1);
