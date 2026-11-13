@@ -586,10 +586,12 @@ fn postCard(a: std.mem.Allocator, p: *const board.Post, show_link: bool) forest.
             }, .{}),
             forest.text(" "),
             forest.el(a, .button, .{
+                .id = std.fmt.allocPrint(a, "like-p{d}", .{p.id}) catch @panic("OOM"),
                 .class = "like-btn",
                 .on = .{ .click = "like" },
                 .arg = likeArg(a, 'p', p.id),
-            }, likeLabel(a, lcount)),
+                .text = likeLabel(a, lcount),
+            }, .{}),
         })) catch @panic("OOM");
     }
     return forest.el(a, .div, .{
@@ -707,10 +709,12 @@ fn commentNode(a: std.mem.Allocator, env: ViewEnv, c: *const board.Comment, post
         }, "ответить"),
         forest.text(" "),
         forest.el(a, .button, .{
+            .id = std.fmt.allocPrint(a, "like-c{d}", .{c.id}) catch @panic("OOM"),
             .class = "like-btn",
             .on = .{ .click = "like" },
             .arg = likeArg(a, 'c', c.id),
-        }, likeLabel(a, mm.likeCount(c.id))),
+            .text = likeLabel(a, mm.likeCount(c.id)),
+        }, .{}),
     })) catch @panic("OOM");
     kids.append(a, forest.el(a, .div, .{ .class = "ctext" }, c.text)) catch @panic("OOM");
     // Inline reply form mounts between the text and the children list.
