@@ -104,6 +104,9 @@ const Page = struct {
     /// Indices into the app's layout list, outermost first — the
     /// generated view wraps `page.view` with each in turn.
     wraps: []const usize = &.{},
+    /// `pages/api/` endpoint — not a page route; dispatched through
+    /// `parseApi`/`api` instead of `parseRoute`/`viewNodes`.
+    is_api: bool = false,
 };
 
 /// A `pages/**/_layout.zig` file: `dir` is its directory relative to
@@ -194,7 +197,19 @@ fn genApp(io: Io, arena: Allocator, app_dir: []const u8) !void {
             try page_rels.append(arena, rel);
         }
     }
-    if (page_rels.items.len == 0) return error.FileNotFound;
+
+    // `pages/api/` files are endpoints, not page routes — separate
+    // union/dispatch, no layouts.
+    var api_rels: std.ArrayList([]const u8) = .empty;
+    var real_page_rels: std.ArrayList([]const u8) = .empty;
+    for (page_rels.items) |rel| {
+        if (std.mem.startsWith(u8, rel, "pages/api/")) {
+            try api_rels.append(arena, rel);
+        } else {
+            try real_page_rels.append(arena, rel);
+        }
+    }
+    if (real_page_rels.items.len == 0 and api_rels.items.len == 0) return error.FileNotFound;
 
     // Sort layouts outermost-first (shallowest dir, then lexicographic)
     // so `wraps` indices compose root → leaf.
@@ -207,17 +222,25 @@ fn genApp(io: Io, arena: Allocator, app_dir: []const u8) !void {
         }
     }.lt);
 
-    var parsed = try arena.alloc(Page, page_rels.items.len);
-    for (page_rels.items, 0..) |rel, i| {
+    var parsed = try arena.alloc(Page, real_page_rels.items.len);
+    for (real_page_rels.items, 0..) |rel, i| {
         const src = try readAppFile(io, arena, app_dir, rel);
-        parsed[i] = try buildPage(arena, rel, src);
+        parsed[i] = try buildPage(arena, rel, src, false);
         parsed[i].wraps = try pageWraps(arena, rel, layouts.items);
     }
     try checkConflicts(parsed);
     std.mem.sort(Page, parsed, {}, pageLessThan);
 
+    var apis = try arena.alloc(Page, api_rels.items.len);
+    for (api_rels.items, 0..) |rel, i| {
+        const src = try readAppFile(io, arena, app_dir, rel);
+        apis[i] = try buildPage(arena, rel, src, true);
+    }
+    try checkConflicts(apis);
+    std.mem.sort(Page, apis, {}, pageLessThan);
+
     const zmeta_path = try zmetaImportPath(io, arena, app_dir);
-    const routes_src = try emitRoutes(arena, zmeta_path, parsed, layouts.items);
+    const routes_src = try emitRoutes(arena, zmeta_path, parsed, apis, layouts.items);
     const actions_src = try emitActions(io, arena, app_dir);
 
     const gen_rel = try std.fmt.allocPrint(arena, "{s}/gen", .{app_dir});
@@ -309,23 +332,24 @@ fn pageWraps(arena: Allocator, rel: []const u8, layouts: []const Layout) GenErro
 
 /// Build a Page from a page file's source: route segments from the
 /// path, params fields + optional route_name from the decls.
-fn buildPage(arena: Allocator, rel: []const u8, src: []const u8) GenError!Page {
-    const segs = try routeSegments(arena, rel);
+fn buildPage(arena: Allocator, rel: []const u8, src: []const u8, api: bool) GenError!Page {
+    const segs = try routeSegments(arena, rel, api);
     const params = parseParams(arena, src) orelse return error.BadParams;
     try checkParamSegments(segs, params);
 
     const tag = if (parseRouteName(src)) |rn| rn else try deriveTag(arena, segs);
     if (!std.zig.isValidId(tag)) return error.BadRouteName;
-    return .{ .rel = rel, .segs = segs, .params = params, .tag = tag };
+    return .{ .rel = rel, .segs = segs, .params = params, .tag = tag, .is_api = api };
 }
 
 /// "pages/item/[id].zig" → segs [static "item", dynamic "id"];
 /// "pages/index.zig" → [] (route "/"). A trailing "index" file stem
 /// contributes no segment; "index" elsewhere is a literal segment.
-fn routeSegments(arena: Allocator, rel: []const u8) GenError![]const Seg {
-    if (!std.mem.startsWith(u8, rel, "pages/")) return error.BadSegment;
+fn routeSegments(arena: Allocator, rel: []const u8, api: bool) GenError![]const Seg {
+    const prefix = if (api) "pages/api/" else "pages/";
+    if (!std.mem.startsWith(u8, rel, prefix)) return error.BadSegment;
     if (!std.mem.endsWith(u8, rel, ".zig")) return error.BadSegment;
-    var body = rel["pages/".len .. rel.len - ".zig".len];
+    var body = rel[prefix.len .. rel.len - ".zig".len];
     if (std.mem.eql(u8, body, "index")) {
         body = "";
     } else if (std.mem.endsWith(u8, body, "/index")) {
@@ -576,7 +600,7 @@ fn pageLessThan(_: void, a: Page, b: Page) bool {
 // emission: routes.zig
 // ─────────────────────────────────────────────
 
-fn emitRoutes(arena: Allocator, zmeta_path: []const u8, pages: []const Page, layouts: []const Layout) ![]const u8 {
+fn emitRoutes(arena: Allocator, zmeta_path: []const u8, pages: []const Page, apis: []const Page, layouts: []const Layout) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     const w = &out.writer;
 
@@ -593,6 +617,9 @@ fn emitRoutes(arena: Allocator, zmeta_path: []const u8, pages: []const Page, lay
     try w.writeAll("\");\n\n");
     for (pages) |p| {
         try w.print("const {s}_page = @import(\"../{s}\");\n", .{ p.tag, p.rel });
+    }
+    for (apis) |p| {
+        try w.print("const {s}_api = @import(\"../{s}\");\n", .{ p.tag, p.rel });
     }
     // Layout imports — only the ones some page actually wraps with.
     var used = std.AutoHashMap(usize, void).init(arena);
@@ -676,7 +703,7 @@ fn emitRoutes(arena: Allocator, zmeta_path: []const u8, pages: []const Page, lay
     );
     for (pages) |p| {
         if (p.segs.len == 0) continue; // "/" handled above
-        try emitRouteMatch(arena, w, p);
+        try emitRouteMatch(arena, w, p, "Route");
     }
     try w.writeAll(
         \\        break :result null;
@@ -697,9 +724,17 @@ fn emitRoutes(arena: Allocator, zmeta_path: []const u8, pages: []const Page, lay
         \\    return true;
         \\}
         \\
-        \\/// Pure route pre-check for the server's validPath hook.
+        \\/// Pure route pre-check for the server's validPath hook —
+        \\/// accepts api paths too when the app has pages/api/.
         \\pub fn validPath(path: []const u8) bool {
-        \\    return parseRoute(path) != null;
+        \\
+    );
+    if (apis.len != 0) {
+        try w.writeAll("    return parseRoute(path) != null or apiPath(path);\n");
+    } else {
+        try w.writeAll("    return parseRoute(path) != null;\n");
+    }
+    try w.writeAll(
         \\}
         \\
     );
@@ -765,6 +800,94 @@ fn emitRoutes(arena: Allocator, zmeta_path: []const u8, pages: []const Page, lay
         \\}
         \\
     );
+
+    // ── api endpoints (pages/api/) — JSON, no view/layouts ──
+    if (apis.len != 0) {
+        try w.writeAll(
+            \\/// Typed api route — one tag per `pages/api/` file.
+            \\/// Endpoint handlers return a JSON body; they never
+            \\/// produce forest nodes.
+            \\pub const ApiRoute = union(enum) {
+            \\
+        );
+        for (apis) |p| {
+            try w.print("    {s}: {s}_api.params,\n", .{ p.tag, p.tag });
+        }
+        try w.writeAll("};\n\n");
+
+        // parseApi — same segment machinery as parseRoute, but the
+        // "/api" prefix is stripped first; "/api" and "/api/" both
+        // reach the api index page (or null when there is none).
+        var api_index: ?[]const u8 = null;
+        var api_max_depth: usize = 0;
+        for (apis) |p| {
+            api_max_depth = @max(api_max_depth, p.segs.len);
+            if (p.segs.len == 0) api_index = p.tag;
+        }
+        const api_buf = @max(@as(usize, 1), api_max_depth);
+        try w.writeAll(
+            \\/// Parse an api endpoint path ("/api/..." — "/api" and
+            \\/// "/api/" both mean the index endpoint). Same segment
+            \\/// rules and precedence as parseRoute.
+            \\pub fn parseApi(target: []const u8) ?ApiRoute {
+            \\    if (std.mem.eql(u8, target, "/api") or std.mem.eql(u8, target, "/api/")) {
+            \\
+        );
+        if (api_index) |t| {
+            try w.print("        return ApiRoute{{ .{s} = .{{}} }};\n", .{t});
+        } else {
+            try w.writeAll("        return null;\n");
+        }
+        try w.writeAll(
+            \\    }
+            \\    if (!std.mem.startsWith(u8, target, "/api/")) return null;
+            \\    const path = target[4..];
+            \\    var segs: [
+        );
+        try w.print("{d}", .{api_buf});
+        try w.writeAll(
+            \\][]const u8 = undefined;
+            \\    var n: usize = 0;
+            \\    var it = std.mem.splitScalar(u8, path[1..], '/');
+            \\    while (it.next()) |seg| {
+            \\        if (n < segs.len) segs[n] = seg;
+            \\        n += 1;
+            \\    }
+            \\    return result: {
+            \\
+        );
+        for (apis) |p| {
+            if (p.segs.len == 0) continue; // "/api" handled above
+            try emitRouteMatch(arena, w, p, "ApiRoute");
+        }
+        try w.writeAll(
+            \\        break :result null;
+            \\    };
+            \\}
+            \\
+            \\/// Pure api-route pre-check — pairs with `validPath`.
+            \\pub fn apiPath(path: []const u8) bool {
+            \\    return parseApi(path) != null;
+            \\}
+            \\
+            \\/// Endpoint dispatch: returns the handler's JSON body,
+            \\/// or null when `path` isn't an api route. `a` is the
+            \\/// caller's arena; `env` carries route+query.
+            \\pub fn api(a: std.mem.Allocator, s: anytype, path: []const u8, env: *const zmeta.Env) !?[]const u8 {
+            \\    const r = parseApi(path) orelse return null;
+            \\    const body = switch (r) {
+            \\
+        );
+        for (apis) |p| {
+            try w.print("        .{s} => |p| try {s}_api.api(a, s, p, env),\n", .{ p.tag, p.tag });
+        }
+        try w.writeAll(
+            \\    };
+            \\    return body;
+            \\}
+            \\
+        );
+    }
     return out.toOwnedSlice() catch return error.OutOfMemory;
 }
 
@@ -790,7 +913,7 @@ fn emitViewNodesWraps(arena: Allocator, w: *std.Io.Writer, p: Page, layouts: []c
 }
 
 /// One route's match arm inside parseRoute's `result:` block.
-fn emitRouteMatch(arena: Allocator, w: *std.Io.Writer, p: Page) !void {
+fn emitRouteMatch(arena: Allocator, w: *std.Io.Writer, p: Page, comptime union_name: []const u8) !void {
     const last = if (p.segs.len > 0) p.segs[p.segs.len - 1] else null;
     const has_catchall = last != null and last.? == .catchall;
     const has_optcatchall = last != null and last.? == .optcatchall;
@@ -862,10 +985,10 @@ fn emitRouteMatch(arena: Allocator, w: *std.Io.Writer, p: Page) !void {
     }
     // Construct the payload in params-declaration order.
     if (p.params.len == 0) {
-        try w.print("            break :result Route{{ .{s} = .{{}} }};\n        }}\n", .{p.tag});
+        try w.print("            break :result {s}{{ .{s} = .{{}} }};\n        }}\n", .{ union_name, p.tag });
         return;
     }
-    try w.print("            break :result Route{{ .{s} = .{{ ", .{p.tag});
+    try w.print("            break :result {s}{{ .{s} = .{{ ", .{ union_name, p.tag });
     for (p.params, 0..) |param, i| {
         if (i != 0) try w.writeAll(", ");
         try w.print(".{s} = {s}", .{ param.name, param.name });
@@ -1123,7 +1246,7 @@ test "routeSegments maps page paths to route segments" {
         .{ .rel = "pages/[[...rest]].zig", .want = &.{.{ .optcatchall = "rest" }} },
     };
     for (cases) |c| {
-        const segs = try routeSegments(arena, c.rel);
+        const segs = try routeSegments(arena, c.rel, false);
         try std.testing.expectEqual(c.want.len, segs.len);
         for (c.want, segs) |w, g| {
             switch (w) {
@@ -1138,14 +1261,14 @@ test "routeSegments maps page paths to route segments" {
 
 test "routeSegments rejects malformed paths" {
     const arena = std.testing.allocator;
-    try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/[...rest]/x.zig")); // catch-all must be last
-    try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/[[...rest]]/x.zig")); // optional catch-all must be last
-    try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/[[...]].zig"));
-    try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/[[rest]].zig")); // no "..." prefix
-    try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/[...].zig"));
-    try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/[]/x.zig"));
-    try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/a[0].zig"));
-    try std.testing.expectError(error.BadSegment, routeSegments(arena, "notpages/x.zig"));
+    try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/[...rest]/x.zig", false)); // catch-all must be last
+    try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/[[...rest]]/x.zig", false)); // optional catch-all must be last
+    try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/[[...]].zig", false));
+    try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/[[rest]].zig", false)); // no "..." prefix
+    try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/[...].zig", false));
+    try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/[]/x.zig", false));
+    try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/a[0].zig", false));
+    try std.testing.expectError(error.BadSegment, routeSegments(arena, "notpages/x.zig", false));
 }
 
 test "parseParams extracts flat int fields" {

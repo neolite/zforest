@@ -47,7 +47,8 @@ pub fn setRoute(s: anytype, path: []const u8) bool {
     return true;
 }
 
-/// Pure route pre-check for the server's validPath hook.
+/// Pure route pre-check for the server's validPath hook —
+/// accepts api paths too when the app has pages/api/.
 pub fn validPath(path: []const u8) bool {
     return parseRoute(path) != null;
 }

@@ -48,7 +48,8 @@ src/apps/<name>/
 │   │   └── [tag].zig "/tag/:tag" — string segment (`[]const u8`)
 │   └── docs/
 │       ├── [...rest].zig  "/docs/*" — catch-all remainder (last only)
-│       └── [[...rest]].zig "/wiki/*" — OPTIONAL catch-all: also "/wiki" 
+│       ├── [[...rest]].zig "/wiki/*" — OPTIONAL catch-all: also "/wiki"
+│       └── api/ping.zig   "/api/ping" — JSON endpoint, no view
 ├── actions.zig       action-name manifest (one per line-ish list)
 ├── app.zig           Deps: model, on_<action> handlers, prepare/view glue
 └── gen/              GENERATED — routes.zig + actions.zig (checked in)
@@ -63,6 +64,7 @@ src/zmeta_demo_main.zig  executable entry point (flat src/ placement)
 | `app/` or `pages/` dir | `src/apps/<name>/pages/` | file = route, `[id].zig` = dynamic segment |
 | dynamic route params | `pub const params = struct { id: u64 }` or `{ tag: []const u8 }` | typed at compile time; int segments parse, string segments slice; `[...rest]` catch-all (last only) takes the raw tail, `[[...rest]]` is the optional variant (matches the bare prefix too); failures → 404 |
 | `getServerSideProps` / middleware gate | `pub fn prepare(...) !void` | runs before view; `error.NotFound` → 404 |
+| API routes | `pages/api/<name>.zig` → `pub fn api(a, s, p, env) ![]const u8` | GET /api/* → JSON body, no HTML shell; `Deps.serveApi` dispatches |
 | server component | `pub fn view(a, s, p, env) h.Node` | returns a `forest.Node` tree via `h.*` |
 | server actions / API routes | `actions.zig` manifest + `on_<name>` in app.zig | POST `/action` → ACK `{rev}`; SSE carries the patch |
 | hydration / RSC payload | **none** | SSR HTML + `client.js` applies serialized ops; no client tree exists |

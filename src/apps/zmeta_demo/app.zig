@@ -86,6 +86,20 @@ pub const DemoDeps = struct {
         return routes.viewNodes(a, s, env);
     }
 
+    /// GET /api/* — generated dispatch to `pages/api/` handlers; a
+    /// per-request arena owns the JSON body (freed on return).
+    /// false → not an api path → normal page handling.
+    pub fn serveApi(s: *Session, path: []const u8, writer: anytype) !bool {
+        var arena = std.heap.ArenaAllocator.init(s.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const env = zmeta.Env{ .route = path, .query = s.query };
+        const body = routes.api(a, s, path, &env) catch return error.ApiFailed;
+        const b = body orelse return false;
+        try writer.writeAll(b);
+        return true;
+    }
+
     /// Whitelisted action entry — generated dispatch to `on_<name>`.
     pub fn dispatch(
         s: *Session,

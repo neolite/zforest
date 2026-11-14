@@ -281,6 +281,15 @@ fn SessionMethods(comptime Deps: type) type {
             if (@hasDecl(Deps, "readCookies")) Deps.readCookies(self, cookie_hdr);
         }
 
+        /// Api-endpoint hook for GET /api/* — forwarded to
+        /// `Deps.serveApi` when declared; default false → the request
+        /// falls through to page handling (404 for unknown paths).
+        /// Writes a JSON body; the server skips the HTML shell.
+        pub fn serveApi(self: anytype, path: []const u8, writer: anytype) !bool {
+            if (@hasDecl(Deps, "serveApi")) return Deps.serveApi(self, path, writer);
+            return false;
+        }
+
         /// Full-page render for a navigating client: resolve the route,
         /// run the optional prepare gate, drop tracked DOM state, write
         /// the page body, then reseed so subsequent diffs emit only real
@@ -518,6 +527,7 @@ fn SessionPlain(comptime Deps: type) type {
         pub const setQuery = M.setQuery;
         pub const validPath = M.validPath;
         pub const readCookies = M.readCookies;
+        pub const serveApi = M.serveApi;
         pub const servePage = M.servePage;
         pub const syncPull = M.syncPull;
         pub const bumpSeq = M.bumpSeq;
@@ -597,6 +607,7 @@ fn SessionGrouped(comptime Deps: type) type {
         pub const setQuery = M.setQuery;
         pub const validPath = M.validPath;
         pub const readCookies = M.readCookies;
+        pub const serveApi = M.serveApi;
         pub const servePage = M.servePage;
         pub const syncPull = M.syncPull;
         pub const bumpSeq = M.bumpSeq;

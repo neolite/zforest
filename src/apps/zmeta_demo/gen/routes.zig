@@ -13,6 +13,7 @@ const search_page = @import("../pages/search.zig");
 const structure_page = @import("../pages/structure.zig");
 const tag_page = @import("../pages/tag/[tag].zig");
 const wiki_rest_page = @import("../pages/wiki/[[...rest]].zig");
+const ping_api = @import("../pages/api/ping.zig");
 const lay_root = @import("../pages/_layout.zig");
 
 /// Typed route — one tag per page file. Dynamic `[name]`
@@ -87,9 +88,10 @@ pub fn setRoute(s: anytype, path: []const u8) bool {
     return true;
 }
 
-/// Pure route pre-check for the server's validPath hook.
+/// Pure route pre-check for the server's validPath hook —
+/// accepts api paths too when the app has pages/api/.
 pub fn validPath(path: []const u8) bool {
-    return parseRoute(path) != null;
+    return parseRoute(path) != null or apiPath(path);
 }
 
 /// Type-safe href: `href(a, .{ .item = .{ .id = 3 } })` allocates
@@ -141,4 +143,50 @@ pub fn viewNodes(a: std.mem.Allocator, s: anytype, env: *const zmeta.Env) []cons
         .wiki_rest => |p| lay_root.layout(a, s, env, wiki_rest_page.view(a, s, p, env)),
     };
     return nodes;
+}
+/// Typed api route — one tag per `pages/api/` file.
+/// Endpoint handlers return a JSON body; they never
+/// produce forest nodes.
+pub const ApiRoute = union(enum) {
+    ping: ping_api.params,
+};
+
+/// Parse an api endpoint path ("/api/..." — "/api" and
+/// "/api/" both mean the index endpoint). Same segment
+/// rules and precedence as parseRoute.
+pub fn parseApi(target: []const u8) ?ApiRoute {
+    if (std.mem.eql(u8, target, "/api") or std.mem.eql(u8, target, "/api/")) {
+        return null;
+    }
+    if (!std.mem.startsWith(u8, target, "/api/")) return null;
+    const path = target[4..];
+    var segs: [1][]const u8 = undefined;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, path[1..], '/');
+    while (it.next()) |seg| {
+        if (n < segs.len) segs[n] = seg;
+        n += 1;
+    }
+    return result: {
+        if (n == 1 and std.mem.eql(u8, segs[0], "ping")) {
+            break :result ApiRoute{ .ping = .{} };
+        }
+        break :result null;
+    };
+}
+
+/// Pure api-route pre-check — pairs with `validPath`.
+pub fn apiPath(path: []const u8) bool {
+    return parseApi(path) != null;
+}
+
+/// Endpoint dispatch: returns the handler's JSON body,
+/// or null when `path` isn't an api route. `a` is the
+/// caller's arena; `env` carries route+query.
+pub fn api(a: std.mem.Allocator, s: anytype, path: []const u8, env: *const zmeta.Env) !?[]const u8 {
+    const r = parseApi(path) orelse return null;
+    const body = switch (r) {
+        .ping => |p| try ping_api.api(a, s, p, env),
+    };
+    return body;
 }

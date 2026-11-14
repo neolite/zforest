@@ -393,7 +393,6 @@ fn handle(
             fresh_token = tok;
             break :blk srv.store.create(tok, rpath);
         };
-        extra.append(arena, .{ .name = "content-type", .value = "text/html; charset=utf-8" }) catch @panic("OOM");
         // Auxiliary cookies (board's `zfxu`) also apply to page loads —
         // identity survives reloads, not just POSTs.
         if (@hasDecl(Session, "readCookies")) e.readCookies(cookie_hdr);
@@ -402,6 +401,18 @@ fn handle(
         // later patch renders until the next navigation.
         const qmark = std.mem.indexOfScalar(u8, req.head.target, '?');
         e.setQuery(if (qmark) |i| req.head.target[i + 1 ..] else "");
+        // Api endpoints (pages/api/) answer JSON without the HTML
+        // shell — try them before page rendering.
+        if (@hasDecl(Session, "serveApi")) {
+            var jw: std.Io.Writer.Allocating = .init(arena);
+            const api_ok = e.serveApi(rpath, &jw.writer) catch return .internal_server_error;
+            if (api_ok) {
+                extra.append(arena, .{ .name = "content-type", .value = "application/json" }) catch @panic("OOM");
+                out_body.appendSlice(arena, jw.writer.buffered()) catch @panic("OOM");
+                return .ok;
+            }
+        }
+        extra.append(arena, .{ .name = "content-type", .value = "text/html; charset=utf-8" }) catch @panic("OOM");
         // Render into the request arena; servePage decides route validity.
         var aw: std.Io.Writer.Allocating = .init(arena);
         renderHead(Session, e, &aw.writer) catch @panic("OOM");
