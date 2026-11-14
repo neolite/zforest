@@ -1334,3 +1334,41 @@ byte-identical markup on `/`, `/item/1`, `/structure`). 9 unit tests
 in h.zig cover el-equivalence, lazy store/computed `.text`,
 data-on/data-arg emission, presence attrs, child-type normalization,
 class append/merge, `eachOf` keyed interop and `.lid` composition.
+
+## zsx spike: JSX-like .zsx template transpiler (done — adopt-worthy)
+
+Time-boxed spike on `feat/zsx-spike`: `src/zmeta/zsx.zig` (~700 lines
+parser+emitter+CLI, `zig build zsx` / `zig build zsx-check`) lowers
+`.zsx` templates to `forest.el` calls — deliberately NOT `h.*`, whose
+ported `bindGet` drops `Bound.live` for raw `*T.get()` bindings. Full
+grammar/mapping/diagnostics/LOC evidence in `docs/zsx-spike.md`.
+
+Fixture (`src/apps/zsx_spike/`): post form + comment row with bound
+like `.text`, `w-rep-N` `when` reply, nested keyed `eachOf` kids —
+each written three ways (zsx→gen, `h.*`, `forest.el`). Results:
+
+- SSR `writeHtml`, `writeSnapshotOps` JSON, and a 4-step `PatchLog`
+  diff cycle (text/attr patches, keyed reorder+remove, `when`
+  mount/unmount) are byte-identical across all three versions.
+- `computed` `.text` stays live through lowering (`bindTree`
+  subscribes, `emit` patches); raw store attr keeps `Bound.live`
+  (zsx/el: 1 binding + patch; h: 0 — the documented h gap).
+- Parse diagnostics are positioned `path:line:col` with clean
+  messages; type errors inside `{…}` holes cite `gen/*.zig` with the
+  verbatim expr (one hop from source via the header comment).
+- Handwritten LOC (non-blank/non-comment): zsx 64 vs h.* 100 vs
+  forest.el 97 → **−36% vs h.\*** (−69% post form, −35% comment row).
+  Sensitivity: a named ctx-struct style instead of anonymous
+  `ctx: anytype` literals measures −22% — ctx factoring dominates
+  on data-heavy rows.
+
+**Verdict: adopt-worthy** — meets the precommitted ≥25% bar on both
+examples with parity + tolerable diagnostics. This revisits the
+meta-framework.md "template codegen → Zig: rejected" note: the feared
+losses don't materialize — tags/events are validated at generation
+time (positioned diags beat comptime errors), the parser is bounded
+plain Zig, and `ctx: anytype` holes keep full Zig type checking at
+the call site. Caveats recorded in the spike doc: no entities,
+components, loops or spread; whitespace-only runs containing newlines
+are dropped (same-line spaces preserved); generated type errors need
+the header-comment hop.
