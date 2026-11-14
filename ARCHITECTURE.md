@@ -1524,4 +1524,57 @@ subscriptions, so live↔diff transitions per route are clean.
 Constraint: every dynamic value on a live page must be store-bound;
 structural content is frozen at build time. Mutations still
 bumpSeq() for revision ordering. This is page granularity — per-leaf
-islands inside a diffed page are future work.
+islands inside a diffed page landed next (see below).
+
+## Per-leaf islands (landed)
+
+`forest.island(a, .{ .id/.lid }, children)` wraps a transparent
+subtree (`Node.island`) inside a normal diff-mode page — the final
+piece of the live-island roadmap, giving zmeta pages page-level live
+semantics at subtree granularity without opting the whole route in.
+
+Mechanics:
+
+- **Identity is required.** `.id`/`.lid` resolves like element ids
+  (`parent/lid` composition) and panics without one — the resolved id
+  keys a `Dom.Binding` of new kind `.island`, whose ctx is an
+  `IslandCtx` (view-side record owning a binding-lifetime arena +
+  deep copy of the subtree). Presence of that marker IS the
+  binder-owned flag: `diffNode`/`seedNode` skip the subtree once it
+  exists; SSR, `writeSnapshotOps` and first-seed treat the island as
+  a `fragment`.
+- **`bindIslands` runs after every `forest.diff`** in the skeleton's
+  `render` (never on live pages — they already `bindTree`). It walks
+  the fresh tree but attaches ONLY inside islands: leaves outside
+  stay diff-owned (binding them too would double-emit). Fresh islands
+  get their subtree deep-copied into the IslandCtx arena so
+  `when_key` binder `variant_nodes` captures outlive the per-render
+  arena; the walk then runs the normal `bindNodes` pass on the copy.
+  Already-bound islands cost one marker lookup per render.
+- **Binders reuse the leaf machinery.** `Bound.live` leaves inside an
+  island subscribe exactly like `bindTree` leaves; bound
+  `variant`/`when` keys keep working via `when_key` binders
+  (emitWhen re-serializes the stable copy). Unbound structural
+  content — plain `when` keys, keyed lists — freezes at first bind,
+  same constraint as live pages.
+- **Lifecycle rides `removeTracked`.** The `.island` binding's
+  `node_id` follows the same `id`/`id/…` prefix rule as leaf
+  bindings, so keyed-row removal, `when` unmount, ancestor removal
+  and `dom.reset()` (route change) all unsubscribe leaves and free
+  the IslandCtx arena; a re-added island re-seeds via `seedNode` and
+  re-binds on the next `bindIslands` pass.
+- **No `bindIslands` call → fragment.** Apps that never run the pass
+  (or islands containing only non-live leaves) get plain diff
+  behavior; the marker is the only switch.
+
+Session changes that came with it: `Session(Deps)` gained a
+route-lifetime `live_arena` + `live_active` flag so `Deps.pageLive`
+(the previously generated-but-unwired `pub const live = true` flag)
+actually runs the live pipeline — servePage builds the view ONCE
+into `live_arena` (binder captures must outlive `render_arena`
+resets), ships it as SSR, diffs to seed Dom, `bindTree`s, and
+`render()` short-circuits to a revision stamp while live. Binder emit
+scratch stays on `render_arena`: `PatchLog` dupes every op string at
+emit time, so arena resets can't dangle patch payloads. zboard's
+hand-declared Session gained the two parity fields (its own
+servePage/render overrides never read them).

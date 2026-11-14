@@ -216,3 +216,48 @@ test "generated routes: parse, href, servePage 404, act dispatch" {
     try std.testing.expectEqual(@as(u64, 1), s.deps.pings);
     try std.testing.expectError(error.InvalidAction, s.dispatch("bogus", null, null, null));
 }
+
+test "index island: servePage binds leaves, tick pushes ops without diff; /live unaffected" {
+    const alloc = std.testing.allocator;
+    const s = Session.create(alloc, std.testing.io);
+    defer s.deinit();
+
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    try std.testing.expect(try s.servePage("/", &aw.writer));
+    const html = aw.writer.buffered();
+    // The island is transparent in SSR — children ship, no wrapper id.
+    try std.testing.expect(std.mem.indexOf(u8, html, "id=\"ticks\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "tick-island") == null);
+    // seedDom→render→bindIslands registered the island + its leaf.
+    try std.testing.expect(s.dom.findBinding(.island, "tick-island", ""));
+    try std.testing.expect(s.dom.findBinding(.text, "ticks", ""));
+
+    // act.tick → store notify → binder emits the text op directly; the
+    // island subtree is skipped by the render diff (no double emission).
+    s.log.clear();
+    try s.dispatch(actions.act.tick, null, null, null);
+    var tick_ops: usize = 0;
+    for (s.log.patches.items) |p| {
+        if (p == .text and std.mem.eql(u8, p.text.id, "ticks")) {
+            tick_ops += 1;
+            try std.testing.expectEqualStrings("1", p.text.text);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), tick_ops);
+
+    // Route change resets Dom — island bindings die with the page.
+    var lw: std.Io.Writer.Allocating = .init(alloc);
+    defer lw.deinit();
+    try std.testing.expect(try s.servePage("/live", &lw.writer));
+    try std.testing.expect(!s.dom.findBinding(.island, "tick-island", ""));
+    // The live page's bindTree bound the same leaf id through its own
+    // pipeline — a tick still produces exactly one text op.
+    s.log.clear();
+    try s.dispatch(actions.act.tick, null, null, null);
+    tick_ops = 0;
+    for (s.log.patches.items) |p| {
+        if (p == .text and std.mem.eql(u8, p.text.id, "ticks")) tick_ops += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), tick_ops);
+}

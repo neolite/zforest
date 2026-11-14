@@ -211,10 +211,30 @@ the next `servePage` drops the subscriptions, so live↔diff
 transitions are clean. Constraint (same as zmon): ALL dynamic
 content on a live page must be store-bound — structural/keyed
 content is built once and goes stale. Mutations still `bumpSeq()` so
-the batch carries a fresh revision. Per-LEAF islands inside a
-rebuilt page remain future work (needs diff-skip + binder
-re-resolution); client-side widget islands (§2.3 "true islands") are
-still open.
+the batch carries a fresh revision. Client-side widget islands
+(§2.3 "true islands") are still open.
+
+**LANDED (per-leaf islands).** `forest.island(a, .{ .id = "…" },
+children)` — `h.island` passthrough — marks a transparent subtree
+inside a normal diff-mode page (no markup of its own; `.id`/`.lid`
+required, panic otherwise). SSR, `diff`, `seedNode` and snapshots all
+treat it like a `fragment` — children resolve `.lid`s under the
+island's id path — but once the session skeleton's `bindIslands` pass
+(run after every `forest.diff` in `render`) registers the island in
+`Dom`, `diff`/`seedNode` skip the subtree entirely and every
+`Bound.live` leaf inside gets a store subscription: notifications
+push patch ops with no view rebuild while the rest of the page keeps
+diffing. The island's subtree is deep-copied into a binding-owned
+arena so `when_key` binder captures outlive the per-render arena.
+Removing the subtree (`removeTracked` on the island id or an
+ancestor — keyed-row removal, `when` unmount, `dom.reset` on route
+change) drops the marker and unsubscribes every leaf; a re-added
+island re-seeds and re-binds. Constraint: ALL dynamic content inside
+must be store-bound — unbound structural content and unbound
+`when` keys/keyed lists freeze at first bind; bound `variant`/`when`
+keys keep working through `when_key` binders. Apps that never call
+`bindIslands` get plain diff behavior — the island degrades to a
+`fragment`.
 
 ### 2.4 Nested layouts
 

@@ -465,6 +465,13 @@ pub const Session = struct {
     history: History,
     /// Scratch space for the per-render view tree; reset each render.
     render_arena: std.heap.ArenaAllocator,
+    /// Route-lifetime arena for a live page's once-built view tree —
+    /// skeleton-parity field (board declares its own servePage/render;
+    /// unused here).
+    live_arena: std.heap.ArenaAllocator,
+    /// Skeleton-parity flag — board's servePage/render overrides never
+    /// read it.
+    live_active: bool = false,
     /// Per-session CSRF token rendered into the page and verified on
     /// POST. Owned by the session; set by the server at creation.
     csrf_token: []u8 = &.{},
@@ -505,6 +512,7 @@ pub const Session = struct {
             .log = forest.PatchLog.init(gpa),
             .history = History.init(gpa),
             .render_arena = std.heap.ArenaAllocator.init(gpa),
+            .live_arena = std.heap.ArenaAllocator.init(gpa),
         };
         s.seq = s.app.createStore(u64, 0);
         s.deps = BoardDeps.init(s);

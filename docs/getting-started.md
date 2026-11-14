@@ -66,6 +66,7 @@ src/zmeta_demo_main.zig  executable entry point (flat src/ placement)
 | `getServerSideProps` / middleware gate | `pub fn prepare(...) !void` | runs before view; `error.NotFound` → 404 |
 | API routes | `pages/api/<name>.zig` → `pub fn api(a, s, p, env) ![]const u8` | GET /api/* → JSON body, no HTML shell; `Deps.serveApi` dispatches |
 | Live island page | `pub const live = true;` in a page file | view built once per servePage; `bindTree` pushes leaf ops, `render()` skips diff — all dynamic content must be store-bound |
+| Per-leaf island | `h.island(a, .{ .id = "…" }, children)` in any view | transparent subtree; after first bind `diff` skips it and `Bound.live` leaves inside push ops — all dynamic content inside must be store-bound |
 | server component | `pub fn view(a, s, p, env) h.Node` | returns a `forest.Node` tree via `h.*` |
 | server actions / API routes | `actions.zig` manifest + `on_<name>` in app.zig | POST `/action` → ACK `{rev}`; SSE carries the patch |
 | hydration / RSC payload | **none** | SSR HTML + `client.js` applies serialized ops; no client tree exists |

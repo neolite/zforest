@@ -52,6 +52,11 @@
 //!     `[N]Node`, or a comptime tuple mixing any of those.
 //!     `each`/`eachOf` keyed lists must be the element's ONLY child
 //!     source (a forest rule — enforced with a panic).
+//!   - `h.island(a, .{ .id = "…" }, children)` — per-leaf island
+//!     passthrough to `forest.island`: a transparent subtree that
+//!     `bindIslands` (the session skeleton's render) turns into
+//!     store-bound leaf ops while `diff` skips it. Requires `.id`/`.lid`;
+//!     all dynamic content inside must be store-bound.
 //!   - `h.f(a, "fmt {d}", .{x})` — `allocPrint` shorthand for the ids
 //!     and labels every view formats; arena-allocated like everything
 //!     else the builder produces.
@@ -79,6 +84,7 @@ pub const each = view.each;
 pub const eachOf = view.eachOf;
 pub const variant = view.variant;
 pub const when = view.when;
+pub const island = view.island;
 pub const computed = view.computed;
 pub const writeHtml = view.writeHtml;
 

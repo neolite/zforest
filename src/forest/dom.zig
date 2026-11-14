@@ -21,9 +21,11 @@ pub const Dom = struct {
 
     /// One live binding registration. `kind`/`name` disambiguate leaves
     /// sharing an element id (its `.text` vs each bound attr vs a `when`
-    /// anchor on the same id).
+    /// anchor on the same id). `.island` marks a binder-owned subtree
+    /// (view.island): its ctx is a view-side IslandCtx owning the stable
+    /// subtree copy, not a Binder — presence alone is the diff-skip flag.
     pub const Binding = struct {
-        pub const Kind = enum { text, attr, when_key };
+        pub const Kind = enum { text, attr, when_key, island };
         kind: Kind,
         /// Owned resolved node/anchor id — matched against removeTracked's
         /// `id`/`id/…` prefix rule.
@@ -83,9 +85,10 @@ pub const Dom = struct {
     /// allocator — render-group clone-on-fork relies on the clone
     /// tracking EXACTLY what the source tracked, so diffing the same
     /// view against either produces identical ops. Live `bindings`
-    /// cannot be copied (each ctx owns store subscriptions), so a Dom
-    /// that has them must never be cloned — board sessions never call
-    /// bindTree, making the assert a real invariant, not a hope.
+    /// cannot be copied (each ctx owns store subscriptions or an
+    /// island subtree copy), so a Dom that has them must never be
+    /// cloned — board sessions never call bindTree/bindIslands,
+    /// making the assert a real invariant, not a hope.
     pub fn cloneDeep(self: *const Dom) Dom {
         std.debug.assert(self.bindings.items.len == 0);
         var out = Dom.init(self.gpa);

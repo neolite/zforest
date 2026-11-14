@@ -48,7 +48,9 @@
 //!       `server.statusOf`.
 //!     `fn view(a, s, env: *const Env) []const forest.Node` — the whole
 //!       `<main>` body for SSR, diff and snapshot (one tree, three
-//!       outputs). `a` is the per-render arena.
+//!       outputs). `a` is the per-render arena — EXCEPT on live pages
+//!       (`Deps.pageLive` true), where it is the route-lifetime
+//!       `live_arena` because bindTree captures must outlive renders.
 //!   optional (absent = skeleton default):
 //!     `fn deinit(s) void` — frees domain allocations (item titles, ui
 //!       drafts); runs before dom/log/history/arena/app teardown.
@@ -70,6 +72,10 @@
 //!       declares only this (the zmon shape).
 //!     `fn readCookies(s, cookie_hdr: ?[]const u8) void` — auxiliary-
 //!       cookie pickup before dispatch/page render (board's `zfxu`).
+//!     `fn pageLive(s) bool` — per-route live-island flag; generated
+//!       `routes.isLive` forwards page files' `pub const live = true`.
+//!       True → servePage builds the view once + bindTree; render()
+//!       only stamps the revision. Absent = all-diff (default).
 //!     `page_title` / `page_class` / `cookie_name` — consts forwarded
 //!       to the server contract (defaults match http.zig's).
 //!     `archetype` — `zmeta.Archetype` const documenting the §4.1
@@ -226,6 +232,7 @@ fn SessionMethods(comptime Deps: type) type {
             self.log.deinit();
             self.history.deinit();
             self.render_arena.deinit();
+            self.live_arena.deinit();
             self.app.deinit();
             self.gpa.destroy(self);
         }
@@ -293,8 +300,12 @@ fn SessionMethods(comptime Deps: type) type {
         /// Full-page render for a navigating client: resolve the route,
         /// run the optional prepare gate, drop tracked DOM state, write
         /// the page body, then reseed so subsequent diffs emit only real
-        /// changes. `Deps.servePage` replaces the whole pipeline — see
-        /// the contract docs at the top of this file.
+        /// changes. Live pages (`Deps.pageLive`) instead build the view
+        /// ONCE into `live_arena`, ship it as SSR, diff to seed Dom and
+        /// `bindTree` every `Bound.live` leaf — `render()` then only
+        /// stamps the batch revision while store notifications push ops.
+        /// `Deps.servePage` replaces the whole pipeline — see the
+        /// contract docs at the top of this file.
         pub fn servePage(self: anytype, path: []const u8, writer: anytype) !bool {
             if (@hasDecl(Deps, "servePage")) return Deps.servePage(self, path, writer);
             if (!self.setRoute(path)) return false;
@@ -303,8 +314,30 @@ fn SessionMethods(comptime Deps: type) type {
                 Deps.prepare(self, &env) catch return false;
             }
             self.dom.reset();
-            try self.writeView(writer);
-            self.seedDom();
+            self.live_active = false;
+            if (self.pageLive()) {
+                // The once-built tree goes into live_arena (route
+                // lifetime): render_arena resets would orphan the
+                // binder captures (variant_nodes) bindTree stores.
+                // render_arena still serves as diff/bindTree scratch —
+                // and later as binder emit scratch (render() resets it
+                // per flush while live_active; Allocator values into an
+                // ArenaAllocator survive reset).
+                _ = self.live_arena.reset(.retain_capacity);
+                const a = self.live_arena.allocator();
+                const env = self.viewEnv();
+                const nodes = Deps.view(a, self, &env);
+                _ = self.render_arena.reset(.retain_capacity);
+                const ra = self.render_arena.allocator();
+                try forest.writeHtml(ra, nodes, writer);
+                forest.diff(ra, nodes, &self.dom, &self.log);
+                self.log.clear();
+                forest.bindTree(ra, nodes, &self.dom, &self.log);
+                self.live_active = true;
+            } else {
+                try self.writeView(writer);
+                self.seedDom();
+            }
             return true;
         }
 
@@ -340,18 +373,40 @@ fn SessionMethods(comptime Deps: type) type {
             return .{ .route = self.route, .query = self.query };
         }
 
+        /// Whether the current route's page opted into live bindings —
+        /// forwards `Deps.pageLive` (generated `routes.isLive` reports
+        /// page files' `pub const live = true`); false when Deps
+        /// doesn't declare it.
+        fn pageLive(self: anytype) bool {
+            if (@hasDecl(Deps, "pageLive")) return Deps.pageLive(self);
+            return false;
+        }
+
         /// Diff the view into DOM patches. Runs post-settle (after-flush)
         /// and inside seedDom. `Deps.render` replaces it wholesale —
         /// grouped sessions route this through their render group.
+        /// Live pages (`live_active`) skip the diff entirely: bindTree
+        /// binders already emitted during the notify phase, so only the
+        /// batch revision is stamped (render_arena doubles as binder
+        /// emit scratch and is reset here to bound emit garbage).
+        /// Diff pages additionally run `bindIslands` so `.island`
+        /// subtrees get store-bound leaf subscriptions.
         fn render(self: anytype) void {
             if (@hasDecl(Deps, "render")) {
                 Deps.render(self);
                 return;
             }
+            if (self.live_active) {
+                _ = self.render_arena.reset(.retain_capacity);
+                self.log.revision = self.seq.get();
+                return;
+            }
             _ = self.render_arena.reset(.retain_capacity);
             const a = self.render_arena.allocator();
             const env = self.viewEnv();
-            forest.diff(a, Deps.view(a, self, &env), &self.dom, &self.log);
+            const nodes = Deps.view(a, self, &env);
+            forest.diff(a, nodes, &self.dom, &self.log);
+            forest.bindIslands(a, nodes, &self.dom, &self.log);
             self.log.revision = self.seq.get();
         }
 
@@ -439,6 +494,7 @@ fn createSessionImpl(comptime S: type, comptime Deps: type, gpa: std.mem.Allocat
         .log = forest.PatchLog.init(gpa),
         .history = History.init(gpa),
         .render_arena = std.heap.ArenaAllocator.init(gpa),
+        .live_arena = std.heap.ArenaAllocator.init(gpa),
     };
     s.seq = s.app.createStore(u64, 0);
     s.deps = Deps.init(s);
@@ -486,6 +542,13 @@ fn SessionPlain(comptime Deps: type) type {
         history: History,
         /// Scratch space for the per-render view tree; reset each render.
         render_arena: std.heap.ArenaAllocator,
+        /// Route-lifetime arena for a live page's once-built view tree —
+        /// binder captures (variant_nodes) must outlive render_arena
+        /// resets. Reset per servePage; unused on diff pages.
+        live_arena: std.heap.ArenaAllocator,
+        /// True while the current route runs the live pipeline
+        /// (`Deps.pageLive`) — render() only stamps the batch revision.
+        live_active: bool = false,
         /// Per-session CSRF token rendered into the page and verified on
         /// POST. Owned by the session; set by the server at creation.
         csrf_token: []u8 = &.{},
@@ -567,6 +630,13 @@ fn SessionGrouped(comptime Deps: type) type {
         history: History,
         /// Scratch space for the per-render view tree; reset each render.
         render_arena: std.heap.ArenaAllocator,
+        /// Route-lifetime arena for a live page's once-built view tree —
+        /// binder captures (variant_nodes) must outlive render_arena
+        /// resets. Reset per servePage; unused on diff pages.
+        live_arena: std.heap.ArenaAllocator,
+        /// True while the current route runs the live pipeline
+        /// (`Deps.pageLive`) — render() only stamps the batch revision.
+        live_active: bool = false,
         /// Per-session CSRF token rendered into the page and verified on
         /// POST. Owned by the session; set by the server at creation.
         csrf_token: []u8 = &.{},

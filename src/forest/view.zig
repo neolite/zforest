@@ -146,6 +146,20 @@ pub const Variant = struct {
     nodes: []const Node = &.{},
 };
 
+/// A per-leaf island inside a diff-mode page: a transparent subtree
+/// (no markup of its own) whose contents become binder-owned after the
+/// first bind — see `island`/`bindIslands`.
+pub const Island = struct {
+    /// Bound island id — REQUIRED (`.id` or `.lid`): it keys the Dom's
+    /// island binding that switches `diff` off and scopes child `.lid`s
+    /// exactly like a bound element's id.
+    id: ?[]const u8 = null,
+    /// Local id composed against the nearest bound ancestor
+    /// (`{parent}/{lid}`), like `Element.lid`.
+    lid: ?[]const u8 = null,
+    nodes: []const Node = &.{},
+};
+
 /// One node of a view tree. Strings are borrowed — keep them alive until
 /// `writeHtml`/`diff` return (a per-render arena covers this naturally).
 pub const Node = union(enum) {
@@ -160,6 +174,8 @@ pub const Node = union(enum) {
     /// A conditional subtree between `z-when` comment anchors — see
     /// `variant`/`when`.
     variant: Variant,
+    /// A binder-owned subtree for per-leaf live islands — see `island`.
+    island: Island,
 };
 
 /// Text child node — HTML-escaped on output.
@@ -226,6 +242,55 @@ pub fn variant(a: std.mem.Allocator, idspec: anytype, key: anytype, children: an
 pub fn when(a: std.mem.Allocator, idspec: anytype, cond: anytype, children: anytype) Node {
     const key: ?[]const u8 = if (truthy(a, cond)) "on" else null;
     return variant(a, idspec, key, children);
+}
+
+/// A per-leaf island inside a normal diff-mode page. `idspec` is an
+/// anonymous struct — `.id`/`.lid` resolved like element bindings —
+/// REQUIRED (panics without one): the resolved id keys the Dom's
+/// island binding and scopes child `.lid`s exactly as if the island
+/// were a transparent element. The island emits no markup of its own.
+///
+/// Lifecycle: SSR/writeHtml/diff/seed/snapshot all treat the island as
+/// transparent — children render under the island's id path. The FIRST
+/// time `diff`/`seedNode` meets an unbound island it processes the
+/// children normally (seeding Dom state); once `bindIslands` (run by
+/// the session skeleton's `render`, or called directly) registers the
+/// island, `diff`/`seedNode` skip the subtree entirely and every
+/// `Bound.live` leaf inside gets a store subscription — notifications
+/// push patch ops with no view rebuild. Removing the island's DOM
+/// subtree (`removeTracked` on its id or an ancestor — keyed-row
+/// removal, `when` unmount) drops the binding; a re-added island
+/// re-seeds and re-binds. Apps that never call `bindIslands` get
+/// plain diff behavior — the island degrades to a `fragment`.
+///
+/// Constraint (same as live pages): ALL dynamic content inside must be
+/// store-bound — diff never revisits the subtree, so unbound structural
+/// content freezes at first bind. `variant`/`when` with BOUND keys work
+/// (when_key binders re-serialize branches); unbound structural `when`
+/// and keyed lists inside an island freeze. `children` accepts the same
+/// shapes as `variant` EXCEPT a bare keyed list (the island has no DOM
+/// node to parent create/move ops — wrap `each`/`eachOf` in a bound
+/// parent element instead).
+pub fn island(a: std.mem.Allocator, idspec: anytype, children: anytype) Node {
+    var isl: Island = .{};
+    const sinfo = @typeInfo(@TypeOf(idspec)).@"struct";
+    inline for (sinfo.field_names) |name| {
+        const f = @field(idspec, name);
+        if (comptime std.mem.eql(u8, name, "id")) {
+            isl.id = resolveValue(a, f);
+        } else if (comptime std.mem.eql(u8, name, "lid")) {
+            isl.lid = resolveValue(a, f);
+        } else {
+            @compileError("island idspec fields must be .id/.lid, found ." ++ name);
+        }
+    }
+    if (isl.id == null and isl.lid == null)
+        @panic("island requires a bound id (.id/.lid)");
+    isl.nodes = switch (normChildren(a, children)) {
+        .nodes => |s| s,
+        .keyed => @panic("island children can't be a bare keyed list; wrap each/eachOf in a bound parent element"),
+    };
+    return .{ .island = isl };
 }
 
 /// Bind `store` (any `*T` exposing `.get()`) through the mapping fn `f` —
@@ -577,6 +642,14 @@ fn anchorId(a: std.mem.Allocator, v: Variant, parent_path: []const u8) []const u
     return anchor;
 }
 
+/// The id an island answers to — `resolvedId` over `.id`/`.lid`, the
+/// same composition rules as elements/variants. Required: the id keys
+/// the Dom's island binding that switches diff off and bindIslands on.
+fn islandId(a: std.mem.Allocator, isl: Island, parent_path: []const u8) []const u8 {
+    return resolvedId(a, isl.id, isl.lid, parent_path) orelse
+        @panic("island requires a bound id (.id/.lid)");
+}
+
 /// `when` condition truthiness, mirroring `resolveValue`'s operand set:
 /// bool → itself; optional → null is false, else the inner recurses;
 /// `*T.get()` → deref and recurse; int → non-zero; string → non-empty;
@@ -624,6 +697,11 @@ fn writeNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, writer: 
         .text => |s| try escapeHtmlInto(writer, s),
         .raw => |s| try writer.writeAll(s),
         .fragment => |kids| for (kids) |k| try writeNode(a, k, parent_path, writer),
+        .island => |isl| {
+            // Transparent — children resolve under the island's id path.
+            const iid = islandId(a, isl, parent_path);
+            for (isl.nodes) |k| try writeNode(a, k, iid, writer);
+        },
         .variant => |v| {
             // Both markers always — branch markup lives strictly between.
             const anchor = anchorId(a, v, parent_path);
@@ -678,6 +756,15 @@ fn diffNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, dom: *Dom
     switch (node) {
         .text, .raw => {},
         .fragment => |kids| for (kids) |k| diffNode(a, k, parent_path, dom, log),
+        .island => |isl| {
+            const iid = islandId(a, isl, parent_path);
+            // Binder-owned once bindIslands registered the island —
+            // diff skips the subtree entirely; leaf ops come from the
+            // store subscriptions. Unbound islands diff normally (apps
+            // that never call bindIslands degrade to fragment).
+            if (dom.findBinding(.island, iid, "")) return;
+            for (isl.nodes) |k| diffNode(a, k, iid, dom, log);
+        },
         .variant => |v| {
             const anchor = anchorId(a, v, parent_path);
             const key = resolveValue(a, v.key);
@@ -776,6 +863,12 @@ fn snapshotOps(a: std.mem.Allocator, node: Node, parent_path: []const u8, ops: *
     switch (node) {
         .text, .raw => {},
         .fragment => |kids| for (kids) |k| try snapshotOps(a, k, parent_path, ops),
+        .island => |isl| {
+            // State dump — islands don't change snapshot coverage:
+            // children emit their bound ops under the island's id path.
+            const iid = islandId(a, isl, parent_path);
+            for (isl.nodes) |k| try snapshotOps(a, k, iid, ops);
+        },
         .variant => |v| {
             // One full-state when-op per anchor; the branch markup covers
             // everything between the markers — no inner ops (same rule as
@@ -829,6 +922,13 @@ fn seedNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, dom: *Dom
     switch (node) {
         .text, .raw => {},
         .fragment => |kids| for (kids) |k| seedNode(a, k, parent_path, dom),
+        .island => |isl| {
+            const iid = islandId(a, isl, parent_path);
+            // Same rule as diffNode: a bound island's state is owned by
+            // its binders — don't re-seed (and don't unfreeze it).
+            if (dom.findBinding(.island, iid, "")) return;
+            for (isl.nodes) |k| seedNode(a, k, iid, dom);
+        },
         .variant => |v| {
             const anchor = anchorId(a, v, parent_path);
             const key = resolveValue(a, v.key);
@@ -930,6 +1030,8 @@ pub const Binder = struct {
             .text => if (s) |v| self.dom.setText(self.log, self.id, v),
             .attr => self.dom.setAttr(self.log, self.id, self.name, s),
             .when_key => self.emitWhen(s),
+            // Island markers are IslandCtx records, never Binders.
+            .island => unreachable,
         }
     }
 
@@ -1053,6 +1155,16 @@ fn bindNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, dom: *Dom
     switch (node) {
         .text, .raw => {},
         .fragment => |kids| bindNodes(a, kids, parent_path, dom, log),
+        .island => |isl| {
+            const iid = islandId(a, isl, parent_path);
+            // Register the marker so diff/bindIslands treat the subtree
+            // as binder-owned. This walk already runs on stable nodes
+            // (bindTree's once-built view, emitWhen's captured branch,
+            // or bindIslands' island-arena copy), so no subtree copy is
+            // kept — markIsland only.
+            _ = ensureIsland(dom, iid, null);
+            bindNodes(a, isl.nodes, iid, dom, log);
+        },
         .variant => |v| {
             const anchor = anchorId(a, v, parent_path);
             if (v.key) |kv| {
@@ -1125,6 +1237,211 @@ fn bindNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, dom: *Dom
                 .keyed => |kids| {
                     const pid = id orelse @panic("keyed children require a bound parent (.id/.lid)");
                     for (kids) |k| bindNode(a, k, pid, dom, log);
+                },
+            }
+        },
+    }
+}
+
+// ── per-leaf islands ───────────────────────────────────────────
+//
+// `bindTree` subscribes EVERY live leaf — for sessions whose view is
+// built once. `bindIslands` is the diff-mode counterpart: it walks the
+// freshly built tree but only descends into `.island` subtrees, so leaf
+// bindings inside islands self-update while everything else stays on
+// the normal diff path (binding outside leaves too would double-emit
+// with diff). Run it after `diff` on every render — already-bound
+// islands cost one marker lookup each.
+//
+// Fresh islands get a DEEP COPY of their subtree in a binding-owned
+// arena: binder captures (`variant_nodes` for when_key binders, and
+// any arena-allocated operand slices) must outlive the per-render
+// arena, which `diff` callers reset every render. `a` itself only
+// needs to survive the walk — the render arena is fine (`Allocator`
+// values into an `ArenaAllocator` stay valid across `reset()`, so
+// binder emit scratch keeps working; it just allocates into the next
+// arena generation).
+
+/// Ownership record behind a `.island` binding — registered through
+/// `Dom.addBinding` so `removeTracked`/`deinit` drop it exactly like a
+/// Binder. `nodes` is the stable deep copy `bindIslands` walks; empty
+/// for mark-only bindings (bindTree/emitWhen walks already run on
+/// stable trees and need no copy).
+const IslandCtx = struct {
+    gpa: std.mem.Allocator,
+    /// Child allocator for `nodes` — deinit frees the whole copy.
+    arena: std.heap.ArenaAllocator,
+    nodes: []const Node = &.{},
+};
+
+fn destroyIslandCtx(p: *anyopaque) void {
+    const c: *IslandCtx = @ptrCast(@alignCast(p));
+    c.arena.deinit();
+    c.gpa.destroy(c);
+}
+
+/// Register `iid` as binder-owned: `diff`/`seedNode`/`bindIslands` skip
+/// the subtree from then on. When `copy_nodes` is non-null the subtree
+/// is deep-copied into a binding-owned arena and the copy returned —
+/// `bindIslands` walks THAT so binder captures outlive the render
+/// arena. Returns the stable copy, or null when the island was already
+/// bound (or marked without a copy).
+fn ensureIsland(dom: *Dom, iid: []const u8, copy_nodes: ?[]const Node) ?[]const Node {
+    if (dom.findBinding(.island, iid, "")) return null;
+    const ctx = dom.gpa.create(IslandCtx) catch @panic("OOM");
+    ctx.* = .{
+        .gpa = dom.gpa,
+        .arena = std.heap.ArenaAllocator.init(dom.gpa),
+    };
+    var out: ?[]const Node = null;
+    if (copy_nodes) |ns| {
+        const sa = ctx.arena.allocator();
+        const cp = sa.alloc(Node, ns.len) catch @panic("OOM");
+        for (ns, 0..) |n, i| cp[i] = dupeNodeDeep(sa, n);
+        ctx.nodes = cp;
+        out = cp;
+    }
+    dom.addBinding(.island, iid, "", ctx, &destroyIslandCtx);
+    return out;
+}
+
+/// Deep-copy a node subtree into `a` — every slice/string re-allocated
+/// so the copy survives render-arena resets. `Bound`s copy verbatim:
+/// live `Bound.ctx` is the store pointer (session-stable — the same
+/// contract `bindTree` relies on), and non-live thunks are only ever
+/// re-resolved during the same-render bind walk.
+fn dupeNodeDeep(a: std.mem.Allocator, n: Node) Node {
+    return switch (n) {
+        .text => |s| .{ .text = dupeStrDeep(a, s) },
+        .raw => |s| .{ .raw = dupeStrDeep(a, s) },
+        .fragment => |kids| .{ .fragment = dupeNodesDeep(a, kids) },
+        .island => |isl| .{ .island = dupeIslandDeep(a, isl) },
+        .variant => |v| .{ .variant = dupeVariantDeep(a, v) },
+        .element => |e| .{ .element = dupeElementDeep(a, e) },
+    };
+}
+
+fn dupeStrDeep(a: std.mem.Allocator, s: []const u8) []const u8 {
+    return a.dupe(u8, s) catch @panic("OOM");
+}
+
+fn dupeOptStrDeep(a: std.mem.Allocator, s: ?[]const u8) ?[]const u8 {
+    return if (s) |v| dupeStrDeep(a, v) else null;
+}
+
+fn dupeValueDeep(a: std.mem.Allocator, v: ?Value) ?Value {
+    const x = v orelse return null;
+    return switch (x) {
+        .str => |s| .{ .str = dupeStrDeep(a, s) },
+        .bound => |b| .{ .bound = b },
+    };
+}
+
+fn dupeNodesDeep(a: std.mem.Allocator, nodes: []const Node) []const Node {
+    const out = a.alloc(Node, nodes.len) catch @panic("OOM");
+    for (nodes, 0..) |n, i| out[i] = dupeNodeDeep(a, n);
+    return out;
+}
+
+fn dupeAttrsDeep(a: std.mem.Allocator, attrs: []const Attr) []const Attr {
+    const out = a.alloc(Attr, attrs.len) catch @panic("OOM");
+    for (attrs, 0..) |at, i| {
+        out[i] = .{
+            .name = dupeStrDeep(a, at.name),
+            .value = dupeValueDeep(a, at.value),
+            .presence = at.presence,
+        };
+    }
+    return out;
+}
+
+fn dupeChildrenDeep(a: std.mem.Allocator, c: Children) Children {
+    return switch (c) {
+        .nodes => |s| .{ .nodes = dupeNodesDeep(a, s) },
+        .keyed => |s| .{ .keyed = dupeNodesDeep(a, s) },
+    };
+}
+
+fn dupeElementDeep(a: std.mem.Allocator, e: Element) Element {
+    return .{
+        .tag = e.tag,
+        .id = dupeOptStrDeep(a, e.id),
+        .lid = dupeOptStrDeep(a, e.lid),
+        .text = dupeValueDeep(a, e.text),
+        .attrs = dupeAttrsDeep(a, e.attrs),
+        .children = dupeChildrenDeep(a, e.children),
+    };
+}
+
+fn dupeVariantDeep(a: std.mem.Allocator, v: Variant) Variant {
+    return .{
+        .id = dupeOptStrDeep(a, v.id),
+        .lid = dupeOptStrDeep(a, v.lid),
+        .key = dupeValueDeep(a, v.key),
+        .nodes = dupeNodesDeep(a, v.nodes),
+    };
+}
+
+fn dupeIslandDeep(a: std.mem.Allocator, isl: Island) Island {
+    return .{
+        .id = dupeOptStrDeep(a, isl.id),
+        .lid = dupeOptStrDeep(a, isl.lid),
+        .nodes = dupeNodesDeep(a, isl.nodes),
+    };
+}
+
+/// Subscribe every live-capable bound leaf inside `.island` subtrees —
+/// the diff-mode counterpart of `bindTree`. Call after `diff` on every
+/// render: bound islands are skipped by marker lookup, fresh islands
+/// get a stable subtree copy plus leaf/when_key binders. Leaves outside
+/// islands are left to `diff` — binding them too would double-emit.
+///
+/// `a` is scratch for id resolution AND each binder's emit arena —
+/// pass the render arena: an `ArenaAllocator`'s `Allocator` stays valid
+/// across `reset()`, so captured emit scratch keeps working (it
+/// allocates into the next arena generation). Island subtree copies
+/// live in binding-owned arenas, not `a`.
+pub fn bindIslands(a: std.mem.Allocator, nodes: []const Node, dom: *Dom, log: *PatchLog) void {
+    for (nodes) |n| bindIslandsNode(a, n, "", dom, log);
+}
+
+/// Search-only walk behind `bindIslands`: traverses the whole tree
+/// (fragments, elements, keyed children, mounted variant branches)
+/// looking for `.island` nodes but attaches NOTHING outside them —
+/// diff owns those bindings. Mirrors `bindNode`'s path/id resolution
+/// exactly so island children resolve under the same ids diff seeded.
+fn bindIslandsNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, dom: *Dom, log: *PatchLog) void {
+    switch (node) {
+        .text, .raw => {},
+        .fragment => |kids| for (kids) |k| bindIslandsNode(a, k, parent_path, dom, log),
+        .island => |isl| {
+            const iid = islandId(a, isl, parent_path);
+            if (dom.findBinding(.island, iid, "")) return; // binder-owned
+            // Fresh island: deep-copy the subtree into a binding-owned
+            // arena, then run the full bind walk on the COPY — every
+            // capture (leaf ids are gpa-duped anyway; variant_nodes
+            // slices) then points at stable memory.
+            if (ensureIsland(dom, iid, isl.nodes)) |stable| {
+                bindNodes(a, stable, iid, dom, log);
+            }
+        },
+        .variant => |v| {
+            const anchor = anchorId(a, v, parent_path);
+            // Only a mounted branch exists in the DOM — same gate
+            // bindNode uses before binding inner leaves.
+            if (resolveValue(a, v.key) != null) {
+                for (v.nodes) |k| bindIslandsNode(a, k, anchor, dom, log);
+            }
+        },
+        .element => |e| {
+            const id = resolvedId(a, e.id, e.lid, parent_path);
+            const path = id orelse parent_path;
+            if (e.text != null) return; // .text owns the element's content
+            switch (e.children) {
+                .nodes => |kids| for (kids) |k| bindIslandsNode(a, k, path, dom, log),
+                .keyed => |kids| {
+                    const pid = id orelse @panic("keyed children require a bound parent (.id/.lid)");
+                    for (kids) |k| bindIslandsNode(a, k, pid, dom, log);
                 },
             }
         },
@@ -2147,4 +2464,142 @@ test "removeTracked unsubscribes live bindings under the id" {
 
     st.emit(2); // dead binding: nothing emitted
     try std.testing.expectEqual(@as(usize, 0), log.patches.items.len);
+}
+
+// ─────────────────────────────────────────────
+// per-leaf island tests
+// ─────────────────────────────────────────────
+
+/// One keyed row whose only child is an island wrapping a live text
+/// leaf — the shape bindIslands is built for.
+fn islandRow(a: std.mem.Allocator, st: *FakeLiveStore(u32)) Node {
+    return el(a, .li, .{ .id = "r1" }, .{
+        island(a, .{ .lid = "isl" }, .{
+            el(a, .span, .{ .lid = "v", .text = st }, .{}),
+        }),
+    });
+}
+
+/// `<ul id="list">` keyed list containing the island row (or empty).
+fn islandListView(a: std.mem.Allocator, st: *FakeLiveStore(u32), with_row: bool) []const Node {
+    const kids: []const Node = if (with_row) blk: {
+        const s = a.alloc(Node, 1) catch @panic("OOM");
+        s[0] = islandRow(a, st);
+        break :blk s;
+    } else &.{};
+    const out = a.alloc(Node, 1) catch @panic("OOM");
+    out[0] = el(a, .ul, .{ .id = "list" }, each(kids));
+    return out;
+}
+
+test "island seeds once, binder pushes ops, removal unbinds, re-add rebinds" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var st = FakeLiveStore(u32){ .gpa = std.testing.allocator, .v = 1 };
+    defer st.deinit();
+    var dom = Dom.init(std.testing.allocator);
+    defer dom.deinit();
+    var log = PatchLog.init(std.testing.allocator);
+    defer log.deinit();
+
+    // SSR is transparent: no wrapper markup, children resolve under
+    // the island's id path exactly like a bound element's.
+    const a = arena.allocator();
+    const nodes = islandListView(a, &st, true);
+    try std.testing.expectEqualStrings(
+        "<ul id=\"list\"><li id=\"r1\"><span id=\"r1/isl/v\">1</span></li></ul>",
+        renderStr(a, nodes),
+    );
+
+    // First diff seeds the row (create patch ships the markup); the
+    // island is still unbound so seedNode records the leaf's state.
+    diff(a, nodes, &dom, &log);
+    log.clear();
+    bindIslands(a, nodes, &dom, &log);
+    // island marker + one text binder; the store is subscribed once.
+    try std.testing.expect(dom.findBinding(.island, "r1/isl", ""));
+    try std.testing.expect(dom.findBinding(.text, "r1/isl/v", ""));
+    try std.testing.expectEqual(@as(usize, 2), dom.bindings.items.len);
+    try std.testing.expectEqual(@as(usize, 1), st.watcherCount());
+
+    // Direct binder update — no diff, no view rebuild.
+    st.emit(5);
+    try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
+    try expectText(log.patches.items[0], "r1/isl/v", "5");
+    log.clear();
+
+    // Next render: the render arena resets (nodes freed — the island
+    // binding owns a stable copy), the store moved WITHOUT a notify,
+    // and diff must skip the binder-owned subtree entirely.
+    st.v = 42;
+    _ = arena.reset(.retain_capacity);
+    const a2 = arena.allocator();
+    const nodes2 = islandListView(a2, &st, true);
+    diff(a2, nodes2, &dom, &log);
+    try std.testing.expectEqual(@as(usize, 0), log.patches.items.len);
+    bindIslands(a2, nodes2, &dom, &log); // already bound: marker lookup only
+    try std.testing.expectEqual(@as(usize, 1), st.watcherCount());
+
+    // The binder still resolves the CURRENT store value on notify.
+    st.emit(43);
+    try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
+    try expectText(log.patches.items[0], "r1/isl/v", "43");
+    log.clear();
+
+    // Removing the keyed row drops everything under "r1/" — island
+    // marker, leaf binder, IslandCtx arena, store subscription.
+    const nodes3 = islandListView(a2, &st, false);
+    diff(a2, nodes3, &dom, &log);
+    try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
+    try std.testing.expect(log.patches.items[0] == .remove);
+    try std.testing.expectEqualStrings("r1", log.patches.items[0].remove.id);
+    try std.testing.expectEqual(@as(usize, 0), dom.bindings.items.len);
+    try std.testing.expectEqual(@as(usize, 0), st.watcherCount());
+    log.clear();
+
+    // Dead binding: notifications after removal emit nothing.
+    st.emit(1);
+    try std.testing.expectEqual(@as(usize, 0), log.patches.items.len);
+
+    // Re-adding the row re-seeds and re-binds from scratch.
+    const nodes4 = islandListView(a2, &st, true);
+    diff(a2, nodes4, &dom, &log);
+    log.clear();
+    bindIslands(a2, nodes4, &dom, &log);
+    try std.testing.expect(dom.findBinding(.island, "r1/isl", ""));
+    try std.testing.expectEqual(@as(usize, 2), dom.bindings.items.len);
+    try std.testing.expectEqual(@as(usize, 1), st.watcherCount());
+    st.emit(8);
+    try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
+    try expectText(log.patches.items[0], "r1/isl/v", "8");
+}
+
+test "island without bindIslands degrades to plain diff behavior" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Non-watchable store: even bindIslands couldn't subscribe — the
+    // island must behave exactly like a fragment under diff.
+    var st = FakeStore(u32){ .v = 1 };
+    var dom = Dom.init(std.testing.allocator);
+    defer dom.deinit();
+    var log = PatchLog.init(std.testing.allocator);
+    defer log.deinit();
+
+    const nodes = &.{island(a, .{ .id = "top" }, .{
+        el(a, .span, .{ .lid = "v", .text = &st }, .{}),
+    })};
+    diff(a, nodes, &dom, &log);
+    log.clear();
+
+    // Second render resolves the store's new value through diff —
+    // nothing was bound, so the island never froze.
+    st.v = 2;
+    const nodes2 = &.{island(a, .{ .id = "top" }, .{
+        el(a, .span, .{ .lid = "v", .text = &st }, .{}),
+    })};
+    diff(a, nodes2, &dom, &log);
+    try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
+    try expectText(log.patches.items[0], "top/v", "2");
+    try std.testing.expectEqual(@as(usize, 0), dom.bindings.items.len);
 }
