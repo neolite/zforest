@@ -8,7 +8,7 @@
 const std = @import("std");
 const zefx = @import("zefx");
 const forest = @import("forest");
-const History = @import("server/history.zig").History;
+const zmeta = @import("zmeta/root.zig");
 const CarData = @import("car_data.zig");
 
 const Booking = struct {
@@ -31,15 +31,20 @@ const Mutation = union(enum) {
 
 pub const ActionError = error{ InvalidAction, InvalidChoice, IncompleteVehicle, EmptyCart, BadContact };
 
-/// One browser session: isolated graph + booking draft + DOM patch state.
-pub const Session = struct {
-    /// Session contract for the generic server (see server/http.zig).
+/// Car domain state + graph handles — the zmeta `Deps`
+/// (docs/meta-framework.md §5.2-5.3). The `zmeta.Session` skeleton owns
+/// the transport contract (Dom/log/history/arena/CSRF/seq/render hook);
+/// everything domain-specific — vehicle selection, the service cart,
+/// bookings, the mutation event, action validation, the view tree —
+/// lives here. The session contract for the generic server is provided
+/// by the skeleton (see zmeta/session.zig).
+pub const CarDeps = struct {
+    /// Page <title> and <main> class rendered by the server's page shell.
     pub const page_title = "zcar — запись в сервис";
     pub const page_class = "app app-car";
+    /// Session cookie name — "zfxc" keeps zcar sessions distinct from
+    /// the other apps' on the same host.
     pub const cookie_name = "zfxc";
-
-    gpa: std.mem.Allocator,
-    app: zefx.App,
 
     brand: ?usize = null,
     model: ?usize = null,
@@ -50,236 +55,73 @@ pub const Session = struct {
     next_booking: u32 = 1,
 
     mutate: *zefx.Event(Mutation),
-    seq: *zefx.Store(u64),
 
-    dom: forest.Dom,
-    log: forest.PatchLog,
-    history: History,
-    render_arena: std.heap.ArenaAllocator,
-    csrf_token: []u8 = &.{},
-    /// Store-stamped incarnation (see the Session contract in
-    /// server/http.zig): distinguishes this session from a previous one
-    /// evicted+recreated under the same (cookie token, route) key.
-    incarnation: u64 = 0,
-    out_cookie: []const u8 = &.{},
-
-    pub fn create(gpa: std.mem.Allocator, io: std.Io) *Session {
-        _ = io;
-        return createSession(gpa);
+    /// `Deps.init` — create the graph handles on the session's engine.
+    /// `seq` already exists; `wire` registers the reducer next.
+    pub fn init(s: *Session) CarDeps {
+        return .{ .mutate = s.app.createEvent(Mutation) };
     }
 
-    pub fn deinit(self: *Session) void {
-        if (self.csrf_token.len != 0) self.gpa.free(self.csrf_token);
-        self.services.deinit(self.gpa);
-        for (self.bookings.items) |b| {
-            self.gpa.free(b.name);
-            self.gpa.free(b.phone);
-            self.gpa.free(b.car);
+    /// `Deps.deinit` — free domain allocations. Runs before the
+    /// skeleton tears down dom/log/history/arena/app.
+    pub fn deinit(s: *Session) void {
+        s.deps.services.deinit(s.gpa);
+        for (s.deps.bookings.items) |b| {
+            s.gpa.free(b.name);
+            s.gpa.free(b.phone);
+            s.gpa.free(b.car);
         }
-        self.bookings.deinit(self.gpa);
-        self.dom.deinit();
-        self.log.deinit();
-        self.history.deinit();
-        self.render_arena.deinit();
-        self.app.deinit();
-        self.gpa.destroy(self);
+        s.deps.bookings.deinit(s.gpa);
     }
 
-    pub fn setCsrf(self: *Session, token: []u8) void {
-        if (self.csrf_token.len != 0) self.gpa.free(self.csrf_token);
-        self.csrf_token = token;
+    /// `Deps.wire` — pure-phase reducers. The skeleton installs the
+    /// render after-flush hook after this returns.
+    pub fn wire(s: *Session) void {
+        s.deps.mutate.onReducer(s, &applyMutation);
     }
 
+    /// `Deps.validPath` — single-route app: only "/" is a page route,
+    /// so bogus paths 404 before a session is minted (the same gate
+    /// the hand-rolled `validPath` applied).
     pub fn validPath(path: []const u8) bool {
         return std.mem.eql(u8, path, "/");
     }
 
-    pub fn setRoute(_: *Session, path: []const u8) bool {
-        return std.mem.eql(u8, path, "/");
-    }
-
-    pub fn servePage(self: *Session, path: []const u8, writer: anytype) !bool {
-        if (!self.setRoute(path)) return false;
-        self.dom.reset();
-        try self.writeView(writer);
-        self.seedDom();
-        return true;
-    }
-
-    /// Per-session model — nothing external changes between polls.
-    pub fn syncPull(_: *Session) void {}
-
-    // ── cart math ─────────────────────────────────────────────────
-
-    fn hasSvc(self: *Session, id: u32) bool {
-        return self.services.contains(id);
-    }
-
-    fn catCount(self: *Session, cat: CarData.Cat) u32 {
-        var n: u32 = 0;
-        var it = self.services.keyIterator();
-        while (it.next()) |id| {
-            if (CarData.serviceAt(id.*)) |sv| {
-                if (sv.cat == cat) n += 1;
-            }
-        }
-        return n;
-    }
-
-    fn catSubtotal(self: *Session, cat: CarData.Cat) u32 {
-        var sum: u32 = 0;
-        var it = self.services.keyIterator();
-        while (it.next()) |id| {
-            if (CarData.serviceAt(id.*)) |sv| {
-                if (sv.cat == cat) sum += sv.price;
-            }
-        }
-        return sum;
-    }
-
-    pub const Discount = struct { label: []const u8, amount: u32 };
-
-    /// Active combo discounts, in display order — written into `buf`
-    /// (max 3) so no slice to stack memory escapes.
-    fn discounts(self: *Session, buf: []Discount) []const Discount {
-        var n: usize = 0;
-        const maint_n = self.catCount(.maintenance);
-        if (maint_n >= 3) {
-            buf[n] = .{ .label = "Лояльность: 3+ ТО — скидка 15% на ТО", .amount = self.catSubtotal(.maintenance) * 15 / 100 };
-            n += 1;
-        }
-        if (self.hasSvc(16) and self.hasSvc(17)) {
-            buf[n] = .{ .label = "Комбо: шиномонтаж + балансировка −20%", .amount = (CarData.serviceAt(16).?.price + CarData.serviceAt(17).?.price) * 20 / 100 };
-            n += 1;
-        }
-        const sub = self.subtotal();
-        if (sub >= 20000) {
-            buf[n] = .{ .label = "Крупный заказ — скидка 10%", .amount = sub * 10 / 100 };
-            n += 1;
-        }
-        return buf[0..n];
-    }
-
-    fn subtotal(self: *Session) u32 {
-        var sum: u32 = 0;
-        var it = self.services.keyIterator();
-        while (it.next()) |id| {
-            if (CarData.serviceAt(id.*)) |sv| sum += sv.price;
-        }
-        return sum;
-    }
-
-    fn total(self: *Session) u32 {
-        var t = self.subtotal();
-        var buf: [3]Discount = undefined;
-        for (self.discounts(&buf)) |d| t -|= d.amount;
-        return t;
-    }
-
-    /// Selected ids sorted ascending — stable order for the summary list.
-    fn cartIds(self: *Session, a: std.mem.Allocator) []u32 {
-        const ids = a.alloc(u32, self.services.count()) catch @panic("OOM");
-        var n: usize = 0;
-        var it = self.services.keyIterator();
-        while (it.next()) |id| {
-            ids[n] = id.*;
-            n += 1;
-        }
-        // insertion sort — cart is tiny
-        var i: usize = 1;
-        while (i < n) : (i += 1) {
-            const v = ids[i];
-            var j = i;
-            while (j > 0 and ids[j - 1] > v) {
-                ids[j] = ids[j - 1];
-                j -= 1;
-            }
-            ids[j] = v;
-        }
-        return ids[0..n];
-    }
-
-    pub const Suggestion = struct { id: u32, reason: []const u8 };
-
-    /// Context upsells: derived from the chosen vehicle and the current
-    /// cart. Deduped by service id, in rule order.
-    fn suggestions(self: *Session, a: std.mem.Allocator) []const Suggestion {
-        var out: std.ArrayListUnmanaged(Suggestion) = .empty;
-        const add = struct {
-            fn f(list: *std.ArrayListUnmanaged(Suggestion), alloc: std.mem.Allocator, id: u32, reason: []const u8) void {
-                for (list.items) |s| {
-                    if (s.id == id) return;
-                }
-                list.append(alloc, .{ .id = id, .reason = reason }) catch @panic("OOM");
-            }
-        }.f;
-
-        var it = self.services.keyIterator();
-        var has_engine = false;
-        var has_gearbox = false;
-        while (it.next()) |id| {
-            if (CarData.serviceAt(id.*)) |sv| {
-                has_engine = has_engine or sv.cat == .engine;
-                has_gearbox = has_gearbox or sv.cat == .gearbox;
-            }
-        }
-        if (has_engine and !self.hasSvc(9)) add(&out, a, 9, "Вместе с работами по двигателю");
-        if (has_gearbox and !self.hasSvc(10)) add(&out, a, 10, "Вместе с работами по коробке");
-        if (self.hasSvc(16) and !self.hasSvc(17)) add(&out, a, 17, "В пару к шиномонтажу");
-        if (self.hasSvc(13) and !self.hasSvc(14)) add(&out, a, 14, "Геометрия после амортизаторов");
-        if (self.year) |y| {
-            if (y <= 2014 and !self.hasSvc(6)) {
-                const reason = std.fmt.allocPrint(a, "Авто {d} г.в. — износ цепи ГРМ", .{y}) catch unreachable;
-                add(&out, a, 6, reason);
-            }
-        }
-        if (self.services.count() >= 4) add(&out, a, 21, "Перед выдачей — проверить электрику");
-        return out.items;
-    }
-
-    fn vehicleComplete(self: *Session) bool {
-        return self.brand != null and self.model != null and self.year != null;
-    }
-
-    fn carDesc(self: *Session, a: std.mem.Allocator) []u8 {
-        const b = CarData.brandAt(self.brand.?).?;
-        const m = CarData.modelAt(self.brand.?, self.model.?).?;
-        return std.fmt.allocPrint(a, "{s} {s} {d}", .{ b.name, m.name, self.year.? }) catch @panic("OOM");
-    }
-
-    // ── actions ────────────────────────────────────────────────────
-
+    /// `Deps.dispatch` — whitelisted action entry point: the DOM event
+    /// protocol maps to a Mutation emitted into the graph; the flush
+    /// applies it (pure phase) and the skeleton's after-flush hook
+    /// renders DOM patches into `s.log`.
     pub fn dispatch(
-        self: *Session,
+        s: *Session,
         action: []const u8,
         arg: ?[]const u8,
         value: ?[]const u8,
         fields: ?*const std.json.ObjectMap,
     ) ActionError!void {
         if (std.mem.eql(u8, action, "set_brand")) {
-            const i = try self.argIdx(value orelse arg, CarData.brands.len);
-            self.mutate.emit(.{ .set_brand = i });
+            const i = try argIdx(value orelse arg, CarData.brands.len);
+            s.deps.mutate.emit(.{ .set_brand = i });
         } else if (std.mem.eql(u8, action, "set_model")) {
-            const i = try self.argIdx(value orelse arg, if (self.brand) |b| CarData.brandAt(b).?.models.len else 0);
-            self.mutate.emit(.{ .set_model = i });
+            const i = try argIdx(value orelse arg, if (s.deps.brand) |b| CarData.brandAt(b).?.models.len else 0);
+            s.deps.mutate.emit(.{ .set_model = i });
         } else if (std.mem.eql(u8, action, "set_year")) {
             const a_str = value orelse arg orelse return error.InvalidAction;
             const y = std.fmt.parseInt(u16, a_str, 10) catch return error.InvalidChoice;
-            const m = if (self.brand != null and self.model != null)
-                CarData.modelAt(self.brand.?, self.model.?)
+            const m = if (s.deps.brand != null and s.deps.model != null)
+                CarData.modelAt(s.deps.brand.?, s.deps.model.?)
             else
                 null;
             const md = m orelse return error.InvalidChoice;
             if (y < md.year_lo or y > md.year_hi) return error.InvalidChoice;
-            self.mutate.emit(.{ .set_year = y });
+            s.deps.mutate.emit(.{ .set_year = y });
         } else if (std.mem.eql(u8, action, "toggle_svc") or std.mem.eql(u8, action, "add_svc")) {
             const a_str = arg orelse return error.InvalidAction;
             const id = std.fmt.parseInt(u32, a_str, 10) catch return error.InvalidChoice;
             if (CarData.serviceAt(id) == null) return error.InvalidChoice;
             if (std.mem.eql(u8, action, "toggle_svc")) {
-                self.mutate.emit(.{ .toggle_svc = id });
+                s.deps.mutate.emit(.{ .toggle_svc = id });
             } else {
-                self.mutate.emit(.{ .add_svc = id });
+                s.deps.mutate.emit(.{ .add_svc = id });
             }
         } else if (std.mem.eql(u8, action, "book")) {
             const f = fields orelse return error.InvalidAction;
@@ -288,111 +130,231 @@ pub const Session = struct {
             const n = std.mem.trim(u8, name, " \t\r\n");
             const p = std.mem.trim(u8, phone, " \t\r\n");
             if (n.len < 2 or p.len < 5) return error.BadContact;
-            if (!self.vehicleComplete()) return error.IncompleteVehicle;
-            if (self.services.count() == 0) return error.EmptyCart;
-            self.mutate.emit(.{ .book = .{ .name = n, .phone = p } });
+            if (!vehicleComplete(s)) return error.IncompleteVehicle;
+            if (s.deps.services.count() == 0) return error.EmptyCart;
+            s.deps.mutate.emit(.{ .book = .{ .name = n, .phone = p } });
         } else {
             return error.InvalidAction;
         }
     }
 
-    fn argIdx(_: *Session, arg: ?[]const u8, bound: usize) ActionError!usize {
-        const a = arg orelse return error.InvalidAction;
-        const i = std.fmt.parseInt(usize, a, 10) catch return error.InvalidChoice;
-        if (i >= bound) return error.InvalidChoice;
-        return i;
-    }
-
-    fn fieldStr(f: *const std.json.ObjectMap, key: []const u8) ActionError![]const u8 {
-        const v = f.get(key) orelse return error.InvalidAction;
-        return switch (v) {
-            .string => |s| s,
-            else => error.InvalidAction,
-        };
-    }
-
-    // ── graph wiring ───────────────────────────────────────────────
-
-    fn wire(self: *Session) void {
-        const eng = &self.app.eng;
-        self.mutate.onReducer(self, &Session.applyMutation);
-
-        eng.onAfterFlush(.{
-            .ctx = @ptrCast(self),
-            .call = &struct {
-                fn render(raw: *anyopaque) void {
-                    const s: *Session = @ptrCast(@alignCast(raw));
-                    s.render();
-                }
-            }.render,
-        });
-    }
-
-    fn applyMutation(self: *Session, m: Mutation) void {
-        switch (m) {
-            .set_brand => |i| {
-                self.brand = i;
-                self.model = null;
-                self.year = null;
-            },
-            .set_model => |i| {
-                self.model = i;
-                self.year = null;
-            },
-            .set_year => |y| self.year = y,
-            .toggle_svc => |id| {
-                if (self.services.fetchRemove(id)) |_| {
-                    // removed
-                } else {
-                    self.services.put(self.gpa, id, {}) catch @panic("OOM");
-                }
-            },
-            .add_svc => |id| {
-                if (!self.services.contains(id)) {
-                    self.services.put(self.gpa, id, {}) catch @panic("OOM");
-                }
-            },
-            .book => |b| {
-                const car = self.carDesc(self.gpa);
-                self.bookings.append(self.gpa, .{
-                    .id = self.next_booking,
-                    .name = self.gpa.dupe(u8, b.name) catch @panic("OOM"),
-                    .phone = self.gpa.dupe(u8, b.phone) catch @panic("OOM"),
-                    .car = car,
-                    .items = @intCast(self.services.count()),
-                    .total = self.total(),
-                }) catch @panic("OOM");
-                self.next_booking += 1;
-                self.services.clearRetainingCapacity();
-            },
-        }
-        self.seq.set(self.seq.get() + 1);
-    }
-
-    // ── rendering ──────────────────────────────────────────────────
-
-    fn render(self: *Session) void {
-        _ = self.render_arena.reset(.retain_capacity);
-        const a = self.render_arena.allocator();
-        forest.diff(a, buildView(a, self), &self.dom, &self.log);
-        self.log.revision = self.seq.get();
-    }
-
-    pub fn writeView(self: *Session, writer: anytype) !void {
-        _ = self.render_arena.reset(.retain_capacity);
-        const a = self.render_arena.allocator();
-        try forest.writeHtml(a, buildView(a, self), writer);
-    }
-
-    pub fn buildViewNodes(self: *Session, a: std.mem.Allocator) []const forest.Node {
-        return buildView(a, self);
-    }
-
-    pub fn seedDom(self: *Session) void {
-        self.render();
-        self.log.clear();
+    /// `Deps.view` — the `<main>` body. Single-route app: `env.route`
+    /// is always "/"; the tree is `buildView` below.
+    pub fn view(a: std.mem.Allocator, s: *Session, env: *const zmeta.Env) []const forest.Node {
+        _ = env;
+        return buildView(a, s);
     }
 };
+
+/// One browser session: an isolated zefx graph + booking draft + DOM
+/// patch state, provided by the zmeta skeleton (see zmeta/session.zig).
+pub const Session = zmeta.Session(CarDeps);
+
+/// Wired session constructor for tests — the server mints sessions via
+/// `Session.create(gpa, io)`; zcar mints no tokens so `io` is unused.
+pub fn createSession(gpa: std.mem.Allocator) *Session {
+    return Session.create(gpa, std.testing.io);
+}
+
+// ── cart math ─────────────────────────────────────────────────
+
+fn hasSvc(s: *Session, id: u32) bool {
+    return s.deps.services.contains(id);
+}
+
+fn catCount(s: *Session, cat: CarData.Cat) u32 {
+    var n: u32 = 0;
+    var it = s.deps.services.keyIterator();
+    while (it.next()) |id| {
+        if (CarData.serviceAt(id.*)) |sv| {
+            if (sv.cat == cat) n += 1;
+        }
+    }
+    return n;
+}
+
+fn catSubtotal(s: *Session, cat: CarData.Cat) u32 {
+    var sum: u32 = 0;
+    var it = s.deps.services.keyIterator();
+    while (it.next()) |id| {
+        if (CarData.serviceAt(id.*)) |sv| {
+            if (sv.cat == cat) sum += sv.price;
+        }
+    }
+    return sum;
+}
+
+pub const Discount = struct { label: []const u8, amount: u32 };
+
+/// Active combo discounts, in display order — written into `buf`
+/// (max 3) so no slice to stack memory escapes.
+fn discounts(s: *Session, buf: []Discount) []const Discount {
+    var n: usize = 0;
+    const maint_n = catCount(s, .maintenance);
+    if (maint_n >= 3) {
+        buf[n] = .{ .label = "Лояльность: 3+ ТО — скидка 15% на ТО", .amount = catSubtotal(s, .maintenance) * 15 / 100 };
+        n += 1;
+    }
+    if (hasSvc(s, 16) and hasSvc(s, 17)) {
+        buf[n] = .{ .label = "Комбо: шиномонтаж + балансировка −20%", .amount = (CarData.serviceAt(16).?.price + CarData.serviceAt(17).?.price) * 20 / 100 };
+        n += 1;
+    }
+    const sub = subtotal(s);
+    if (sub >= 20000) {
+        buf[n] = .{ .label = "Крупный заказ — скидка 10%", .amount = sub * 10 / 100 };
+        n += 1;
+    }
+    return buf[0..n];
+}
+
+fn subtotal(s: *Session) u32 {
+    var sum: u32 = 0;
+    var it = s.deps.services.keyIterator();
+    while (it.next()) |id| {
+        if (CarData.serviceAt(id.*)) |sv| sum += sv.price;
+    }
+    return sum;
+}
+
+fn total(s: *Session) u32 {
+    var t = subtotal(s);
+    var buf: [3]Discount = undefined;
+    for (discounts(s, &buf)) |d| t -|= d.amount;
+    return t;
+}
+
+/// Selected ids sorted ascending — stable order for the summary list.
+fn cartIds(s: *Session, a: std.mem.Allocator) []u32 {
+    const ids = a.alloc(u32, s.deps.services.count()) catch @panic("OOM");
+    var n: usize = 0;
+    var it = s.deps.services.keyIterator();
+    while (it.next()) |id| {
+        ids[n] = id.*;
+        n += 1;
+    }
+    // insertion sort — cart is tiny
+    var i: usize = 1;
+    while (i < n) : (i += 1) {
+        const v = ids[i];
+        var j = i;
+        while (j > 0 and ids[j - 1] > v) {
+            ids[j] = ids[j - 1];
+            j -= 1;
+        }
+        ids[j] = v;
+    }
+    return ids[0..n];
+}
+
+pub const Suggestion = struct { id: u32, reason: []const u8 };
+
+/// Context upsells: derived from the chosen vehicle and the current
+/// cart. Deduped by service id, in rule order.
+fn suggestions(s: *Session, a: std.mem.Allocator) []const Suggestion {
+    var out: std.ArrayListUnmanaged(Suggestion) = .empty;
+    const add = struct {
+        fn f(list: *std.ArrayListUnmanaged(Suggestion), alloc: std.mem.Allocator, id: u32, reason: []const u8) void {
+            for (list.items) |sug| {
+                if (sug.id == id) return;
+            }
+            list.append(alloc, .{ .id = id, .reason = reason }) catch @panic("OOM");
+        }
+    }.f;
+
+    var it = s.deps.services.keyIterator();
+    var has_engine = false;
+    var has_gearbox = false;
+    while (it.next()) |id| {
+        if (CarData.serviceAt(id.*)) |sv| {
+            has_engine = has_engine or sv.cat == .engine;
+            has_gearbox = has_gearbox or sv.cat == .gearbox;
+        }
+    }
+    if (has_engine and !hasSvc(s, 9)) add(&out, a, 9, "Вместе с работами по двигателю");
+    if (has_gearbox and !hasSvc(s, 10)) add(&out, a, 10, "Вместе с работами по коробке");
+    if (hasSvc(s, 16) and !hasSvc(s, 17)) add(&out, a, 17, "В пару к шиномонтажу");
+    if (hasSvc(s, 13) and !hasSvc(s, 14)) add(&out, a, 14, "Геометрия после амортизаторов");
+    if (s.deps.year) |y| {
+        if (y <= 2014 and !hasSvc(s, 6)) {
+            const reason = std.fmt.allocPrint(a, "Авто {d} г.в. — износ цепи ГРМ", .{y}) catch unreachable;
+            add(&out, a, 6, reason);
+        }
+    }
+    if (s.deps.services.count() >= 4) add(&out, a, 21, "Перед выдачей — проверить электрику");
+    return out.items;
+}
+
+fn vehicleComplete(s: *Session) bool {
+    return s.deps.brand != null and s.deps.model != null and s.deps.year != null;
+}
+
+fn carDesc(s: *Session, a: std.mem.Allocator) []u8 {
+    const b = CarData.brandAt(s.deps.brand.?).?;
+    const m = CarData.modelAt(s.deps.brand.?, s.deps.model.?).?;
+    return std.fmt.allocPrint(a, "{s} {s} {d}", .{ b.name, m.name, s.deps.year.? }) catch @panic("OOM");
+}
+
+// ── action helpers ──────────────────────────────────────────────
+
+fn argIdx(arg: ?[]const u8, bound: usize) ActionError!usize {
+    const a = arg orelse return error.InvalidAction;
+    const i = std.fmt.parseInt(usize, a, 10) catch return error.InvalidChoice;
+    if (i >= bound) return error.InvalidChoice;
+    return i;
+}
+
+fn fieldStr(f: *const std.json.ObjectMap, key: []const u8) ActionError![]const u8 {
+    const v = f.get(key) orelse return error.InvalidAction;
+    return switch (v) {
+        .string => |s| s,
+        else => error.InvalidAction,
+    };
+}
+
+// ── graph wiring ───────────────────────────────────────────────
+
+/// mutate reducer — pure-phase model change, then bump the revision
+/// (the skeleton's after-flush hook renders the diff).
+fn applyMutation(s: *Session, m: Mutation) void {
+    switch (m) {
+        .set_brand => |i| {
+            s.deps.brand = i;
+            s.deps.model = null;
+            s.deps.year = null;
+        },
+        .set_model => |i| {
+            s.deps.model = i;
+            s.deps.year = null;
+        },
+        .set_year => |y| s.deps.year = y,
+        .toggle_svc => |id| {
+            if (s.deps.services.fetchRemove(id)) |_| {
+                // removed
+            } else {
+                s.deps.services.put(s.gpa, id, {}) catch @panic("OOM");
+            }
+        },
+        .add_svc => |id| {
+            if (!s.deps.services.contains(id)) {
+                s.deps.services.put(s.gpa, id, {}) catch @panic("OOM");
+            }
+        },
+        .book => |b| {
+            const car = carDesc(s, s.gpa);
+            s.deps.bookings.append(s.gpa, .{
+                .id = s.deps.next_booking,
+                .name = s.gpa.dupe(u8, b.name) catch @panic("OOM"),
+                .phone = s.gpa.dupe(u8, b.phone) catch @panic("OOM"),
+                .car = car,
+                .items = @intCast(s.deps.services.count()),
+                .total = total(s),
+            }) catch @panic("OOM");
+            s.deps.next_booking += 1;
+            s.deps.services.clearRetainingCapacity();
+        },
+    }
+    s.bumpSeq();
+}
 
 // ── formatting helpers ────────────────────────────────────────────
 
@@ -487,41 +449,41 @@ fn vehicleView(a: std.mem.Allocator, s: *Session) forest.Node {
     parts.append(a, forest.el(a, .h2, .{ .class = "sec" }, "1. Автомобиль")) catch @panic("OOM");
 
     var bitems = std.ArrayListUnmanaged(OptItem).empty;
-    bitems.append(a, .{ .key = "x", .val = "", .label = "— марка —", .sel = s.brand == null, .dis = true }) catch @panic("OOM");
+    bitems.append(a, .{ .key = "x", .val = "", .label = "— марка —", .sel = s.deps.brand == null, .dis = true }) catch @panic("OOM");
     for (CarData.brands, 0..) |b, i| {
         const v = numStr(a, i);
-        bitems.append(a, .{ .key = v, .val = v, .label = b.name, .sel = s.brand != null and s.brand.? == i }) catch @panic("OOM");
+        bitems.append(a, .{ .key = v, .val = v, .label = b.name, .sel = s.deps.brand != null and s.deps.brand.? == i }) catch @panic("OOM");
     }
-    parts.append(a, fld(a, "Марка", selectEl(a, "sel-brand", "set_brand", if (s.brand) |b| numStr(a, b) else "", false, "brand", bitems.items))) catch @panic("OOM");
+    parts.append(a, fld(a, "Марка", selectEl(a, "sel-brand", "set_brand", if (s.deps.brand) |b| numStr(a, b) else "", false, "brand", bitems.items))) catch @panic("OOM");
 
     var mitems = std.ArrayListUnmanaged(OptItem).empty;
-    mitems.append(a, .{ .key = "x", .val = "", .label = "— модель —", .sel = s.model == null, .dis = true }) catch @panic("OOM");
-    if (s.brand) |bi| {
+    mitems.append(a, .{ .key = "x", .val = "", .label = "— модель —", .sel = s.deps.model == null, .dis = true }) catch @panic("OOM");
+    if (s.deps.brand) |bi| {
         const br = CarData.brandAt(bi).?;
         for (br.models, 0..) |m, i| {
             const v = numStr(a, i);
-            mitems.append(a, .{ .key = v, .val = v, .label = m.name, .sel = s.model != null and s.model.? == i }) catch @panic("OOM");
+            mitems.append(a, .{ .key = v, .val = v, .label = m.name, .sel = s.deps.model != null and s.deps.model.? == i }) catch @panic("OOM");
         }
     }
-    parts.append(a, fld(a, "Модель", selectEl(a, "sel-model", "set_model", if (s.model) |m| numStr(a, m) else "", s.brand == null, "model", mitems.items))) catch @panic("OOM");
+    parts.append(a, fld(a, "Модель", selectEl(a, "sel-model", "set_model", if (s.deps.model) |m| numStr(a, m) else "", s.deps.brand == null, "model", mitems.items))) catch @panic("OOM");
 
     var yitems = std.ArrayListUnmanaged(OptItem).empty;
-    yitems.append(a, .{ .key = "x", .val = "", .label = "— год —", .sel = s.year == null, .dis = true }) catch @panic("OOM");
-    if (s.brand != null and s.model != null) {
-        const md = CarData.modelAt(s.brand.?, s.model.?).?;
+    yitems.append(a, .{ .key = "x", .val = "", .label = "— год —", .sel = s.deps.year == null, .dis = true }) catch @panic("OOM");
+    if (s.deps.brand != null and s.deps.model != null) {
+        const md = CarData.modelAt(s.deps.brand.?, s.deps.model.?).?;
         var y = md.year_lo;
         while (y <= md.year_hi) : (y += 1) {
             const v = numStr(a, y);
-            yitems.append(a, .{ .key = v, .val = v, .label = v, .sel = s.year != null and s.year.? == y }) catch @panic("OOM");
+            yitems.append(a, .{ .key = v, .val = v, .label = v, .sel = s.deps.year != null and s.deps.year.? == y }) catch @panic("OOM");
         }
     }
-    parts.append(a, fld(a, "Год", selectEl(a, "sel-year", "set_year", if (s.year) |y| numStr(a, y) else "", s.brand == null or s.model == null, "year", yitems.items))) catch @panic("OOM");
+    parts.append(a, fld(a, "Год", selectEl(a, "sel-year", "set_year", if (s.deps.year) |y| numStr(a, y) else "", s.deps.brand == null or s.deps.model == null, "year", yitems.items))) catch @panic("OOM");
 
-    if (s.vehicleComplete()) {
-        const b = CarData.brandAt(s.brand.?).?;
-        const m = CarData.modelAt(s.brand.?, s.model.?).?;
+    if (vehicleComplete(s)) {
+        const b = CarData.brandAt(s.deps.brand.?).?;
+        const m = CarData.modelAt(s.deps.brand.?, s.deps.model.?).?;
         const spec = std.fmt.allocPrint(a, "{s} {s} · {d} г. · {s} · {s} · {s} привод", .{
-            b.name, m.name, s.year.?, m.spec.engine, m.spec.gearbox, m.spec.drivetrain,
+            b.name, m.name, s.deps.year.?, m.spec.engine, m.spec.gearbox, m.spec.drivetrain,
         }) catch @panic("OOM");
         // Mounted through a when-anchor: non-keyed children can't appear
         // or disappear via diff — only bound leaves and branch swaps can.
@@ -533,7 +495,7 @@ fn vehicleView(a: std.mem.Allocator, s: *Session) forest.Node {
 }
 
 fn svcCard(a: std.mem.Allocator, s: *Session, sv: *const CarData.Service) forest.Node {
-    const on = s.hasSvc(sv.id);
+    const on = hasSvc(s, sv.id);
     var kids = std.ArrayListUnmanaged(forest.Node).empty;
     kids.append(a, forest.el(a, .span, .{ .class = "svc-name" }, sv.name)) catch @panic("OOM");
     kids.append(a, forest.el(a, .span, .{ .class = "svc-meta" }, forest.fragment(a, .{
@@ -573,13 +535,13 @@ fn servicesView(a: std.mem.Allocator, s: *Session) forest.Node {
     return forest.el(a, .section, .{ .class = "vsec" }, parts.items);
 }
 
-const UpsellCtx = struct { s: *Session, sugs: []const Session.Suggestion };
+const UpsellCtx = struct { s: *Session, sugs: []const Suggestion };
 
 fn upsellOrNull(a: std.mem.Allocator, ctx: UpsellCtx, i: usize) ?forest.Node {
     if (i >= ctx.sugs.len) return null;
     const sug = ctx.sugs[i];
     const sv = CarData.serviceAt(sug.id) orelse return null;
-    const in_cart = ctx.s.hasSvc(sug.id);
+    const in_cart = hasSvc(ctx.s, sug.id);
     return forest.el(a, .div, .{
         .id = std.fmt.allocPrint(a, "upsell-{d}", .{sv.id}) catch @panic("OOM"),
         .class = "upsell",
@@ -603,7 +565,7 @@ fn upsellOrNull(a: std.mem.Allocator, ctx: UpsellCtx, i: usize) ?forest.Node {
 }
 
 fn upsellsView(a: std.mem.Allocator, s: *Session) forest.Node {
-    const sugs = s.suggestions(a);
+    const sugs = suggestions(s, a);
     return forest.when(a, .{ .id = "w-upsell" }, sugs.len > 0, forest.el(a, .section, .{ .class = "vsec" }, .{
         forest.el(a, .h2, .{ .class = "sec" }, "Рекомендуем"),
         forest.el(a, .div, .{ .class = "upsell-list", .id = "upsells" }, forest.eachOf(a, idxSlice(a, sugs.len), UpsellCtx{ .s = s, .sugs = sugs }, upsellOrNull)),
@@ -632,13 +594,13 @@ fn sumOrNull(a: std.mem.Allocator, ctx: SumCtx, id: u32) ?forest.Node {
 }
 
 fn summaryView(a: std.mem.Allocator, s: *Session) forest.Node {
-    const ids = s.cartIds(a);
+    const ids = cartIds(s, a);
     return forest.when(a, .{ .id = "w-sum" }, ids.len > 0, blk: {
         var kids = std.ArrayListUnmanaged(forest.Node).empty;
         kids.append(a, forest.el(a, .h2, .{ .class = "sec" }, "3. Заказ")) catch @panic("OOM");
         kids.append(a, forest.el(a, .div, .{ .class = "sum-list", .id = "cart" }, forest.eachOf(a, ids, SumCtx{ .s = s, .ids = ids }, sumOrNull))) catch @panic("OOM");
-        const dbuf = a.alloc(Session.Discount, 3) catch @panic("OOM");
-        for (s.discounts(dbuf), 0..) |d, i| {
+        const dbuf = a.alloc(Discount, 3) catch @panic("OOM");
+        for (discounts(s, dbuf), 0..) |d, i| {
             kids.append(a, sumLine(
                 a,
                 std.fmt.allocPrint(a, "disc-{d}", .{i}) catch @panic("OOM"),
@@ -649,7 +611,7 @@ fn summaryView(a: std.mem.Allocator, s: *Session) forest.Node {
         }
         kids.append(a, forest.el(a, .div, .{ .id = "sum-total", .class = "sum-total" }, .{
             forest.el(a, .span, .{ .lid = "lbl", .text = "Итого" }, .{}),
-            forest.el(a, .span, .{ .lid = "val", .text = std.fmt.allocPrint(a, "{s} ₽", .{fmtPrice(a, s.total())}) catch @panic("OOM") }, .{}),
+            forest.el(a, .span, .{ .lid = "val", .text = std.fmt.allocPrint(a, "{s} ₽", .{fmtPrice(a, total(s))}) catch @panic("OOM") }, .{}),
         })) catch @panic("OOM");
         kids.append(a, forest.el(a, .form, .{
             .class = "book-form",
@@ -681,9 +643,9 @@ fn bookOrNull(a: std.mem.Allocator, ctx: BookCtx, b: Booking) ?forest.Node {
 }
 
 fn bookingsView(a: std.mem.Allocator, s: *Session) forest.Node {
-    return forest.when(a, .{ .id = "w-book" }, s.bookings.items.len > 0, forest.el(a, .section, .{ .class = "vsec" }, .{
+    return forest.when(a, .{ .id = "w-book" }, s.deps.bookings.items.len > 0, forest.el(a, .section, .{ .class = "vsec" }, .{
         forest.el(a, .h2, .{ .class = "sec" }, "Записи"),
-        forest.el(a, .div, .{ .class = "book-list", .id = "bookings" }, forest.eachOf(a, s.bookings.items, BookCtx{ .s = s }, bookOrNull)),
+        forest.el(a, .div, .{ .class = "book-list", .id = "bookings" }, forest.eachOf(a, s.deps.bookings.items, BookCtx{ .s = s }, bookOrNull)),
     }));
 }
 
@@ -707,32 +669,32 @@ fn stateJson(a: std.mem.Allocator, s: *Session) []const u8 {
     w.writeAll("\"rev\":") catch @panic("OOM");
     jwNum(w, s.seq.get());
     w.writeAll(",\"vehicle\":") catch @panic("OOM");
-    if (s.brand != null and s.model != null and s.year != null) {
-        const b = CarData.brandAt(s.brand.?).?;
-        const m = CarData.modelAt(s.brand.?, s.model.?).?;
+    if (s.deps.brand != null and s.deps.model != null and s.deps.year != null) {
+        const b = CarData.brandAt(s.deps.brand.?).?;
+        const m = CarData.modelAt(s.deps.brand.?, s.deps.model.?).?;
         w.writeByte('{') catch @panic("OOM");
         w.writeAll("\"brand\":") catch @panic("OOM");
         jwStr(w, b.name);
         w.writeAll(",\"model\":") catch @panic("OOM");
         jwStr(w, m.name);
         w.writeAll(",\"year\":") catch @panic("OOM");
-        jwNum(w, s.year.?);
+        jwNum(w, s.deps.year.?);
         w.writeByte('}') catch @panic("OOM");
     } else {
         w.writeAll("null") catch @panic("OOM");
     }
     w.writeAll(",\"services\":[") catch @panic("OOM");
-    const ids = s.cartIds(a);
+    const ids = cartIds(s, a);
     for (ids, 0..) |id, i| {
         if (i != 0) w.writeByte(',') catch @panic("OOM");
         jwNum(w, id);
     }
     w.writeByte(']') catch @panic("OOM");
     w.writeAll(",\"subtotal\":") catch @panic("OOM");
-    jwNum(w, s.subtotal());
+    jwNum(w, subtotal(s));
     w.writeAll(",\"discounts\":[") catch @panic("OOM");
-    var dbuf: [3]Session.Discount = undefined;
-    for (s.discounts(&dbuf), 0..) |d, i| {
+    var dbuf: [3]Discount = undefined;
+    for (discounts(s, &dbuf), 0..) |d, i| {
         if (i != 0) w.writeByte(',') catch @panic("OOM");
         w.writeByte('{') catch @panic("OOM");
         w.writeAll("\"label\":") catch @panic("OOM");
@@ -743,9 +705,9 @@ fn stateJson(a: std.mem.Allocator, s: *Session) []const u8 {
     }
     w.writeByte(']') catch @panic("OOM");
     w.writeAll(",\"total\":") catch @panic("OOM");
-    jwNum(w, s.total());
+    jwNum(w, total(s));
     w.writeAll(",\"bookings\":[") catch @panic("OOM");
-    for (s.bookings.items, 0..) |b, i| {
+    for (s.deps.bookings.items, 0..) |b, i| {
         if (i != 0) w.writeByte(',') catch @panic("OOM");
         w.writeByte('{') catch @panic("OOM");
         w.writeAll("\"id\":") catch @panic("OOM");
@@ -791,26 +753,6 @@ fn buildView(a: std.mem.Allocator, s: *Session) []const forest.Node {
     return nodes;
 }
 
-// ── session factory ───────────────────────────────────────────────
-
-pub fn createSession(gpa: std.mem.Allocator) *Session {
-    const s = gpa.create(Session) catch @panic("OOM");
-    s.* = .{
-        .gpa = gpa,
-        .app = zefx.createApp(gpa),
-        .mutate = undefined,
-        .seq = undefined,
-        .dom = forest.Dom.init(gpa),
-        .log = forest.PatchLog.init(gpa),
-        .history = History.init(gpa),
-        .render_arena = std.heap.ArenaAllocator.init(gpa),
-    };
-    s.mutate = s.app.createEvent(Mutation);
-    s.seq = s.app.createStore(u64, 0);
-    s.wire();
-    return s;
-}
-
 // ── tests ─────────────────────────────────────────────────────────
 
 fn patchJson(s: *Session, alloc: std.mem.Allocator) []u8 {
@@ -834,15 +776,15 @@ test "vehicle cascade resets downstream choices" {
     s.seedDom();
 
     try s.dispatch("set_brand", "0", null, null);
-    try std.testing.expectEqual(@as(?usize, 0), s.brand);
+    try std.testing.expectEqual(@as(?usize, 0), s.deps.brand);
     try s.dispatch("set_model", "0", null, null);
     try s.dispatch("set_year", "2018", null, null);
-    try std.testing.expect(s.vehicleComplete());
+    try std.testing.expect(vehicleComplete(s));
 
     // brand switch resets model+year
     try s.dispatch("set_brand", "4", null, null);
-    try std.testing.expectEqual(@as(?usize, 4), s.brand);
-    try std.testing.expect(s.model == null and s.year == null);
+    try std.testing.expectEqual(@as(?usize, 4), s.deps.brand);
+    try std.testing.expect(s.deps.model == null and s.deps.year == null);
 
     // out-of-range / bad args rejected
     try std.testing.expectError(error.InvalidChoice, s.dispatch("set_brand", "99", null, null));
@@ -864,22 +806,22 @@ test "cart, combos and booking" {
     try s.dispatch("toggle_svc", "1", null, null);
     try s.dispatch("toggle_svc", "2", null, null);
     try s.dispatch("toggle_svc", "3", null, null);
-    const sub = s.subtotal();
+    const sub = subtotal(s);
     try std.testing.expectEqual(@as(u32, 4500 + 6800 + 9200), sub);
-    var dbuf: [3]Session.Discount = undefined;
-    const discs = s.discounts(&dbuf);
+    var dbuf: [3]Discount = undefined;
+    const discs = discounts(s, &dbuf);
     // 3×ТО combo (15% of 20 500) + big-order combo (10% of 20 500).
     try std.testing.expectEqual(@as(usize, 2), discs.len);
     try std.testing.expectEqual(@as(u32, sub * 15 / 100), discs[0].amount);
     try std.testing.expectEqual(@as(u32, sub * 10 / 100), discs[1].amount);
     var expect_total = sub;
     for (discs) |d| expect_total -|= d.amount;
-    try std.testing.expectEqual(expect_total, s.total());
+    try std.testing.expectEqual(expect_total, total(s));
 
     // toggle off removes
     try s.dispatch("toggle_svc", "3", null, null);
-    try std.testing.expect(!s.hasSvc(3));
-    try std.testing.expectEqual(@as(usize, 0), s.discounts(&dbuf).len);
+    try std.testing.expect(!hasSvc(s, 3));
+    try std.testing.expectEqual(@as(usize, 0), discounts(s, &dbuf).len);
 
     // book without contact → BadContact; with → booking + cart cleared
     var f = fields2(alloc, "cust", "Ivan", "phone", "123");
@@ -890,11 +832,11 @@ test "cart, combos and booking" {
     const j = patchJson(s, alloc);
     defer alloc.free(j);
     try s.dispatch("book", null, null, &f2);
-    try std.testing.expectEqual(@as(usize, 1), s.bookings.items.len);
-    const bk = s.bookings.items[0];
+    try std.testing.expectEqual(@as(usize, 1), s.deps.bookings.items.len);
+    const bk = s.deps.bookings.items[0];
     try std.testing.expectEqualStrings("Toyota Camry 2018", bk.car);
     try std.testing.expectEqual(@as(u32, 2), bk.items);
-    try std.testing.expectEqual(@as(usize, 0), s.services.count());
+    try std.testing.expectEqual(@as(usize, 0), s.deps.services.count());
     alloc.free(patchJson(s, alloc));
 }
 
@@ -911,21 +853,21 @@ test "upsell suggestions follow cart and vehicle age" {
     try s.dispatch("set_model", "0", null, null);
     try s.dispatch("set_year", "2012", null, null); // ≤2014 → ГРМ upsell
 
-    try std.testing.expectEqual(@as(usize, 1), s.suggestions(a).len);
-    try std.testing.expectEqual(@as(u32, 6), s.suggestions(a)[0].id);
+    try std.testing.expectEqual(@as(usize, 1), suggestions(s, a).len);
+    try std.testing.expectEqual(@as(u32, 6), suggestions(s, a)[0].id);
 
     // engine work → oil-change upsell appears too
     try s.dispatch("toggle_svc", "7", null, null);
-    const sugs = s.suggestions(a);
+    const sugs = suggestions(s, a);
     try std.testing.expectEqual(@as(usize, 2), sugs.len);
 
     // add_svc on an upsell inserts it; duplicates are no-ops
     try s.dispatch("add_svc", "9", null, null);
-    try std.testing.expect(s.hasSvc(9));
+    try std.testing.expect(hasSvc(s, 9));
     try s.dispatch("add_svc", "9", null, null);
     try std.testing.expectEqual(@as(usize, 1), blk: {
         var n: usize = 0;
-        var kit = s.services.keyIterator();
+        var kit = s.deps.services.keyIterator();
         while (kit.next()) |k| {
             if (k.* == 9) n += 1;
         }
