@@ -1510,3 +1510,18 @@ swapped DOM and reset revision ordering. No new server endpoint: the
 page GET is the nav payload. Opt-outs: modifier keys, `target`,
 `download`, `data-reload` on the anchor. Back/forward falls back to
 full loads. Query-only changes reuse the path-keyed session.
+
+## Live islands (page-level, landed)
+
+A page file may declare `pub const live = true;`. Generated
+`routes.isLive(route)` reports it; the app's `Deps.pageLive` forwards
+it; the session skeleton then runs that route on the live pipeline:
+servePage builds the view once (writeHtml for SSR, diff to seed
+Dom, bindTree to subscribe Bound.live leaves) and render() only
+stamps log.revision — zefx store notifications push leaf patch ops
+with no rebuild. dom.reset() on the next servePage drops
+subscriptions, so live↔diff transitions per route are clean.
+Constraint: every dynamic value on a live page must be store-bound;
+structural content is frozen at build time. Mutations still
+bumpSeq() for revision ordering. This is page granularity — per-leaf
+islands inside a diffed page are future work.

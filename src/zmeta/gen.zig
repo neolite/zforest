@@ -801,6 +801,32 @@ fn emitRoutes(arena: Allocator, zmeta_path: []const u8, pages: []const Page, api
         \\
     );
 
+    // Live-island opt-in: `pub const live = true` in a page file makes
+    // the session build that route's view once per servePage and let
+    // `forest.bindTree` subscriptions push leaf ops instead of diffing
+    // every flush (see docs/meta-framework.md §2.3).
+    try w.writeAll(
+        \\
+        \\fn pageLive(comptime Page: type) bool {
+        \\    if (@hasDecl(Page, "live")) return Page.live;
+        \\    return false;
+        \\}
+        \\
+        \\/// Whether the route's page opted into live bindings. The
+        \\/// session's `Deps.pageLive` forwards here.
+        \\pub fn isLive(r: Route) bool {
+        \\    return switch (r) {
+        \\
+    );
+    for (pages) |p| {
+        try w.print("        .{s} => pageLive({s}_page),\n", .{ p.tag, p.tag });
+    }
+    try w.writeAll(
+        \\    };
+        \\}
+        \\
+    );
+
     // ── api endpoints (pages/api/) — JSON, no view/layouts ──
     if (apis.len != 0) {
         try w.writeAll(

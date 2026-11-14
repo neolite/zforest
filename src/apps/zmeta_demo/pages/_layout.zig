@@ -27,6 +27,8 @@ pub fn layout(
                     h.a(a).href(routes.href(a, .{ .structure = .{} })).child("structure").node(),
                     " · ",
                     h.a(a).href(routes.href(a, .{ .search = .{} })).child("search").node(),
+                    " · ",
+                    h.a(a).href(routes.href(a, .{ .live = .{} })).child("live").node(),
                 })
                 .node(),
             inner,

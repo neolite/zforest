@@ -9,6 +9,7 @@ const zmeta = @import("../../../zmeta/root.zig");
 const index_page = @import("../pages/index.zig");
 const docs_rest_page = @import("../pages/docs/[...rest].zig");
 const item_page = @import("../pages/item/[id].zig");
+const live_page = @import("../pages/live.zig");
 const search_page = @import("../pages/search.zig");
 const structure_page = @import("../pages/structure.zig");
 const tag_page = @import("../pages/tag/[tag].zig");
@@ -22,6 +23,7 @@ pub const Route = union(enum) {
     index: index_page.params,
     docs_rest: docs_rest_page.params,
     item: item_page.params,
+    live: live_page.params,
     search: search_page.params,
     structure: structure_page.params,
     tag: tag_page.params,
@@ -59,6 +61,9 @@ pub fn parseRoute(path: []const u8) ?Route {
         if (n == 2 and std.mem.eql(u8, segs[0], "item")) {
             const id = std.fmt.parseInt(u64, segs[1], 10) catch break :result null;
             break :result Route{ .item = .{ .id = id } };
+        }
+        if (n == 1 and std.mem.eql(u8, segs[0], "live")) {
+            break :result Route{ .live = .{} };
         }
         if (n == 1 and std.mem.eql(u8, segs[0], "search")) {
             break :result Route{ .search = .{} };
@@ -102,6 +107,7 @@ pub fn href(a: std.mem.Allocator, r: Route) []const u8 {
         .index => "/",
         .docs_rest => |p| std.fmt.allocPrint(a, "/docs/{s}", .{p.rest}) catch @panic("OOM"),
         .item => |p| std.fmt.allocPrint(a, "/item/{d}", .{p.id}) catch @panic("OOM"),
+        .live => "/live",
         .search => "/search",
         .structure => "/structure",
         .tag => |p| std.fmt.allocPrint(a, "/tag/{s}", .{p.tag}) catch @panic("OOM"),
@@ -120,6 +126,7 @@ pub fn prepare(s: anytype, env: *const zmeta.Env) !void {
         .index => |p| try preparePage(index_page, s, p, env),
         .docs_rest => |p| try preparePage(docs_rest_page, s, p, env),
         .item => |p| try preparePage(item_page, s, p, env),
+        .live => |p| try preparePage(live_page, s, p, env),
         .search => |p| try preparePage(search_page, s, p, env),
         .structure => |p| try preparePage(structure_page, s, p, env),
         .tag => |p| try preparePage(tag_page, s, p, env),
@@ -137,12 +144,33 @@ pub fn viewNodes(a: std.mem.Allocator, s: anytype, env: *const zmeta.Env) []cons
         .index => |p| lay_root.layout(a, s, env, index_page.view(a, s, p, env)),
         .docs_rest => |p| lay_root.layout(a, s, env, docs_rest_page.view(a, s, p, env)),
         .item => |p| lay_root.layout(a, s, env, item_page.view(a, s, p, env)),
+        .live => |p| lay_root.layout(a, s, env, live_page.view(a, s, p, env)),
         .search => |p| lay_root.layout(a, s, env, search_page.view(a, s, p, env)),
         .structure => |p| lay_root.layout(a, s, env, structure_page.view(a, s, p, env)),
         .tag => |p| lay_root.layout(a, s, env, tag_page.view(a, s, p, env)),
         .wiki_rest => |p| lay_root.layout(a, s, env, wiki_rest_page.view(a, s, p, env)),
     };
     return nodes;
+}
+
+fn pageLive(comptime Page: type) bool {
+    if (@hasDecl(Page, "live")) return Page.live;
+    return false;
+}
+
+/// Whether the route's page opted into live bindings. The
+/// session's `Deps.pageLive` forwards here.
+pub fn isLive(r: Route) bool {
+    return switch (r) {
+        .index => pageLive(index_page),
+        .docs_rest => pageLive(docs_rest_page),
+        .item => pageLive(item_page),
+        .live => pageLive(live_page),
+        .search => pageLive(search_page),
+        .structure => pageLive(structure_page),
+        .tag => pageLive(tag_page),
+        .wiki_rest => pageLive(wiki_rest_page),
+    };
 }
 /// Typed api route — one tag per `pages/api/` file.
 /// Endpoint handlers return a JSON body; they never

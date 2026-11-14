@@ -537,6 +537,7 @@ fn SessionPlain(comptime Deps: type) type {
         pub const seedDom = M.seedDom;
         const viewEnv = M.viewEnv;
         const render = M.render;
+        const pageLive = M.pageLive;
     };
 }
 
@@ -617,6 +618,7 @@ fn SessionGrouped(comptime Deps: type) type {
         pub const seedDom = M.seedDom;
         const viewEnv = M.viewEnv;
         const render = M.render;
+        const pageLive = M.pageLive;
 
         // ── render-group stream hooks ──────────────────────────────
         // Present ONLY here — this is what flips http.zig's @hasDecl

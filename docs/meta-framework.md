@@ -198,6 +198,24 @@ is rebuilding Next inside `client.js`; the server already ships
 everything an island needs as ops. Deferred to v1 (§7); v0 ships no
 islands.
 
+
+**LANDED (page-level live islands).** A page file may declare
+`pub const live = true;` — generated `routes.isLive` reports it,
+`Deps.pageLive` forwards it, and the session skeleton switches that
+route to the live pipeline: `servePage` builds the view ONCE
+(`buildViewNodes` → `writeHtml` for SSR → `diff` to seed Dom →
+`bindTree` to subscribe every `Bound.live` leaf), then `render()`
+only stamps `log.revision` — store notifications push leaf ops
+straight into the patch log, no rebuild, no diff. `dom.reset()` on
+the next `servePage` drops the subscriptions, so live↔diff
+transitions are clean. Constraint (same as zmon): ALL dynamic
+content on a live page must be store-bound — structural/keyed
+content is built once and goes stale. Mutations still `bumpSeq()` so
+the batch carries a fresh revision. Per-LEAF islands inside a
+rebuilt page remain future work (needs diff-skip + binder
+re-resolution); client-side widget islands (§2.3 "true islands") are
+still open.
+
 ### 2.4 Nested layouts
 
 Today layout composition is plain function calls. zboard's

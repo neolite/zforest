@@ -86,3 +86,16 @@ pub fn viewNodes(a: std.mem.Allocator, s: anytype, env: *const zmeta.Env) []cons
     };
     return nodes;
 }
+
+fn pageLive(comptime Page: type) bool {
+    if (@hasDecl(Page, "live")) return Page.live;
+    return false;
+}
+
+/// Whether the route's page opted into live bindings. The
+/// session's `Deps.pageLive` forwards here.
+pub fn isLive(r: Route) bool {
+    return switch (r) {
+        .index => pageLive(index_page),
+    };
+}

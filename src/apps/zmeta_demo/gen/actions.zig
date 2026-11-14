@@ -9,6 +9,7 @@ const std = @import("std");
 pub const act = struct {
     pub const ping = "ping";
     pub const like = "like";
+    pub const tick = "tick";
 };
 
 /// Dispatch skeleton: each whitelisted action calls the app's
@@ -25,5 +26,6 @@ pub fn dispatch(
     const D = @TypeOf(s.deps);
     if (std.mem.eql(u8, action, act.ping)) return D.on_ping(s, arg, value, fields);
     if (std.mem.eql(u8, action, act.like)) return D.on_like(s, arg, value, fields);
+    if (std.mem.eql(u8, action, act.tick)) return D.on_tick(s, arg, value, fields);
     return error.InvalidAction;
 }

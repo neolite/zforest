@@ -5,6 +5,7 @@
 //! Routes (generated into gen/routes.zig from pages/):
 //!   "/"               pages/index.zig
 //!   "/item/:id"       pages/item/[id].zig   (prepare 404s unknown ids)
+//!   "/live"           pages/live.zig        (live island: bindTree, no diff)
 const std = @import("std");
 const zefx = @import("zefx");
 const forest = @import("forest");
@@ -54,11 +55,15 @@ pub const DemoDeps = struct {
     pings: u64 = 0,
     /// Per-item like counts (item id → count).
     likes: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    /// Live-island counter — a real zefx Store so `.text(ticks)`
+    /// binds with `Bound.live` hooks (bindTree pushes ops, no rebuild).
+    ticks: *zefx.Store(u64) = undefined,
 
-    /// `Deps.init` — no graph handles needed beyond the skeleton's seq.
+    /// `Deps.init` — graph handles beyond the skeleton's seq.
     pub fn init(s: *Session) DemoDeps {
-        _ = s;
-        return .{};
+        var d: DemoDeps = .{};
+        d.ticks = s.app.createStore(u64, 0);
+        return d;
     }
 
     /// `Deps.deinit` — free domain allocations before skeleton teardown.
@@ -84,6 +89,12 @@ pub const DemoDeps = struct {
     /// The `<main>` body — generated dispatch to the active page's view.
     pub fn view(a: std.mem.Allocator, s: *Session, env: *const zmeta.Env) []const forest.Node {
         return routes.viewNodes(a, s, env);
+    }
+
+    /// Live-island routes — generated `routes.isLive` over the typed
+    /// route; pages opt in with `pub const live = true`.
+    pub fn pageLive(s: *Session) bool {
+        return routes.isLive(s.deps.route);
     }
 
     /// GET /api/* — generated dispatch to `pages/api/` handlers; a
@@ -123,6 +134,21 @@ pub const DemoDeps = struct {
         _ = fields;
         s.deps.pings += 1;
         s.bumpSeq();
+    }
+
+    /// act.tick — live page button; store.set flushes watchers, the
+    /// bindTree binder emits the text op, render() only stamps rev.
+    pub fn on_tick(
+        s: *Session,
+        arg: ?[]const u8,
+        value: ?[]const u8,
+        fields: ?*const std.json.ObjectMap,
+    ) !void {
+        _ = arg;
+        _ = value;
+        _ = fields;
+        s.bumpSeq();
+        s.deps.ticks.set(s.deps.ticks.get() + 1);
     }
 
     /// act.like — item page button; `arg` carries the item id.
