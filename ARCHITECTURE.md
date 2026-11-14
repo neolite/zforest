@@ -959,13 +959,109 @@ render mode is still Deps-owned future work). Env is unchanged: the
 hooks take `*Session`, so group state is reached through `s.deps` —
 no new Env accessors were needed.
 
-Deferred for real zboard migration: grouped `servePage`/`render`/
-`writeView`/`buildViewNodes`/`seedDom` overrides (board's grouped
-servePage syncs membership + ensures the group current instead of
-`dom.reset`+`seedDom`; the skeleton's diff-render assumes per-session
-Dom) — needs optional `Deps` hooks for the render path, or per-app
-skeleton specialization. Contract proven on a test `SharedDeps` only;
-no app migrated yet.
+The render-path overrides this deferred (grouped
+`servePage`/`render`/`writeView`/`buildViewNodes`/`seedDom` —
+board's grouped servePage syncs membership + ensures the group
+current instead of `dom.reset`+`seedDom`, and its flush render goes
+through the group) landed on `feat/zmeta-grouped` — see the next
+section. No app migrated yet.
+
+## zmeta: render-path overrides for grouped apps (done)
+
+`feat/zmeta-grouped`: `Session(Deps)` now lets an app replace the
+render pipeline per-method — the missing piece deferred from the
+`.shared_model` work above. Five new OPTIONAL Deps decls, each
+delegated via `@hasDecl` inside `SessionMethods` (same trick as
+`deinit`/`wire`/`syncPull`/`prepare`):
+
+- `fn servePage(s: *Session, path: []const u8, writer: anytype)
+  !bool` — replaces the WHOLE page pipeline (setRoute gate →
+  prepare → dom.reset → writeView → seedDom). Grouped apps need
+  the whole-pipeline hook: board's is setRoute → `attached` →
+  `syncMembership` → `ensureGroupCurrent` → `writeView`, with NO
+  `dom.reset`/`seedDom` — the shared Dom lives in the render group.
+- `fn render(s: *Session) void` — replaces the after-flush diff
+  render (and the render step inside `seedDom`). Effectively
+  REQUIRED for grouped sessions: without it every flush diffs into
+  the session's unused `dom`/`log` while the group never renders.
+- `fn writeView(s, writer) !void`, `fn buildViewNodes(s, a)
+  []const forest.Node`, `fn seedDom(s) void` — per-method
+  replacements; they compose (default servePage calls
+  `self.writeView`/`self.seedDom`, resolving through the same
+  overrides, so a Deps can override e.g. only `seedDom`).
+
+Mechanism trade-off (recorded per AGENTS.md): per-method delegation
+was chosen over a `render_pipeline = .per_session | .grouped_custom`
+decl or more variant types. The four stream hooks needed
+`SessionPlain`/`SessionGrouped` variants ONLY because http.zig probes
+`@hasDecl(Session, ...)` on the session TYPE — their presence or
+absence must be a type-level fact. servePage/writeView/
+buildViewNodes/seedDom are unconditional contract methods (the
+server calls them on every GET / SSE snapshot), so `@hasDecl(Deps)`
+inside the body is sufficient and strictly more flexible: no new
+variants, no all-or-nothing render set, and `todo.Session`/
+`car.Session`/the demo are untouched (none declare the new names —
+behavior byte-identical). A grouped Deps should treat `render` +
+`servePage` as a pair: the first routes flushes into the group, the
+second replaces the per-session page pipeline; `seedDom` stays
+declared-but-unreached for them.
+
+Test coverage: `PipelineDeps` in session.zig declares all four
+stream hooks + all five render overrides; the test asserts marker
+HTML from the custom servePage (and that "/" — accepted by the
+default pipeline — returns false under the override), custom
+writeView/buildViewNodes output, seedDom bypassing `self.render`,
+and dispatch→bumpSeq→flush reaching `Deps.render` with `s.log`
+left empty. `zig build test` and `zig build` (all 5 exes) green.
+
+### zboard→zmeta migration path
+
+Not done in this task — the mapping for the next step:
+
+- `board_app.model`/`globalSeq()` stay module-global; `BoardModel`
+  and the `board_groups` registry stay app-owned — the skeleton
+  owns no group state (§4.1 verdict unchanged).
+- Session fields → `Deps` fields on `s.deps`: parsed `route`,
+  `reply_to`, `sort`, `user_token`, `out_cookie_buf`, `seen_seq`,
+  `attached`, `group: ?*RenderGroup`, `membership_epoch`, `ping`
+  handle. Skeleton-owned fields (`app`/`seq`/`dom`/`log`/`history`/
+  `render_arena`/`csrf_token`/`incarnation`/`route` path/
+  `out_cookie`) come free — note board's `out_cookie_buf` scratch
+  vs the skeleton's `out_cookie` slice: Deps keeps the buffer and
+  points the slice at it.
+- `Deps.init` creates graph handles; `Deps.wire` registers ONLY
+  `ping.onReducer` — the skeleton installs the after-flush render
+  hook itself, so board's `wire` must not re-register it.
+- `setRoute`/`validPath` → `Deps.setRoute`/`Deps.validPath`
+  (parseRoute + dangling-id 404). The skeleton additionally stores
+  the raw path for `Env.route`; `Deps.view` rebuilds `ViewEnv` from
+  `s.deps` — `Env` stays the thin `{route}` v0 slice.
+- `syncPull` → `Deps.syncPull` verbatim (group `isCurrent()` gate →
+  ping; else `seen_seq` vs `global_seq`).
+- `servePage`/`render` → `Deps.servePage`/`Deps.render` verbatim
+  modulo `self.`→`s.`/`s.deps.` field access and skeleton calls.
+- `publishPending`/`streamRev`/`streamHistory`/`membershipEpoch` →
+  the four existing Deps hooks verbatim (group-vs-session fallback
+  logic included — they already take `*Session`).
+- `writeView`/`buildViewNodes`/`seedDom`: the DEFAULTS likely
+  suffice — `Deps.view` adapts `ViewEnv`; override only if
+  group-aware serialization is needed. Caveat: board's
+  `buildViewNodes` stamps `seen_seq` through `viewEnv().seen`,
+  and the §4.4 rule says the cursor is written only by Dom-syncing
+  builds, never incidental serialization — today
+  `session.buildViewNodes` passes `seen = &seen_seq`
+  unconditionally; the migration should preserve that exact split
+  or deliberately fix it.
+- `dispatch`/`view`/`readCookies` (`zfxu`)/`page_title`/`page_class`/
+  `cookie_name` → same names on Deps; `view` wraps
+  `buildView(a, depsViewEnv(s))`.
+- Open question for migration: `RenderGroup.seed`/`render` call
+  `board_app.buildView` directly with the GROUP's `viewEnv`
+  (`seen = &g.last_rendered_seq`), bypassing any session. Under
+  zmeta either board_groups keeps calling a board-owned `buildView`
+  shim (safest first cut — preserves the cursor split exactly) or
+  grows a view-fn parameter; decide then — board_groups stays
+  board-owned either way.
 
 ## zmeta codegen: file-based routes + action table (done)
 

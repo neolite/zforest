@@ -594,6 +594,12 @@ pub const app = zmeta.App(.{
 `out_cookie`/`setRoute`/`servePage`/`writeView`/`buildViewNodes`/
 `seedDom`/`syncPull` stubs — so app code declares only: model fields,
 action handlers, page/layout fns, and optional group/live hooks.
+Render-path methods (`servePage`/`render`/`writeView`/
+`buildViewNodes`/`seedDom`) are additionally per-method
+`Deps`-overridable so grouped apps can replace the per-session
+pipeline (membership sync + group render instead of `dom.reset` +
+`seedDom`) — landed on `feat/zmeta-grouped`, see ARCHITECTURE.md
+"zmeta: render-path overrides for grouped apps".
 This kills the ~150 lines of contract boilerplate every current app
 repeats (compare `todo_app.zig:60-160` vs `board_app.zig:86-200`).
 It is the single biggest DX win and the lowest-risk piece: the

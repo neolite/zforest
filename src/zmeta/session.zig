@@ -75,6 +75,39 @@
 //!     `archetype` — `zmeta.Archetype` const documenting the §4.1
 //!       session shape (metadata only; hook emission is driven by the
 //!       hook decls themselves, see above).
+//!   render-path overrides (each independently optional, same
+//!   `@hasDecl` delegation as the hooks above; absent = skeleton
+//!   default):
+//!     `fn servePage(s, path, writer) !bool` — replaces the WHOLE
+//!       page pipeline (setRoute gate → prepare → dom.reset →
+//!       writeView → seedDom). Grouped apps need this: their
+//!       Dom/history/revision live in the render group, so the
+//!       default per-session reset+seed pipeline is wrong — board's
+//!       is setRoute → membership sync → ensure-group-current →
+//!       writeView, with NO dom.reset/seedDom. The override owns
+//!       every step but may still call the pub contract methods
+//!       (`s.setRoute`, `s.writeView`, …); a prepare env rebuilds
+//!       as `Env{ .route = s.route }`.
+//!     `fn render(s) void` — replaces the after-flush diff render
+//!       (and the render step inside seedDom). Effectively REQUIRED
+//!       for grouped sessions: without it every flush diffs into the
+//!       session's unused `dom`/`log` while the group never renders.
+//!     `fn writeView(s, writer) !void` — replaces the SSR `<main>`
+//!       serializer (default: `forest.writeHtml` over `Deps.view`).
+//!     `fn buildViewNodes(s, a) []const forest.Node` — replaces the
+//!       SSE-snapshot view builder (default: `Deps.view` in `a`).
+//!     `fn seedDom(s) void` — replaces the post-servePage Dom reseed
+//!       (default: render + drop the patch log). Only meaningful for
+//!       per-session Dom; a grouped Deps overrides servePage so this
+//!       is never reached through the pipeline — declare it anyway if
+//!       anything else might call it.
+//!   Unlike the four stream hooks these need NO variant split: the
+//!   server calls servePage/writeView/buildViewNodes/seedDom
+//!   unconditionally, so per-method `@hasDecl(Deps)` delegation inside
+//!   `SessionMethods` suffices (the same trick as `deinit`/`wire`/
+//!   `syncPull`). They compose — the default servePage calls
+//!   `self.writeView`/`self.seedDom`, which resolve back through the
+//!   same overrides.
 //!   grouped sessions (all-or-nothing — see the top comment):
 //!     `fn publishPending(s) void` — drain the pending rendered batch
 //!       into retained history (through the app's render group).
@@ -236,8 +269,10 @@ fn SessionMethods(comptime Deps: type) type {
         /// Full-page render for a navigating client: resolve the route,
         /// run the optional prepare gate, drop tracked DOM state, write
         /// the page body, then reseed so subsequent diffs emit only real
-        /// changes.
+        /// changes. `Deps.servePage` replaces the whole pipeline — see
+        /// the contract docs at the top of this file.
         pub fn servePage(self: anytype, path: []const u8, writer: anytype) !bool {
+            if (@hasDecl(Deps, "servePage")) return Deps.servePage(self, path, writer);
             if (!self.setRoute(path)) return false;
             if (@hasDecl(Deps, "prepare")) {
                 const env = self.viewEnv();
@@ -281,8 +316,14 @@ fn SessionMethods(comptime Deps: type) type {
             return .{ .route = self.route };
         }
 
-        /// Diff the view into DOM patches. Runs post-settle (after-flush).
+        /// Diff the view into DOM patches. Runs post-settle (after-flush)
+        /// and inside seedDom. `Deps.render` replaces it wholesale —
+        /// grouped sessions route this through their render group.
         fn render(self: anytype) void {
+            if (@hasDecl(Deps, "render")) {
+                Deps.render(self);
+                return;
+            }
             _ = self.render_arena.reset(.retain_capacity);
             const a = self.render_arena.allocator();
             const env = self.viewEnv();
@@ -291,7 +332,10 @@ fn SessionMethods(comptime Deps: type) type {
         }
 
         /// Render the `<main>` inner content — used by the initial page.
+        /// `Deps.writeView` replaces the serializer (default:
+        /// `forest.writeHtml` over `Deps.view`).
         pub fn writeView(self: anytype, writer: anytype) !void {
+            if (@hasDecl(Deps, "writeView")) return Deps.writeView(self, writer);
             _ = self.render_arena.reset(.retain_capacity);
             const a = self.render_arena.allocator();
             const env = self.viewEnv();
@@ -300,14 +344,22 @@ fn SessionMethods(comptime Deps: type) type {
 
         /// The session's current view nodes, built into `a` — the SSE
         /// snapshot writer serializes them via `forest.writeSnapshotOps`.
+        /// `Deps.buildViewNodes` replaces the builder.
         pub fn buildViewNodes(self: anytype, a: std.mem.Allocator) []const forest.Node {
+            if (@hasDecl(Deps, "buildViewNodes")) return Deps.buildViewNodes(self, a);
             const env = self.viewEnv();
             return Deps.view(a, self, &env);
         }
 
         /// Seed tracked DOM state to match markup already emitted in the
         /// page, so the first diff renders only real changes.
+        /// `Deps.seedDom` replaces it (grouped sessions never reseed a
+        /// per-session Dom — their group's Dom is seeded at join).
         pub fn seedDom(self: anytype) void {
+            if (@hasDecl(Deps, "seedDom")) {
+                Deps.seedDom(self);
+                return;
+            }
             self.render();
             // Keep tracked state, drop the patches — the page ships full HTML.
             self.log.clear();
@@ -816,4 +868,187 @@ test "group hook coverage: none/all/partial" {
     try std.testing.expect(groupHookCoverage(SharedDeps) == .all);
     try std.testing.expect(groupHookCoverage(TwoHooks) == .partial);
     try std.testing.expectEqualStrings("publishPending, streamHistory", comptime missingGroupHooks(TwoHooks));
+}
+
+/// Grouped Deps exercising EVERY render-path override — the zboard
+/// migration shape in miniature: all four stream hooks plus custom
+/// servePage/render/writeView/buildViewNodes/seedDom. Proves the
+/// overrides compile the full contract AND are actually invoked
+/// (marker output + counters), i.e. each default pipeline is bypassed.
+const PipelineSession = Session(PipelineDeps);
+
+const PipelineDeps = struct {
+    pub const archetype: Archetype = .shared_model;
+
+    count: *zefx.Store(u32),
+    /// Deps-owned "group" state the stream hooks read.
+    group_rev: u64 = 0,
+    group_history: History,
+    // Override-invocation counters asserted by the test.
+    served: usize = 0,
+    renders: usize = 0,
+    wrote: usize = 0,
+    built: usize = 0,
+    seeded: usize = 0,
+
+    pub fn init(s: *PipelineSession) PipelineDeps {
+        return .{
+            .count = s.app.createStore(u32, 0),
+            .group_history = History.init(s.gpa),
+        };
+    }
+
+    pub fn deinit(s: *PipelineSession) void {
+        s.deps.group_history.deinit();
+    }
+
+    pub fn dispatch(
+        s: *PipelineSession,
+        action: []const u8,
+        arg: ?[]const u8,
+        value: ?[]const u8,
+        fields: ?*const std.json.ObjectMap,
+    ) !void {
+        _ = arg;
+        _ = value;
+        _ = fields;
+        if (std.mem.eql(u8, action, "ping")) {
+            // seq.set flushes the idle engine → after-flush → M.render
+            // → Deps.render (the override under test).
+            s.bumpSeq();
+        } else {
+            return error.InvalidAction;
+        }
+    }
+
+    pub fn view(a: std.mem.Allocator, s: *PipelineSession, env: *const Env) []const forest.Node {
+        _ = env;
+        const nodes = a.alloc(forest.Node, 1) catch @panic("OOM");
+        nodes[0] = forest.el(a, .div, .{ .id = "n", .text = forest.computed(s.deps.count, pipeText) }, .{});
+        return nodes;
+    }
+
+    fn pipeText(a: std.mem.Allocator, n: u32) []const u8 {
+        return std.fmt.allocPrint(a, "pipe={d}", .{n}) catch @panic("OOM");
+    }
+
+    // ── render-path overrides ──────────────────────────────────────
+
+    /// Whole-pipeline replacement: marker HTML for "/custom", false
+    /// elsewhere — deliberately NOT the default setRoute/prepare/
+    /// dom.reset/writeView/seedDom flow ("/" would succeed by default).
+    pub fn servePage(s: *PipelineSession, path: []const u8, writer: anytype) !bool {
+        s.deps.served += 1;
+        if (std.mem.eql(u8, path, "/custom")) {
+            try writer.writeAll("CUSTOM-PAGE-MARKER");
+            return true;
+        }
+        return false;
+    }
+
+    /// After-flush render replacement — stands in for the grouped
+    /// session's syncMembership + group render+publish.
+    pub fn render(s: *PipelineSession) void {
+        s.deps.renders += 1;
+        s.deps.group_rev += 1;
+    }
+
+    pub fn writeView(s: *PipelineSession, writer: anytype) !void {
+        s.deps.wrote += 1;
+        try writer.writeAll("CUSTOM-WRITEVIEW");
+    }
+
+    pub fn buildViewNodes(s: *PipelineSession, a: std.mem.Allocator) []const forest.Node {
+        s.deps.built += 1;
+        const nodes = a.alloc(forest.Node, 1) catch @panic("OOM");
+        nodes[0] = forest.el(a, .div, .{ .id = "custom" }, .{});
+        return nodes;
+    }
+
+    /// Grouped sessions never reseed a per-session Dom — no-op.
+    pub fn seedDom(s: *PipelineSession) void {
+        s.deps.seeded += 1;
+    }
+
+    // ── the four render-group stream hooks (all-or-nothing set) ────
+
+    pub fn publishPending(s: *PipelineSession) void {
+        if (s.deps.group_rev == 0) return;
+        const batch = s.gpa.dupe(u8, "{\"rev\":1,\"ops\":[]}") catch @panic("OOM");
+        s.deps.group_history.publish(s.deps.group_rev, batch);
+    }
+
+    pub fn streamRev(s: *PipelineSession) u64 {
+        return s.deps.group_rev;
+    }
+
+    pub fn streamHistory(s: *PipelineSession) *History {
+        return &s.deps.group_history;
+    }
+
+    pub fn membershipEpoch(s: *PipelineSession) u64 {
+        _ = s;
+        return 0;
+    }
+};
+
+test "render-path overrides: Deps servePage/render/writeView/buildViewNodes/seedDom are invoked" {
+    const alloc = std.testing.allocator;
+    const s = PipelineSession.create(alloc, std.testing.io);
+    defer s.deinit();
+
+    // Still the grouped variant: the four stream hooks exist and the
+    // rest of the contract surface is intact.
+    try std.testing.expectEqual(Archetype.shared_model, PipelineSession.archetype);
+    try std.testing.expect(@hasDecl(PipelineSession, "publishPending"));
+    try std.testing.expect(@hasDecl(PipelineSession, "streamRev"));
+    try std.testing.expect(@hasDecl(PipelineSession, "streamHistory"));
+    try std.testing.expect(@hasDecl(PipelineSession, "membershipEpoch"));
+
+    // servePage → Deps.servePage: "/custom" ships the marker, "/" —
+    // which the DEFAULT pipeline would accept — returns false because
+    // the override owns the whole route gate too.
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    try std.testing.expect(try s.servePage("/custom", &aw.writer));
+    try std.testing.expectEqualStrings("CUSTOM-PAGE-MARKER", aw.writer.buffered());
+    try std.testing.expectEqual(@as(usize, 1), s.deps.served);
+
+    var bw: std.Io.Writer.Allocating = .init(alloc);
+    defer bw.deinit();
+    try std.testing.expect(!(try s.servePage("/", &bw.writer)));
+    try std.testing.expectEqual(@as(usize, 2), s.deps.served);
+    // The default pipeline never ran: no dom.reset/seedDom side effects.
+    try std.testing.expectEqual(@as(usize, 0), s.deps.seeded);
+    try std.testing.expectEqual(@as(usize, 0), s.deps.wrote);
+
+    // writeView → Deps.writeView marker.
+    var cw: std.Io.Writer.Allocating = .init(alloc);
+    defer cw.deinit();
+    try s.writeView(&cw.writer);
+    try std.testing.expectEqualStrings("CUSTOM-WRITEVIEW", cw.writer.buffered());
+    try std.testing.expectEqual(@as(usize, 1), s.deps.wrote);
+
+    // buildViewNodes → Deps.buildViewNodes (custom node, counter bumped).
+    _ = s.render_arena.reset(.retain_capacity);
+    const a = s.render_arena.allocator();
+    const nodes = s.buildViewNodes(a);
+    try std.testing.expectEqual(@as(usize, 1), s.deps.built);
+    try std.testing.expectEqual(@as(usize, 1), nodes.len);
+
+    // seedDom → Deps.seedDom: bumps its counter WITHOUT routing through
+    // self.render — the default would have bumped `renders` via render.
+    s.seedDom();
+    try std.testing.expectEqual(@as(usize, 1), s.deps.seeded);
+    try std.testing.expectEqual(@as(usize, 0), s.deps.renders);
+
+    // render → Deps.render: dispatch → bumpSeq → seq.set flushes the
+    // idle engine → the skeleton's after-flush hook calls M.render,
+    // which delegates. The default diff never touches s.log — it stays
+    // empty (no patches recorded) while group_rev advanced instead.
+    try s.dispatch("ping", null, null, null);
+    try std.testing.expectEqual(@as(usize, 1), s.deps.renders);
+    try std.testing.expectEqual(@as(u64, 1), s.deps.group_rev);
+    try std.testing.expectEqual(@as(usize, 0), s.log.patches.items.len);
+    try std.testing.expectEqual(@as(u64, 1), s.seq.get());
 }
