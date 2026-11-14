@@ -13,7 +13,7 @@ pub const params = struct {};
 fn itemRow(a: std.mem.Allocator, ctx: anytype, it: app.Item) ?h.Node {
     _ = ctx;
     return h.li(a)
-        .id(std.fmt.allocPrint(a, "item-{d}", .{it.id}) catch @panic("OOM"))
+        .id(h.f(a, "item-{d}", .{it.id}))
         .children(.{
             h.a(a).href(routes.href(a, .{ .item = .{ .id = it.id } })).child(it.name),
             " — ",
@@ -25,8 +25,8 @@ fn itemRow(a: std.mem.Allocator, ctx: anytype, it: app.Item) ?h.Node {
 pub fn view(a: std.mem.Allocator, s: anytype, p: params, env: *const zmeta.Env) h.Node {
     _ = p;
     _ = env;
-    const pings = std.fmt.allocPrint(a, "pings: {d}", .{s.deps.pings}) catch @panic("OOM");
-    const likes = std.fmt.allocPrint(a, "likes: {d}", .{app.totalLikes(s.deps)}) catch @panic("OOM");
+    const pings = h.f(a, "pings: {d}", .{s.deps.pings});
+    const likes = h.f(a, "likes: {d}", .{app.totalLikes(s.deps)});
     return h.fragment(a, .{
         h.h1(a).id("title").child("zmeta demo").node(),
         h.p(a).id("blurb").child("file-based routes · typed params · comptime actions").node(),

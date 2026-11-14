@@ -52,6 +52,9 @@
 //!     `[N]Node`, or a comptime tuple mixing any of those.
 //!     `each`/`eachOf` keyed lists must be the element's ONLY child
 //!     source (a forest rule — enforced with a panic).
+//!   - `h.f(a, "fmt {d}", .{x})` — `allocPrint` shorthand for the ids
+//!     and labels every view formats; arena-allocated like everything
+//!     else the builder produces.
 //!   - Void tags (`<input>`, `<br>`, …) assert they got no children,
 //!     matching `el`.
 //!
@@ -78,6 +81,12 @@ pub const variant = view.variant;
 pub const when = view.when;
 pub const computed = view.computed;
 pub const writeHtml = view.writeHtml;
+
+/// `allocPrint` shorthand — `h.f(a, "item-{d}", .{id})` instead of
+/// `std.fmt.allocPrint(a, "item-{d}", .{id}) catch @panic("OOM")`.
+pub fn f(alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype) []const u8 {
+    return std.fmt.allocPrint(alloc, fmt, args) catch @panic("OOM");
+}
 
 /// DOM event types allowed in `.on` — mirrors forest.view's comptime
 /// whitelist; the comptime block below keeps the two lists in sync.
@@ -522,7 +531,7 @@ fn unwrapOpt(comptime T: type) type {
 fn getReturnsBool(comptime S: type) bool {
     if (!isGetPtr(S)) return false;
     const r = switch (@typeInfo(@TypeOf(std.meta.Child(S).get))) {
-        .@"fn" => |f| f.return_type orelse return false,
+        .@"fn" => |fninfo| fninfo.return_type orelse return false,
         else => return false,
     };
     return unwrapOpt(r) == bool;

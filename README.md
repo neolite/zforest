@@ -17,6 +17,9 @@ vanilla JS patch client. Four apps share the transport:
   vehicle specs, service catalogue by category, context upsells, combo
   discounts, booking form + history) — exercises keyed lists and
   conditional subtrees on the diff path.
+- **`zmeta-demo`** — the `zmeta` meta-framework demo: file-based
+  routes, typed params, generated action dispatch, `Session(Deps)`
+  skeleton. See [docs/getting-started.md](docs/getting-started.md).
 
 <p align="center">
   <img src="docs/architecture.svg" alt="zforest architecture" width="900">
@@ -25,15 +28,17 @@ vanilla JS patch client. Four apps share the transport:
 ## Run
 
 ```sh
-zig build        # produces zig-out/bin/{zforest,zboard,zmon,zcar}
+zig build        # produces zig-out/bin/{zforest,zboard,zmon,zcar,zmeta-demo}
 zig build run    # serves the todo app on http://127.0.0.1:8080
 zig build run-board 8081 127.0.0.1 board.db  # board on :8081, file db
 zig build run-mon 8082 127.0.0.1             # dashboard on :8082
 zig build run-car 8083 127.0.0.1             # booking demo on :8083
+zig build run-demo 8084 127.0.0.1            # zmeta demo on :8084
 ./zig-out/bin/zforest [port] [bind-ip]
 ./zig-out/bin/zboard   [port] [bind-ip] [db-path]   # db-path default ":memory:"
 ./zig-out/bin/zmon     [port] [bind-ip]
 ./zig-out/bin/zcar     [port] [bind-ip]
+./zig-out/bin/zmeta-demo [port] [bind-ip]
 zig build test   # engine, forest, session, db, and board tests
 ```
 

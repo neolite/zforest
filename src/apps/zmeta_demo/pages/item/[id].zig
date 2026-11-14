@@ -21,12 +21,12 @@ pub fn view(a: std.mem.Allocator, s: anytype, p: params, env: *const zmeta.Env) 
     _ = env;
     const it = app.item(p.id) orelse unreachable; // prepare already 404'd
     const likes = s.deps.likes.get(p.id) orelse 0;
-    const likes_text = std.fmt.allocPrint(a, "likes: {d}", .{likes}) catch @panic("OOM");
-    const arg = std.fmt.allocPrint(a, "{d}", .{p.id}) catch @panic("OOM");
+    const likes_text = h.f(a, "likes: {d}", .{likes});
+    const arg = h.f(a, "{d}", .{p.id});
     return h.fragment(a, .{
         h.h1(a).id("iname").child(it.name).node(),
         h.p(a).id("iblurb").child(it.blurb).node(),
-        h.p(a).id("iid").child(std.fmt.allocPrint(a, "item #{d}", .{p.id}) catch @panic("OOM")).node(),
+        h.p(a).id("iid").child(h.f(a, "item #{d}", .{p.id})).node(),
         h.button(a).id("like-btn").on(.click, actions.act.like).arg(arg).child("like").node(),
         h.p(a).id("likes").text(likes_text).node(),
         h.p(a).child(h.a(a).href(routes.href(a, .{ .index = .{} })).child("← home")).node(),
