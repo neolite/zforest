@@ -108,7 +108,8 @@ What codegen adds:
 Costs/notes: the generator is a small Zig tool run as a `zig build`
 step (or `zig run`) scanning `apps/<name>/pages/`; output is a
 `gen/routes.zig` module. Dynamic segments are `[name]` (int or
-`[]const u8` params); catch-all `[...rest]` (last segment only,
+`[]const u8` params); catch-all `[...rest]` and optional catch-all
+`[[...rest]]` (last segment only, empty tail allowed),
 non-empty remainder) is supported; route groups `(name)` remain
 deferred (§7). String params slice the session-owned route path —
 `skeleton.setRoute` dupes the request path before `Deps.setRoute`

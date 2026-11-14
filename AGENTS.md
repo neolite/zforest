@@ -23,7 +23,7 @@ combo discounts, booking history).
 - `src/car_main.zig`: `zcar` executable entry point (`zcar [port] [bind-ip]`).
 - `src/mon_main.zig`: `zmon` executable entry point (`zmon [port] [bind-ip]`; spawns the model ticker thread).
 - `src/zmeta/`: plain-source meta-framework layer (NOT a named module — relative imports preserve `History`/`Dom`/`zefx`/`forest` type identity). `session.zig` is the generic `Session(Deps)` skeleton, `env.zig` the render context, `root.zig` the plain-source export surface, `gen.zig` the routing/action codegen (`zig build gen`).
-- `src/apps/<name>/`: zmeta app dirs — `pages/**/*.zig` (file-based routes; `[name]`/`[...name]` segments → typed `params` fields: ints + `[]const u8` strings slicing the session-owned route path), `actions.zig` (action-name manifest), generated `gen/routes.zig` + `gen/actions.zig` (checked in).
+- `src/apps/<name>/`: zmeta app dirs — `pages/**/*.zig` (file-based routes; `[name]`/`[...name]`/`[[...name]]` segments → typed `params` fields: ints + `[]const u8` strings slicing the session-owned route path), `actions.zig` (action-name manifest), generated `gen/routes.zig` + `gen/actions.zig` (checked in).
 - `src/zmeta_demo_main.zig`: `zmeta-demo` executable entry point (`zmeta-demo [port] [bind-ip]`); flat `src/` placement keeps every relative import inside the module path.
 - `src/server/http.zig`: generic-over-`Session` HTTP/SSE server (cookie sessions, POST /action → ACK, GET /events → SSE stream, `Ip4Address` bind, `setRoute`/`servePage`/`syncPull`/`out_cookie`/`readCookies` hooks, per-action `Set-Cookie`).
 - `src/server/history.zig`: bounded per-session ring of serialized patch batches for SSE subscribers.

@@ -87,6 +87,9 @@ const Seg = union(enum) {
     /// `[...name]` catch-all — LAST segment only; `name` must be a
     /// `[]const u8` params field receiving the raw remainder ("a/b/c").
     catchall: []const u8,
+    /// `[[...name]]` optional catch-all — LAST segment only; same
+    /// payload as `catchall` but the tail may be empty ("" remainder).
+    optcatchall: []const u8,
 };
 
 const Page = struct {
@@ -335,17 +338,27 @@ fn routeSegments(arena: Allocator, rel: []const u8) GenError![]const Seg {
     while (it.next()) |part| {
         if (part.len == 0) return error.BadSegment;
         if (part[0] == '[') {
-            if (part.len < 3 or part[part.len - 1] != ']') return error.BadSegment;
-            const inner = part[1 .. part.len - 1];
-            if (std.mem.startsWith(u8, inner, "...")) {
-                // Catch-all: last segment only, plain name after "...".
+            if (part.len >= 5 and part[1] == '[' and part[part.len - 2] == ']') {
+                // Optional catch-all [[...name]]: last segment only.
+                const inner = part[2 .. part.len - 2];
+                if (!std.mem.startsWith(u8, inner, "...")) return error.BadSegment;
                 const name = inner[3..];
                 if (name.len == 0 or !std.zig.isValidId(name)) return error.BadSegment;
                 if (it.next() != null) return error.BadSegment;
-                segs.append(arena, .{ .catchall = name }) catch return error.OutOfMemory;
+                segs.append(arena, .{ .optcatchall = name }) catch return error.OutOfMemory;
             } else {
-                if (!std.zig.isValidId(inner)) return error.BadSegment;
-                segs.append(arena, .{ .dynamic = inner }) catch return error.OutOfMemory;
+                if (part.len < 3 or part[part.len - 1] != ']') return error.BadSegment;
+                const inner = part[1 .. part.len - 1];
+                if (std.mem.startsWith(u8, inner, "...")) {
+                    // Catch-all: last segment only, plain name after "...".
+                    const name = inner[3..];
+                    if (name.len == 0 or !std.zig.isValidId(name)) return error.BadSegment;
+                    if (it.next() != null) return error.BadSegment;
+                    segs.append(arena, .{ .catchall = name }) catch return error.OutOfMemory;
+                } else {
+                    if (!std.zig.isValidId(inner)) return error.BadSegment;
+                    segs.append(arena, .{ .dynamic = inner }) catch return error.OutOfMemory;
+                }
             }
         } else {
             if (std.mem.indexOfAny(u8, part, "[]") != null) return error.BadSegment;
@@ -455,7 +468,7 @@ fn checkParamSegments(segs: []const Seg, params: []const Param) GenError!void {
     if (dyn_count != params.len) return error.ParamMismatch;
     for (segs) |s| {
         const name = switch (s) {
-            .dynamic, .catchall => |n| n,
+            .dynamic, .catchall, .optcatchall => |n| n,
             .static => continue,
         };
         var found = false;
@@ -480,7 +493,7 @@ fn deriveTag(arena: Allocator, segs: []const Seg) GenError![]const u8 {
         const name = switch (s) {
             .static => |v| v,
             .dynamic => continue,
-            .catchall => |n| n,
+            .catchall, .optcatchall => |n| n,
         };
         if (!first) buf.append(arena, '_') catch return error.OutOfMemory;
         first = false;
@@ -523,7 +536,10 @@ fn sameShape(a: []const Seg, b: []const Seg) bool {
                 else => false,
             },
             .dynamic => sb == .dynamic,
-            .catchall => sb == .catchall,
+            .catchall, .optcatchall => switch (sb) {
+                .catchall, .optcatchall => true,
+                else => false,
+            },
         };
         if (!same) return false;
     }
@@ -541,7 +557,7 @@ fn pageLessThan(_: void, a: Page, b: Page) bool {
                 return switch (s) {
                     .static => 0,
                     .dynamic => 1,
-                    .catchall => 2,
+                    .catchall, .optcatchall => 2,
                 };
             }
         }.f;
@@ -625,14 +641,18 @@ fn emitRoutes(arena: Allocator, zmeta_path: []const u8, pages: []const Page, lay
         \\pub fn parseRoute(path: []const u8) ?Route {
         \\
     );
-    // "/" early-out: the root page's tag, or an explicit null.
+    // "/" early-out: the root page's tag, or an explicit null —
+    // UNLESS a root `[[...rest]]` page exists: it matches "/" too
+    // (empty remainder), so matching must run for it.
     var root_tag: ?[]const u8 = null;
+    var root_optcatchall = false;
     for (pages) |p| {
         if (p.segs.len == 0) root_tag = p.tag;
+        if (p.segs.len == 1 and p.segs[0] == .optcatchall) root_optcatchall = true;
     }
     if (root_tag) |t| {
         try w.print("    if (std.mem.eql(u8, path, \"/\")) return Route{{ .{s} = .{{}} }};\n", .{t});
-    } else {
+    } else if (!root_optcatchall) {
         try w.writeAll("    if (std.mem.eql(u8, path, \"/\")) return null;\n");
     }
     try w.writeAll(
@@ -771,16 +791,21 @@ fn emitViewNodesWraps(arena: Allocator, w: *std.Io.Writer, p: Page, layouts: []c
 
 /// One route's match arm inside parseRoute's `result:` block.
 fn emitRouteMatch(arena: Allocator, w: *std.Io.Writer, p: Page) !void {
-    const has_catchall = p.segs.len > 0 and p.segs[p.segs.len - 1] == .catchall;
+    const last = if (p.segs.len > 0) p.segs[p.segs.len - 1] else null;
+    const has_catchall = last != null and last.? == .catchall;
+    const has_optcatchall = last != null and last.? == .optcatchall;
+    // Required catch-all: n >= segs.len (tail ≥ 1). Optional: the
+    // catch-all seg itself may be absent → n >= segs.len - 1.
+    const min_n = if (has_optcatchall) p.segs.len - 1 else p.segs.len;
     var cond: std.ArrayList(u8) = .empty;
     try cond.appendSlice(arena, "        if (n ");
-    try cond.appendSlice(arena, if (has_catchall) ">= " else "== ");
+    try cond.appendSlice(arena, if (has_catchall or has_optcatchall) ">= " else "== ");
     var nb: [24]u8 = undefined;
-    try cond.appendSlice(arena, std.fmt.bufPrint(&nb, "{d}", .{p.segs.len}) catch unreachable);
+    try cond.appendSlice(arena, std.fmt.bufPrint(&nb, "{d}", .{min_n}) catch unreachable);
     for (p.segs, 0..) |s, i| {
         const name = switch (s) {
             .static => |v| v,
-            .dynamic, .catchall => continue,
+            .dynamic, .catchall, .optcatchall => continue,
         };
         try cond.appendSlice(arena, " and std.mem.eql(u8, segs[");
         try cond.appendSlice(arena, std.fmt.bufPrint(&nb, "{d}", .{i}) catch unreachable);
@@ -795,7 +820,7 @@ fn emitRouteMatch(arena: Allocator, w: *std.Io.Writer, p: Page) !void {
     for (p.segs, 0..) |s, i| {
         const name = switch (s) {
             .dynamic => |v| v,
-            .static, .catchall => continue,
+            .static, .catchall, .optcatchall => continue,
         };
         const ty = paramType(p, name);
         if (std.mem.eql(u8, ty, "[]const u8")) {
@@ -807,19 +832,33 @@ fn emitRouteMatch(arena: Allocator, w: *std.Io.Writer, p: Page) !void {
             );
         }
     }
-    if (has_catchall) {
+    if (has_catchall or has_optcatchall) {
         // Remainder = path slice starting after the "/" preceding the
         // catch-all position: 1 (leading '/') + each prefix segment's
-        // len + its '/' delimiter.
-        const name = p.segs[p.segs.len - 1].catchall;
+        // len + its '/' delimiter. Optional catch-alls may see n ==
+        // prefix (no tail at all) — then the remainder is "".
+        const name = switch (last.?) {
+            .catchall => |n| n,
+            .optcatchall => |n| n,
+            else => unreachable,
+        };
         const prefix = p.segs.len - 1;
-        try w.print(
-            \\            var ca_off: usize = 1;
-            \\            for (segs[0..{d}]) |sg| ca_off += sg.len + 1;
-            \\            const {s} = path[ca_off..];
-            \\            if ({s}.len == 0) break :result null;
-            \\
-        , .{ prefix, name, name });
+        if (has_optcatchall) {
+            try w.print(
+                \\            var ca_off: usize = 1;
+                \\            for (segs[0..{d}]) |sg| ca_off += sg.len + 1;
+                \\            const {s} = if (n > {d}) path[ca_off..] else "";
+                \\
+            , .{ prefix, name, prefix });
+        } else {
+            try w.print(
+                \\            var ca_off: usize = 1;
+                \\            for (segs[0..{d}]) |sg| ca_off += sg.len + 1;
+                \\            const {s} = path[ca_off..];
+                \\            if ({s}.len == 0) break :result null;
+                \\
+            , .{ prefix, name, name });
+        }
     }
     // Construct the payload in params-declaration order.
     if (p.params.len == 0) {
@@ -864,11 +903,15 @@ fn emitHrefCase(arena: Allocator, w: *std.Io.Writer, p: Page) !void {
     }
     // Dynamic: allocPrint — "{d}" for int params, "{s}" for
     // `[]const u8` params and catch-all remainders; args p.<name> in
-    // path order.
+    // path order. An optional catch-all tail emits a conditional:
+    // empty remainder → the prefix path, else prefix + "/" + tail.
+    const tail_catchall = p.segs.len > 0 and p.segs[p.segs.len - 1] == .catchall;
+    const opt_tail = p.segs.len > 0 and p.segs[p.segs.len - 1] == .optcatchall;
+    const seg_count = if (tail_catchall or opt_tail) p.segs.len - 1 else p.segs.len;
     var fmt: std.ArrayList(u8) = .empty;
     try fmt.append(arena, '/');
     var args: std.ArrayList(u8) = .empty;
-    for (p.segs, 0..) |s, i| {
+    for (p.segs[0..seg_count], 0..) |s, i| {
         if (i != 0) try fmt.append(arena, '/');
         switch (s) {
             .static => |v| try fmt.appendSlice(arena, v),
@@ -879,13 +922,56 @@ fn emitHrefCase(arena: Allocator, w: *std.Io.Writer, p: Page) !void {
                 try args.appendSlice(arena, "p.");
                 try args.appendSlice(arena, name);
             },
-            .catchall => |name| {
-                try fmt.appendSlice(arena, "{s}");
-                if (args.items.len != 0) try args.appendSlice(arena, ", ");
-                try args.appendSlice(arena, "p.");
-                try args.appendSlice(arena, name);
-            },
+            .catchall, .optcatchall => unreachable, // tail handled below
         }
+    }
+    if (tail_catchall) {
+        const name = p.segs[p.segs.len - 1].catchall;
+        try fmt.append(arena, '/');
+        try fmt.appendSlice(arena, "{s}");
+        if (args.items.len != 0) try args.appendSlice(arena, ", ");
+        try args.appendSlice(arena, "p.");
+        try args.appendSlice(arena, name);
+    }
+    if (opt_tail) {
+        const name = p.segs[p.segs.len - 1].optcatchall;
+        // Full form appends "/" + remainder; empty → prefix only.
+        var full_fmt = fmt;
+        try full_fmt.append(arena, '/');
+        try full_fmt.appendSlice(arena, "{s}");
+        var full_args = args;
+        if (full_args.items.len != 0) try full_args.appendSlice(arena, ", ");
+        try full_args.appendSlice(arena, "p.");
+        try full_args.appendSlice(arena, name);
+        const prefix_static = blk: {
+            var all_static = true;
+            for (p.segs[0..seg_count]) |s| {
+                if (s != .static) {
+                    all_static = false;
+                    break;
+                }
+            }
+            break :blk all_static;
+        };
+        if (prefix_static) {
+            // Prefix is a comptime literal — no allocPrint needed.
+            var lit: std.ArrayList(u8) = .empty;
+            try lit.append(arena, '/');
+            for (p.segs[0..seg_count], 0..) |s2, i| {
+                if (i != 0) try lit.append(arena, '/');
+                try lit.appendSlice(arena, s2.static);
+            }
+            try w.print(
+                "        .{s} => |p| if (p.{s}.len == 0) \"{s}\" else std.fmt.allocPrint(a, \"{s}\", .{{{s}}}) catch @panic(\"OOM\"),\n",
+                .{ p.tag, name, lit.items, full_fmt.items, full_args.items },
+            );
+        } else {
+            try w.print(
+                "        .{s} => |p| if (p.{s}.len == 0) std.fmt.allocPrint(a, \"{s}\", .{{{s}}}) catch @panic(\"OOM\") else std.fmt.allocPrint(a, \"{s}\", .{{{s}}}) catch @panic(\"OOM\"),\n",
+                .{ p.tag, name, fmt.items, args.items, full_fmt.items, full_args.items },
+            );
+        }
+        return;
     }
     try w.print(
         "        .{s} => |p| std.fmt.allocPrint(a, \"{s}\", .{{{s}}}) catch @panic(\"OOM\"),\n",
@@ -1033,6 +1119,8 @@ test "routeSegments maps page paths to route segments" {
         .{ .rel = "pages/tag/[tag].zig", .want = &.{ .{ .static = "tag" }, .{ .dynamic = "tag" } } },
         .{ .rel = "pages/docs/[...rest].zig", .want = &.{ .{ .static = "docs" }, .{ .catchall = "rest" } } },
         .{ .rel = "pages/[...rest].zig", .want = &.{.{ .catchall = "rest" }} },
+        .{ .rel = "pages/wiki/[[...rest]].zig", .want = &.{ .{ .static = "wiki" }, .{ .optcatchall = "rest" } } },
+        .{ .rel = "pages/[[...rest]].zig", .want = &.{.{ .optcatchall = "rest" }} },
     };
     for (cases) |c| {
         const segs = try routeSegments(arena, c.rel);
@@ -1042,6 +1130,7 @@ test "routeSegments maps page paths to route segments" {
                 .static => |ws| try std.testing.expectEqualStrings(ws, g.static),
                 .dynamic => |wd| try std.testing.expectEqualStrings(wd, g.dynamic),
                 .catchall => |wc| try std.testing.expectEqualStrings(wc, g.catchall),
+                .optcatchall => |wc| try std.testing.expectEqualStrings(wc, g.optcatchall),
             }
         }
     }
@@ -1050,6 +1139,9 @@ test "routeSegments maps page paths to route segments" {
 test "routeSegments rejects malformed paths" {
     const arena = std.testing.allocator;
     try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/[...rest]/x.zig")); // catch-all must be last
+    try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/[[...rest]]/x.zig")); // optional catch-all must be last
+    try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/[[...]].zig"));
+    try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/[[rest]].zig")); // no "..." prefix
     try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/[...].zig"));
     try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/[]/x.zig"));
     try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/a[0].zig"));

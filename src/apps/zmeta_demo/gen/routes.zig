@@ -12,6 +12,7 @@ const item_page = @import("../pages/item/[id].zig");
 const search_page = @import("../pages/search.zig");
 const structure_page = @import("../pages/structure.zig");
 const tag_page = @import("../pages/tag/[tag].zig");
+const wiki_rest_page = @import("../pages/wiki/[[...rest]].zig");
 const lay_root = @import("../pages/_layout.zig");
 
 /// Typed route — one tag per page file. Dynamic `[name]`
@@ -23,6 +24,7 @@ pub const Route = union(enum) {
     search: search_page.params,
     structure: structure_page.params,
     tag: tag_page.params,
+    wiki_rest: wiki_rest_page.params,
 };
 
 /// Parse a request path into a typed Route. Static segments take
@@ -67,6 +69,12 @@ pub fn parseRoute(path: []const u8) ?Route {
             const tag = segs[1];
             break :result Route{ .tag = .{ .tag = tag } };
         }
+        if (n >= 1 and std.mem.eql(u8, segs[0], "wiki")) {
+            var ca_off: usize = 1;
+            for (segs[0..1]) |sg| ca_off += sg.len + 1;
+            const rest = if (n > 1) path[ca_off..] else "";
+            break :result Route{ .wiki_rest = .{ .rest = rest } };
+        }
         break :result null;
     };
 }
@@ -95,6 +103,7 @@ pub fn href(a: std.mem.Allocator, r: Route) []const u8 {
         .search => "/search",
         .structure => "/structure",
         .tag => |p| std.fmt.allocPrint(a, "/tag/{s}", .{p.tag}) catch @panic("OOM"),
+        .wiki_rest => |p| if (p.rest.len == 0) "/wiki" else std.fmt.allocPrint(a, "/wiki/{s}", .{p.rest}) catch @panic("OOM"),
     };
 }
 
@@ -112,6 +121,7 @@ pub fn prepare(s: anytype, env: *const zmeta.Env) !void {
         .search => |p| try preparePage(search_page, s, p, env),
         .structure => |p| try preparePage(structure_page, s, p, env),
         .tag => |p| try preparePage(tag_page, s, p, env),
+        .wiki_rest => |p| try preparePage(wiki_rest_page, s, p, env),
     }
 }
 
@@ -128,6 +138,7 @@ pub fn viewNodes(a: std.mem.Allocator, s: anytype, env: *const zmeta.Env) []cons
         .search => |p| lay_root.layout(a, s, env, search_page.view(a, s, p, env)),
         .structure => |p| lay_root.layout(a, s, env, structure_page.view(a, s, p, env)),
         .tag => |p| lay_root.layout(a, s, env, tag_page.view(a, s, p, env)),
+        .wiki_rest => |p| lay_root.layout(a, s, env, wiki_rest_page.view(a, s, p, env)),
     };
     return nodes;
 }
