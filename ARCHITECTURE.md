@@ -1579,7 +1579,7 @@ emit time, so arena resets can't dangle patch payloads. zboard's
 hand-declared Session gained the two parity fields (its own
 servePage/render overrides never read them).
 
-## Board auth — phased (ADR-0001; phase 1 landed)
+## Board auth — phased (ADR-0001; phases 1+2 landed)
 
 Auth for zboard is phased: tripcodes first (per-post secret, zero
 auth state, no group-key impact), accounts second (zfxa cookie +
@@ -1598,3 +1598,37 @@ hex in a nullable `trip` column — added to the CREATE schema plus a
 base64 alnum, secret-free) to post/comment author labels only; the
 `#who` chip and group key stay trip-free since the suffix is per-post
 content, not viewer state.
+
+Phase 2 shipped the account half, and it is where the group-key
+decision paid off. `groups.Key` gained `account_id` (plus the "@name"
+display name as the human-readable half of the same dimension), so
+anonymous viewers, account A, and account B on the same route never
+share a Dom — own-content delete buttons and the "posting as" label
+are per-viewer chrome that would otherwise diverge silently inside a
+group. `syncMembership` treats an auth transition exactly like any
+other view-input change: the absent key clone-forks the current
+group, so login/logout diffs only the chrome delta (identity chip,
+auth links, delete buttons, posting-as) against the cloned Dom — no
+snapshot, and the SSE cursor stays valid because the fork keeps the
+stream lineage. Sessions of the SAME account still share a group:
+`readCookies` re-resolves `zfxa` on every request (a token detached
+by a logout elsewhere drops the session back to anonymous, and the
+next render re-keys it out of the account group).
+
+Model side: `accounts` (`name UNIQUE`, `pass_hash` =
+`salt_hex$iterations$hash_hex` over PBKDF2-HMAC-SHA256, `auth_token`
+as the single live `zfxa` value — re-login replaces it), nullable
+`acct` columns on posts/comments via the same `PRAGMA`-guarded
+`ALTER TABLE` pattern. `register`/`login`/`logout` are ordinary
+actions; register == auto-login and both mint `zfxa` onto the new
+second `Set-Cookie` — the session's `out_cookie2` field surfaced
+through an `outCookie2()` decl that `http.zig` probes via `@hasDecl`
+(fields are invisible to @hasDecl — a bare field probe silently
+never fires). `zfxu` first-contact and `zfxa` can ride the same
+response. `delete_post`/`delete_comment` are the first
+gated actions: the model re-checks `acct` ownership server-side
+(failures report `NotFound` — no existence leak) and cascades — a
+post takes all its comments + likes, a comment takes its reply
+subtree + likes — then rebuilds every derived index (they store
+`items` positions, so any removal invalidates them all; deletes are
+rare enough that O(rows) beats surgical index surgery).

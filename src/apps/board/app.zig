@@ -39,16 +39,25 @@ const Ping = struct {};
 /// and minted into `Session.out_cookie` on first POST.
 pub const user_cookie_name = "zfxu";
 
+/// `zfxa` account-auth cookie (ADR-0001 phase 2) — the account's live
+/// `auth_token`; minted into `Session.out_cookie2` on login/register,
+/// expired on logout. One token per account: a fresh login invalidates
+/// older cookies everywhere.
+pub const auth_cookie_name = "zfxa";
+
 /// Generated route → domain route: `/b/:slug` resolves to the board
 /// index (unknown slug → null → 404); post/comment ids pass through —
 /// existence is the page `prepare` gate. The comment permalink keeps
 /// only the comment id (it is authoritative; `post` derives from it).
+/// `/login` + `/register` are auth pages — they carry no board route.
 fn pageOf(r: routes.Route) ?boardview.Route {
     return switch (r) {
         .index => .home,
         .b => |p| if (model.boardIndex(p.slug)) |i| .{ .board = i } else null,
         .t => |p| .{ .thread = p.post },
         .t_c => |p| .{ .comment = p.comment },
+        .login => .login,
+        .register => .register,
     };
 }
 
@@ -84,9 +93,19 @@ pub const BoardDeps = struct {
     sort: boardview.Sort = .new,
     /// zfxu cookie value — the anonymous poster identity ("" = anonymous).
     user_token: []u8 = &.{},
+    /// zfxa-resolved account id (null = anonymous). The account NAME is
+    /// never stored — `model.accountName(id)` resolves it at render.
+    /// Re-resolved from the cookie on every `readCookies`, so a token
+    /// detached elsewhere (logout in another tab) clears this too.
+    account_id: ?u64 = null,
     /// Scratch for the Set-Cookie value emitted on the minting POST —
     /// `Session.out_cookie` points into it (one-shot per response).
     out_cookie_buf: [600]u8 = undefined,
+    /// Same for the `zfxa` cookie — `Session.out_cookie2` points here.
+    out_cookie_buf2: [160]u8 = undefined,
+    /// Scratch for the auth display name ("@name") built per
+    /// viewEnv/groupKey call — consumed immediately, never retained.
+    name_buf: [80]u8 = undefined,
     /// Last `model.global_seq` this session rendered — syncPull's cursor
     /// for UNGROUPED (never page-served) sessions; grouped sessions dedup
     /// on their group's `last_rendered_seq` instead.
@@ -95,7 +114,10 @@ pub const BoardDeps = struct {
     /// sessions that never served a page keep the solo diff path.
     attached: bool = false,
     /// Render-group membership (groups.zig): sessions with equal
-    /// (route, reply_to, resolved name, sort) share one Dom/history/rev.
+    /// (route, reply_to, auth display name, account id, sort) share
+    /// one Dom/history/rev — the auth dimension keeps an anonymous
+    /// viewer's chrome (login/register links, no delete buttons)
+    /// disjoint from any account's ("@name · logout", own-delete).
     group: ?*groups.RenderGroup = null,
     /// Bumped on every stream-INCOMPATIBLE group transition — join of a
     /// foreign namespace, first attach, group recreation — the SSE
@@ -158,23 +180,46 @@ pub const BoardDeps = struct {
         return pageOf(r) != null;
     }
 
-    /// `Deps.readCookies` — pick up the `zfxu` user cookie before
-    /// dispatch/page render (the server calls it with the raw Cookie
-    /// header on every /action POST and page GET).
+    /// `Deps.readCookies` — pick up the `zfxu` user cookie and resolve
+    /// the `zfxa` account cookie before dispatch/page render (the
+    /// server calls it with the raw Cookie header on every /action
+    /// POST and page GET — NOT on /events, so an open stream keeps its
+    /// last-resolved auth until the next request or render re-key).
+    ///
+    /// zfxu keeps first-contact-wins semantics (a minted token is never
+    /// replaced by a later cookie). zfxa re-resolves EVERY call: a
+    /// token detached by a logout elsewhere stops resolving and the
+    /// session drops back to anonymous — the render-group re-key on
+    /// the next render migrates it out of the account group.
     pub fn readCookies(s: *Session, cookie_hdr: ?[]const u8) void {
         const h = cookie_hdr orelse return;
+        var user_v: ?[]const u8 = null;
+        var auth_v: ?[]const u8 = null;
         var it = std.mem.splitScalar(u8, h, ';');
         while (it.next()) |part| {
             const kv = std.mem.trim(u8, part, " \t");
-            const prefix = user_cookie_name ++ "=";
-            if (std.mem.startsWith(u8, kv, prefix)) {
-                const v = kv[prefix.len..];
-                if (v.len != 0 and s.deps.user_token.len == 0) {
-                    s.deps.user_token = s.gpa.dupe(u8, v) catch @panic("OOM");
-                }
-                return;
+            const up = user_cookie_name ++ "=";
+            if (std.mem.startsWith(u8, kv, up)) {
+                const v = kv[up.len..];
+                if (v.len != 0) user_v = v;
+                continue;
+            }
+            const ap = auth_cookie_name ++ "=";
+            if (std.mem.startsWith(u8, kv, ap)) {
+                const v = kv[ap.len..];
+                if (v.len != 0) auth_v = v;
             }
         }
+        if (user_v) |v| {
+            if (s.deps.user_token.len == 0) {
+                s.deps.user_token = s.gpa.dupe(u8, v) catch @panic("OOM");
+            }
+        }
+        // Resolve the auth cookie fresh: present+valid → account id;
+        // absent, empty, or detached → anonymous. `accountByAuthToken`
+        // is a map hit — cheap enough per request.
+        const id = if (auth_v) |t| model.get().accountByAuthToken(t) else null;
+        s.deps.account_id = id;
     }
 
     /// `Deps.servePage` — the grouped page pipeline: setRoute →
@@ -270,9 +315,11 @@ pub const BoardDeps = struct {
         value: ?[]const u8,
         fields: ?*const std.json.ObjectMap,
     ) !void {
-        // `out_cookie` is a one-shot: the server emits it on this response
-        // only — later POSTs must not re-send the Set-Cookie header.
+        // `out_cookie`/`out_cookie2` are one-shots: the server emits them
+        // on this response only — later POSTs must not re-send the
+        // Set-Cookie headers.
         s.out_cookie = "";
+        s.out_cookie2 = "";
         // Every POST establishes identity on first contact.
         try ensureUser(s);
         return actions.dispatch(s, action, arg, value, fields);
@@ -280,19 +327,20 @@ pub const BoardDeps = struct {
 
     /// `post` — fields {board, text, trip?} → addPost on the shared
     /// model; `trip` is the optional 4chan-style tripcode (hashed in
-    /// the model, never stored plaintext).
+    /// the model, never stored plaintext). `acct` stamps account
+    /// ownership when the session is logged in (NULL = anonymous).
     pub fn on_post(s: *Session, arg: ?[]const u8, value: ?[]const u8, fields: ?*const std.json.ObjectMap) !void {
         _ = arg;
         _ = value;
         const f = fields orelse return error.InvalidAction;
         const slug = fieldStr(f, "board") orelse return error.InvalidAction;
         const text = fieldStr(f, "text") orelse return error.InvalidAction;
-        _ = try model.get().addPost(slug, s.deps.user_token, text, fieldStr(f, "trip"));
+        _ = try model.get().addPost(slug, s.deps.user_token, text, fieldStr(f, "trip"), s.deps.account_id);
         s.deps.ping.emit(.{});
     }
 
     /// `comment` — fields {post, parent?, text, trip?} → addComment;
-    /// clears the inline-reply target.
+    /// clears the inline-reply target. `acct` like on_post.
     pub fn on_comment(s: *Session, arg: ?[]const u8, value: ?[]const u8, fields: ?*const std.json.ObjectMap) !void {
         _ = arg;
         _ = value;
@@ -300,7 +348,7 @@ pub const BoardDeps = struct {
         const post_id = fieldU64(f, "post") orelse return error.InvalidAction;
         const parent = fieldU64(f, "parent");
         const text = fieldStr(f, "text") orelse return error.InvalidAction;
-        _ = try model.get().addComment(post_id, parent, s.deps.user_token, text, fieldStr(f, "trip"));
+        _ = try model.get().addComment(post_id, parent, s.deps.user_token, text, fieldStr(f, "trip"), s.deps.account_id);
         s.deps.reply_to = null;
         s.deps.ping.emit(.{});
     }
@@ -351,6 +399,92 @@ pub const BoardDeps = struct {
         };
         const target = std.fmt.parseInt(u64, a[1..], 10) catch return error.InvalidAction;
         _ = try model.get().toggleLike(kind, target, s.deps.user_token);
+        s.deps.ping.emit(.{});
+    }
+
+    // ── accounts (ADR-0001 phase 2) ─────────────────────────────
+
+    /// `register` — fields {name, password, confirm} → create the
+    /// account AND log in (register == auto-login): PBKDF2 hash +
+    /// fresh auth token land in one model call, `zfxa` rides
+    /// `out_cookie2` on this response. `confirm` must match `password`
+    /// — it's the only client-side check the server repeats.
+    pub fn on_register(s: *Session, arg: ?[]const u8, value: ?[]const u8, fields: ?*const std.json.ObjectMap) !void {
+        _ = arg;
+        _ = value;
+        const f = fields orelse return error.InvalidAction;
+        const name = fieldStr(f, "name") orelse return error.InvalidAction;
+        const password = fieldStr(f, "password") orelse return error.InvalidAction;
+        const confirm = fieldStr(f, "confirm") orelse return error.InvalidAction;
+        if (!std.mem.eql(u8, password, confirm)) return error.InvalidPassword;
+        var salt: [model.password_salt_len]u8 = undefined;
+        s.io.random(&salt);
+        const token = mintAuthToken(s);
+        const id = model.get().registerAccount(name, password, &salt, token) catch |e| {
+            s.gpa.free(token);
+            return e;
+        };
+        setSessionAuth(s, id, token); // copies token into out_cookie2
+        s.gpa.free(token);
+        s.deps.ping.emit(.{});
+    }
+
+    /// `login` — fields {name, password} → verify, mint a FRESH
+    /// `zfxa` (one live token per account — a second login invalidates
+    /// the first cookie), set session auth + `out_cookie2`.
+    /// BadLogin covers unknown name AND wrong password alike.
+    pub fn on_login(s: *Session, arg: ?[]const u8, value: ?[]const u8, fields: ?*const std.json.ObjectMap) !void {
+        _ = arg;
+        _ = value;
+        const f = fields orelse return error.InvalidAction;
+        const name = fieldStr(f, "name") orelse return error.InvalidAction;
+        const password = fieldStr(f, "password") orelse return error.InvalidAction;
+        const id = try model.get().verifyAccount(name, password);
+        const token = mintAuthToken(s);
+        model.get().attachAuthToken(id, token) catch |e| {
+            s.gpa.free(token);
+            return e;
+        };
+        setSessionAuth(s, id, token);
+        s.gpa.free(token);
+        s.deps.ping.emit(.{});
+    }
+
+    /// `logout` — drop the stored auth token (a replayed `zfxa` stops
+    /// resolving), clear session auth, expire the cookie client-side.
+    pub fn on_logout(s: *Session, arg: ?[]const u8, value: ?[]const u8, fields: ?*const std.json.ObjectMap) !void {
+        _ = arg;
+        _ = value;
+        _ = fields;
+        const was = s.deps.account_id != null;
+        if (s.deps.account_id) |id| {
+            model.get().detachAuthToken(id) catch {};
+            s.deps.account_id = null;
+        }
+        s.out_cookie2 = std.fmt.bufPrint(&s.deps.out_cookie_buf2, "{s}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0", .{auth_cookie_name}) catch @panic("cookie buf too small");
+        if (was) s.deps.ping.emit(.{});
+    }
+
+    /// `delete_post` — arg = post id → model.deletePost gated on the
+    /// session's account owning the row (anonymous posts: never).
+    /// Cascades comments + likes; bumps global_seq like addPost.
+    pub fn on_delete_post(s: *Session, arg: ?[]const u8, value: ?[]const u8, fields: ?*const std.json.ObjectMap) !void {
+        _ = value;
+        _ = fields;
+        const a = arg orelse return error.InvalidAction;
+        const id = std.fmt.parseInt(u64, a, 10) catch return error.InvalidAction;
+        try model.get().deletePost(id, s.deps.account_id);
+        s.deps.ping.emit(.{});
+    }
+
+    /// `delete_comment` — arg = comment id → model.deleteComment with
+    /// the same ownership gate + descendant/like cascade.
+    pub fn on_delete_comment(s: *Session, arg: ?[]const u8, value: ?[]const u8, fields: ?*const std.json.ObjectMap) !void {
+        _ = value;
+        _ = fields;
+        const a = arg orelse return error.InvalidAction;
+        const id = std.fmt.parseInt(u64, a, 10) catch return error.InvalidAction;
+        try model.get().deleteComment(id, s.deps.account_id);
         s.deps.ping.emit(.{});
     }
 
@@ -484,6 +618,12 @@ pub const Session = struct {
     /// Extra `Set-Cookie` header emitted on /action responses
     /// ("" = none). For board this points into `deps.out_cookie_buf`.
     out_cookie: []const u8 = &.{},
+    /// Second auxiliary Set-Cookie (`zfxa` account auth) — http.zig
+    /// emits it via an `@hasDecl` probe alongside `out_cookie`, so a
+    /// login/register response can carry BOTH `zfxu` (first contact)
+    /// and `zfxa` without merging headers. Points into
+    /// `deps.out_cookie_buf2`.
+    out_cookie2: []const u8 = &.{},
     /// Last route path accepted by `setRoute` — the `Env.route` source.
     /// Owned copy: request buffers die with the request.
     route: []const u8 = "/",
@@ -491,6 +631,13 @@ pub const Session = struct {
     /// Raw query string of the last page GET — the `Env.query` source.
     query: []const u8 = "",
     query_owned: bool = false,
+
+    /// `out_cookie2` accessor for http.zig's @hasDecl probe — the probe
+    /// sees DECLS only (struct fields are invisible to @hasDecl, which
+    /// is why this is a fn and not just the field above).
+    pub fn outCookie2(s: *Session) []const u8 {
+        return s.out_cookie2;
+    }
 
     /// Page shell metadata — forwarded from BoardDeps (the skeleton
     /// applies the same defaults when Deps doesn't declare them).
@@ -548,6 +695,10 @@ pub const Session = struct {
                 const c = model.get().comment(cid) orelse break :blk model.scopePost(0);
                 break :blk model.scopePost(c.post);
             },
+            // Auth pages render no model rows — SCOPE_STATIC never
+            // bumps, so their groups re-render only on fork-forced
+            // view-input changes (the auth transition itself).
+            .login, .register => model.SCOPE_STATIC,
         };
     }
 
@@ -600,6 +751,38 @@ pub const Session = struct {
 
 // ── session-state helpers (file scope, take *Session) ─────────
 
+/// Mint a `zfxa` auth token: 16 io-random bytes as 32 lowercase hex
+/// chars — cookie-safe, unguessable, and the model stores it verbatim
+/// (the by-token map makes lookups O(1)). Caller owns the result.
+fn mintAuthToken(s: *Session) []u8 {
+    var rb: [16]u8 = undefined;
+    s.io.random(&rb);
+    const hex = std.fmt.bytesToHex(rb, .lower);
+    return s.gpa.dupe(u8, &hex) catch @panic("OOM");
+}
+
+/// Mark `s` logged in as account `id` with live token `token` (the
+/// caller's copy — the model already stored its own): sets the
+/// session's account id and stages the `zfxa` Set-Cookie on
+/// `out_cookie2` for THIS response only.
+fn setSessionAuth(s: *Session, id: u64, token: []const u8) void {
+    s.deps.account_id = id;
+    s.out_cookie2 = std.fmt.bufPrint(&s.deps.out_cookie_buf2, "{s}={s}; Path=/; HttpOnly; SameSite=Strict", .{ auth_cookie_name, token }) catch @panic("cookie buf too small");
+}
+
+/// The viewer's auth display name — "@<account>" when logged in,
+/// else the resolved anonymous name ("Anon#N" / "anon"). Written
+/// into `buf` (caller-owned scratch; the result is consumed by the
+/// immediately-following view build or group join, never retained).
+fn authNameInto(s: *Session, buf: []u8) []const u8 {
+    if (s.deps.account_id) |id| {
+        if (model.get().accountName(id)) |n| {
+            return std.fmt.bufPrint(buf, "@{s}", .{n}) catch "anon";
+        }
+    }
+    return boardview.nameOf(s.deps.user_token);
+}
+
 /// Every POST needs a resolvable identity: mint on first contact, or
 /// heal a cookie token that has no users row (db reset / forged).
 fn ensureUser(s: *Session) !void {
@@ -620,9 +803,16 @@ fn ensureUser(s: *Session) !void {
 
 /// The session's current group-key inputs — recomputed on every render
 /// so an identity minted by a (possibly failed) dispatch is picked up
-/// BEFORE the group is chosen/rendered.
-fn groupKey(s: *Session) groups.Key {
-    return .{ .route = s.deps.page, .reply_to = s.deps.reply_to, .name = boardview.nameOf(s.deps.user_token), .sort = s.deps.sort };
+/// BEFORE the group is chosen/rendered. `name_buf` is caller scratch
+/// for the "@account" display name (anonymous names borrow the model).
+fn groupKey(s: *Session, name_buf: []u8) groups.Key {
+    return .{
+        .route = s.deps.page,
+        .reply_to = s.deps.reply_to,
+        .name = authNameInto(s, name_buf),
+        .sort = s.deps.sort,
+        .account_id = s.deps.account_id,
+    };
 }
 
 /// Join/migrate the render group when the key changed. Bumps
@@ -634,15 +824,20 @@ fn groupKey(s: *Session) groups.Key {
 /// drafts survive (ARCHITECTURE.md "Render groups v2").
 fn syncMembership(s: *Session) void {
     if (!s.deps.attached) return;
-    const key = groupKey(s);
+    var nbuf: [80]u8 = undefined;
+    const key = groupKey(s, &nbuf);
     var kbuf: [256]u8 = undefined;
-    const ks = groups.keyStringInto(&kbuf, key.route, key.reply_to, key.name, key.sort);
+    const ks = groups.keyStringInto(&kbuf, key.route, key.reply_to, key.name, key.sort, key.account_id);
     if (s.deps.group) |g| {
         if (std.mem.eql(u8, g.key_string, ks)) return;
         if (!groups.contains(key)) {
             // Absent key → clone-fork: new group inherits g's stream
             // lineage (rev + history + tracked Dom). Epoch stays —
             // the client's cursor remains valid on the new group.
+            // This is also the auth-transition path: login/logout
+            // re-keys like any other view input, so an anon→acct
+            // move forks the anon DOM and diffs only the chrome delta
+            // (identity chip, auth links, delete buttons, posting-as).
             s.deps.group = groups.fork(s.gpa, g, key);
             groups.leave(s.gpa, g);
             return;
@@ -674,7 +869,11 @@ pub fn viewEnv(s: *Session) boardview.ViewEnv {
         .route = s.deps.page,
         .reply_to = s.deps.reply_to,
         .sort = s.deps.sort,
-        .name = boardview.nameOf(s.deps.user_token),
+        // Auth display name ("@acct" / "Anon#N") + the account id that
+        // gates own-content delete buttons — the same inputs the
+        // render-group key carries, so group members render identically.
+        .name = authNameInto(s, &s.deps.name_buf),
+        .account_id = s.deps.account_id,
         .seen = &s.deps.seen_seq,
     };
 }
@@ -796,7 +995,7 @@ test "setRoute/servePage reset dom, SSR per route, and 404 dangling ids" {
     defer mm.deinit();
     model.shared = mm;
     defer model.shared = null;
-    _ = try mm.addPost("b", "tok1", "a post", null);
+    _ = try mm.addPost("b", "tok1", "a post", null, null);
 
     const s = createSession(alloc, std.testing.io);
     defer s.deinit();
@@ -904,10 +1103,10 @@ test "thread SSR emits nested keyed comment trees and reply anchors" {
     model.shared = mm;
     defer model.shared = null;
 
-    _ = try mm.addPost("b", "tok1", "root post", null);
-    const c1 = try mm.addComment(1, null, "tok1", "first", null);
-    const c2 = try mm.addComment(1, c1.id, "tok1", "child of first", null);
-    _ = try mm.addComment(1, c2.id, "tok1", "grandchild", null);
+    _ = try mm.addPost("b", "tok1", "root post", null, null);
+    const c1 = try mm.addComment(1, null, "tok1", "first", null, null);
+    const c2 = try mm.addComment(1, c1.id, "tok1", "child of first", null, null);
+    _ = try mm.addComment(1, c2.id, "tok1", "grandchild", null, null);
 
     const s = createSession(alloc, std.testing.io);
     defer s.deinit();
@@ -951,10 +1150,10 @@ test "comment page breadcrumbs walk the parent chain; focused subtree only" {
     model.shared = mm;
     defer model.shared = null;
 
-    _ = try mm.addPost("tech", "tok1", "p", null);
-    const c1 = try mm.addComment(1, null, "tok1", "root c", null);
-    const c2 = try mm.addComment(1, c1.id, "tok1", "mid c", null);
-    const c3 = try mm.addComment(1, c2.id, "tok1", "leaf c", null);
+    _ = try mm.addPost("tech", "tok1", "p", null, null);
+    const c1 = try mm.addComment(1, null, "tok1", "root c", null, null);
+    const c2 = try mm.addComment(1, c1.id, "tok1", "mid c", null, null);
+    const c3 = try mm.addComment(1, c2.id, "tok1", "leaf c", null, null);
 
     const s = createSession(alloc, std.testing.io);
     defer s.deinit();
@@ -1022,7 +1221,7 @@ test "comment on another session patches the board counter live" {
     model.shared = mm;
     defer model.shared = null;
 
-    _ = try mm.addPost("b", "tok1", "thread post", null);
+    _ = try mm.addPost("b", "tok1", "thread post", null, null);
     // Board-index session already rendered (SSR-equivalent seed).
     const s = createSession(alloc, std.testing.io);
     defer s.deinit();
@@ -1135,7 +1334,7 @@ test "render groups: equal keys share one group; one render per model bump" {
     // Model bump → the FIRST member's syncPull renders+publishes once;
     // the second sees last_rendered_seq already current — dedup proof:
     // rev (one per render) advances by exactly 1 for two sessions.
-    _ = try mm.addPost("b", "tok1", "grouped post", null);
+    _ = try mm.addPost("b", "tok1", "grouped post", null, null);
     a.syncPull();
     try std.testing.expectEqual(@as(u64, 1), g.rev);
     try std.testing.expectEqual(g.rev, g.history.latest_rev);
@@ -1164,8 +1363,8 @@ test "render groups v2: reply_to fork clones the stream; A→B→A still snapsho
     model.shared = mm;
     defer model.shared = null;
 
-    _ = try mm.addPost("b", "tok1", "p", null);
-    const c1 = try mm.addComment(1, null, "tok1", "c", null);
+    _ = try mm.addPost("b", "tok1", "p", null, null);
+    const c1 = try mm.addComment(1, null, "tok1", "c", null, null);
 
     const a = createSession(alloc, std.testing.io);
     defer a.deinit();
@@ -1178,7 +1377,7 @@ test "render groups v2: reply_to fork clones the stream; A→B→A still snapsho
 
     // Give the base group a published batch so its ring is non-empty —
     // the fork must carry it verbatim for lagging cursors.
-    _ = try mm.addComment(1, null, "tok2", "c2", null);
+    _ = try mm.addComment(1, null, "tok2", "c2", null, null);
     a.syncPull();
     try std.testing.expectEqual(@as(u64, 1), base.rev);
 
@@ -1220,7 +1419,7 @@ test "render groups: minted identity re-keys the session out of the anon group" 
     model.shared = mm;
     defer model.shared = null;
 
-    _ = try mm.addPost("b", "tok1", "p", null);
+    _ = try mm.addPost("b", "tok1", "p", null, null);
     const a = createSession(alloc, std.testing.io);
     defer a.deinit();
     const d = createSession(alloc, std.testing.io);
@@ -1304,10 +1503,10 @@ test "sortTops: newest-first default, top orders by likes then recency" {
     defer mm.deinit();
     model.shared = mm;
     defer model.shared = null;
-    _ = try mm.addPost("b", "tok", "post", null);
-    _ = try mm.addComment(1, null, "tok", "oldest", null);
-    _ = try mm.addComment(1, null, "tok", "middle", null);
-    _ = try mm.addComment(1, null, "tok", "newest", null);
+    _ = try mm.addPost("b", "tok", "post", null, null);
+    _ = try mm.addComment(1, null, "tok", "oldest", null, null);
+    _ = try mm.addComment(1, null, "tok", "middle", null, null);
+    _ = try mm.addComment(1, null, "tok", "newest", null, null);
     const c_old = mm.comments.items[0].id;
     const c_mid = mm.comments.items[1].id;
     const c_new = mm.comments.items[2].id;
@@ -1409,8 +1608,8 @@ test "dirty-only dispatch: unrelated scope mutations skip group renders" {
     defer mm.deinit();
     model.shared = mm;
     defer model.shared = null;
-    _ = try mm.addPost("b", "tok", "post one", null);
-    _ = try mm.addPost("b", "tok", "post two", null);
+    _ = try mm.addPost("b", "tok", "post one", null, null);
+    _ = try mm.addPost("b", "tok", "post two", null, null);
 
     const a = createSession(alloc, std.testing.io);
     defer a.deinit();
@@ -1511,4 +1710,236 @@ test "tripcode field flows through dispatch into stored hash + author label" {
     try pf.put(alloc, "trip", .{ .string = "   " });
     try s.dispatch("post", null, null, &pf);
     try std.testing.expect(mm.posts.items[1].trip == null);
+}
+
+// ── accounts (ADR-0001 phase 2) ─────────────────────────────────
+
+test "auth actions: register/login/logout set session auth + zfxa cookie" {
+    const alloc = std.testing.allocator;
+    const mm = testModel(alloc);
+    defer mm.deinit();
+    model.shared = mm;
+    defer model.shared = null;
+
+    const s = createSession(alloc, std.testing.io);
+    defer s.deinit();
+
+    // register == auto-login: session gains account_id and the zfxa
+    // Set-Cookie rides out_cookie2 on THIS response only.
+    var rf = fieldsOf(alloc, &.{
+        .{ "name", "alice" },
+        .{ "password", "password1" },
+        .{ "confirm", "password1" },
+    });
+    defer rf.deinit(alloc);
+    try s.dispatch("register", null, null, &rf);
+    try std.testing.expectEqual(@as(?u64, 1), s.deps.account_id);
+    try std.testing.expect(std.mem.startsWith(u8, s.out_cookie2, "zfxa="));
+    const tok1 = mm.accounts.items[0].auth_token.?;
+    try std.testing.expect(std.mem.indexOf(u8, s.out_cookie2, tok1) != null);
+
+    // One-shot: the next dispatch clears it — no re-send on later POSTs.
+    try s.dispatch("cancel_reply", null, null, null);
+    try std.testing.expectEqual(@as(usize, 0), s.out_cookie2.len);
+
+    // readCookies resolves zfxa → account id on another session; a
+    // bogus/absent token resolves to anonymous.
+    const s2 = createSession(alloc, std.testing.io);
+    defer s2.deinit();
+    var hdr_buf: [96]u8 = undefined;
+    const hdr1 = std.fmt.bufPrint(&hdr_buf, "zfxa={s}", .{tok1}) catch unreachable;
+    s2.readCookies(hdr1);
+    try std.testing.expectEqual(@as(?u64, 1), s2.deps.account_id);
+    s2.readCookies("zfxa=bogus-token");
+    try std.testing.expect(s2.deps.account_id == null);
+    s2.readCookies(null);
+    try std.testing.expect(s2.deps.account_id == null);
+
+    // Validation: confirm mismatch → InvalidPassword; wrong password
+    // → BadLogin; unknown name → BadLogin.
+    var bad = fieldsOf(alloc, &.{
+        .{ "name", "bob" },
+        .{ "password", "password1" },
+        .{ "confirm", "password2" },
+    });
+    defer bad.deinit(alloc);
+    try std.testing.expectError(error.InvalidPassword, s.dispatch("register", null, null, &bad));
+    var lf = fieldsOf(alloc, &.{
+        .{ "name", "alice" },
+        .{ "password", "wrong-pass" },
+    });
+    defer lf.deinit(alloc);
+    try std.testing.expectError(error.BadLogin, s.dispatch("login", null, null, &lf));
+    var lf2 = fieldsOf(alloc, &.{
+        .{ "name", "ghost" },
+        .{ "password", "password1" },
+    });
+    defer lf2.deinit(alloc);
+    try std.testing.expectError(error.BadLogin, s.dispatch("login", null, null, &lf2));
+
+    // login mints a FRESH token: the previous zfxa stops resolving
+    // everywhere (one live token per account).
+    var ok = fieldsOf(alloc, &.{
+        .{ "name", "alice" },
+        .{ "password", "password1" },
+    });
+    defer ok.deinit(alloc);
+    try s.dispatch("login", null, null, &ok);
+    try std.testing.expectEqual(@as(?u64, 1), s.deps.account_id);
+    const tok2 = mm.accounts.items[0].auth_token.?;
+    try std.testing.expect(!std.mem.eql(u8, tok1, tok2));
+    try std.testing.expect(mm.accountByAuthToken(tok1) == null);
+    try std.testing.expectEqual(@as(?u64, 1), mm.accountByAuthToken(tok2));
+    // s2's cookie still carries the dead tok1 → drops back to anon.
+    s2.readCookies(hdr1);
+    try std.testing.expect(s2.deps.account_id == null);
+
+    // logout: session auth cleared, cookie expired, stored token
+    // dropped — replaying tok2 resolves nothing.
+    try s.dispatch("logout", null, null, null);
+    try std.testing.expect(s.deps.account_id == null);
+    try std.testing.expect(std.mem.indexOf(u8, s.out_cookie2, "Max-Age=0") != null);
+    try std.testing.expect(mm.accounts.items[0].auth_token == null);
+    const hdr2 = std.fmt.bufPrint(&hdr_buf, "zfxa={s}", .{tok2}) catch unreachable;
+    s2.readCookies(hdr2);
+    try std.testing.expect(s2.deps.account_id == null);
+}
+
+test "render groups: account auth splits the key; login forks, logout rejoins" {
+    const alloc = std.testing.allocator;
+    const mm = testModel(alloc);
+    defer mm.deinit();
+    model.shared = mm;
+    defer model.shared = null;
+
+    _ = try mm.addPost("b", "tok1", "p", null, null);
+    const a = createSession(alloc, std.testing.io);
+    defer a.deinit();
+    const b = createSession(alloc, std.testing.io);
+    defer b.deinit();
+    try serveBoth(alloc, a, b, "/b/b");
+    const anon_group = a.deps.group.?;
+    try std.testing.expectEqual(@as(usize, 2), anon_group.members);
+    const e0 = a.membershipEpoch();
+
+    // a registers → auto-login → the auth dimension re-keys the
+    // session. "@alice"/acct:1 is absent → clone-fork: epoch stays,
+    // the forked group continues the anon stream lineage.
+    var rf = fieldsOf(alloc, &.{
+        .{ "name", "alice" },
+        .{ "password", "password1" },
+        .{ "confirm", "password1" },
+    });
+    defer rf.deinit(alloc);
+    try a.dispatch("register", null, null, &rf);
+    const acct_group = a.deps.group.?;
+    try std.testing.expect(acct_group != anon_group);
+    try std.testing.expect(b.deps.group.? == anon_group);
+    try std.testing.expectEqual(@as(?u64, 1), acct_group.key.account_id);
+    try std.testing.expectEqualStrings("@alice", acct_group.key.name);
+    try std.testing.expect(a.membershipEpoch() == e0);
+    try std.testing.expectEqual(@as(usize, 2), groups.registryCount());
+
+    // The auth chrome actually renders: session SSR shows "@alice" +
+    // the logout button; the anon session still shows login/register.
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    try a.writeView(&aw.writer);
+    const ahtml = aw.toOwnedSlice() catch @panic("OOM");
+    defer alloc.free(ahtml);
+    try std.testing.expect(std.mem.indexOf(u8, ahtml, "@alice") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ahtml, "logout") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ahtml, "posting as") != null);
+    var bw: std.Io.Writer.Allocating = .init(alloc);
+    defer bw.deinit();
+    try b.writeView(&bw.writer);
+    const bhtml = bw.toOwnedSlice() catch @panic("OOM");
+    defer alloc.free(bhtml);
+    try std.testing.expect(std.mem.indexOf(u8, bhtml, "login") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bhtml, "register") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bhtml, "@alice") == null);
+
+    // logout → account_id null → the name falls back to the session's
+    // MINTED anonymous identity ("Anon#1" — the register POST's
+    // ensureUser already created it), NOT b's unresolved "anon".
+    // That key is absent → clone-fork again: epoch still unchanged,
+    // the single-member acct group is destroyed on leave.
+    try a.dispatch("logout", null, null, null);
+    const back = a.deps.group.?;
+    try std.testing.expect(back != anon_group);
+    try std.testing.expect(back.key.account_id == null);
+    try std.testing.expectEqualStrings("Anon#1", back.key.name);
+    try std.testing.expect(a.membershipEpoch() == e0);
+    try std.testing.expectEqual(@as(usize, 1), anon_group.members);
+    try std.testing.expectEqual(@as(usize, 2), groups.registryCount());
+}
+
+test "delete actions: own-content delete end-to-end; foreign/anon rejected" {
+    const alloc = std.testing.allocator;
+    const mm = testModel(alloc);
+    defer mm.deinit();
+    model.shared = mm;
+    defer model.shared = null;
+
+    const a = createSession(alloc, std.testing.io);
+    defer a.deinit();
+    const anon = createSession(alloc, std.testing.io);
+    defer anon.deinit();
+
+    // a registers → posts carry acct=1.
+    var rf = fieldsOf(alloc, &.{
+        .{ "name", "alice" },
+        .{ "password", "password1" },
+        .{ "confirm", "password1" },
+    });
+    defer rf.deinit(alloc);
+    try a.dispatch("register", null, null, &rf);
+
+    var pf = fieldsOf(alloc, &.{
+        .{ "board", "b" },
+        .{ "text", "owned post" },
+    });
+    defer pf.deinit(alloc);
+    try a.dispatch("post", null, null, &pf);
+    try std.testing.expectEqual(@as(?u64, 1), mm.posts.items[0].acct);
+    const pid = mm.posts.items[0].id;
+
+    var pf2 = fieldsOf(alloc, &.{
+        .{ "board", "b" },
+        .{ "text", "anon post" },
+    });
+    defer pf2.deinit(alloc);
+    try anon.dispatch("post", null, null, &pf2);
+    try std.testing.expect(mm.posts.items[1].acct == null);
+
+    var idbuf: [24]u8 = undefined;
+    const parg = std.fmt.bufPrint(&idbuf, "{d}", .{pid}) catch unreachable;
+
+    // Anonymous session cannot delete the account's post.
+    try std.testing.expectError(error.NotFound, anon.dispatch("delete_post", parg, null, null));
+    // Malformed arg rejected before any model call.
+    try std.testing.expectError(error.InvalidAction, a.dispatch("delete_post", "abc", null, null));
+    try std.testing.expectError(error.InvalidAction, a.dispatch("delete_comment", null, null, null));
+
+    // Owner deletes: post + its cascade path exercised model-side.
+    try a.dispatch("delete_post", parg, null, null);
+    try std.testing.expect(mm.post(pid) == null);
+    try std.testing.expectEqual(@as(usize, 1), mm.posts.items.len);
+
+    // Comment path: a comments on the anon post, then deletes it.
+    var cf = fieldsOf(alloc, &.{
+        .{ "post", "2" },
+        .{ "text", "owned comment" },
+    });
+    defer cf.deinit(alloc);
+    try a.dispatch("comment", null, null, &cf);
+    const cid = mm.comments.items[0].id;
+    try std.testing.expectEqual(@as(?u64, 1), mm.comments.items[0].acct);
+    const carg = std.fmt.bufPrint(&idbuf, "{d}", .{cid}) catch unreachable;
+    // The anon post's author can't delete a comments row they don't own
+    // (and anon rows can't be deleted at all — model gate).
+    try std.testing.expectError(error.NotFound, anon.dispatch("delete_comment", carg, null, null));
+    try a.dispatch("delete_comment", carg, null, null);
+    try std.testing.expect(mm.comment(cid) == null);
+    try std.testing.expectEqual(@as(usize, 0), mm.comments.items.len);
 }

@@ -2,6 +2,15 @@
 //! held in memory as struct-of-arrays, write-through to SQLite. All
 //! mutation happens under the server's session mutex; `global_seq` is the
 //! atomic fan-out counter sessions poll via `syncPull`.
+//!
+//! Optional accounts (ADR-0001 phase 2): the `accounts` table holds
+//! `name UNIQUE` + a `salt$iterations$hash` PBKDF2-HMAC-SHA256
+//! `pass_hash` + a single `auth_token` (the `zfxa` cookie value — one
+//! live token per account, demo-grade). posts/comments carry a nullable
+//! `acct` column: the account id for account-authored rows, NULL for
+//! anonymous ones. `acct` is post CONTENT (author attribution), while
+//! the viewer's own account lives per-session in app.zig — only the
+//! delete gate compares the two.
 const std = @import("std");
 const db = @import("../../db.zig");
 
@@ -10,6 +19,19 @@ pub const latest_home_count = 10;
 /// Tripcode input cap (chars, after trimming) — 4chan-style `!code`
 /// suffixes are short; the cap keeps the HMAC input bounded.
 pub const max_trip_len = 64;
+/// Account name cap (chars) — the `[a-zA-Z0-9_-]` charset keeps names
+/// URL/cookie/HTML safe and unambiguous next to "Anon#N"/"@name".
+pub const max_account_name_len = 32;
+/// Minimum password length (bytes) — demo-grade floor, not a policy.
+pub const min_password_len = 8;
+/// PBKDF2-HMAC-SHA256 cost — demo trade-off per ADR-0001 (~100 ms-class
+/// on modern hw is overkill here; stored format keeps `iterations`
+/// tunable per hash).
+const pbkdf2_iterations: u32 = 100_000;
+/// Salt width for `registerAccount` callers (app.zig mints it from
+/// `io.random`) — pub so the session can size its stack buffer.
+pub const password_salt_len = 16;
+const password_hash_len = 32; // SHA-256 output
 
 pub const Board = struct { slug: []const u8, title: []const u8 };
 
@@ -34,7 +56,9 @@ pub fn boardIndex(slug: []const u8) ?usize {
 /// `userName`/`ensureUser` ("Anon#<base36(rownum)>"). `trip` holds the
 /// stored HMAC hash of an optional tripcode (hex, NULL = none) — the
 /// plaintext tripcode is never persisted; the public `!code` is
-/// derived from the hash by `tripCode`.
+/// derived from the hash by `tripCode`. `acct` is the account id for
+/// account-authored rows (NULL = anonymous); account posts still carry
+/// their session `user` token so likes keep working per-session.
 pub const Post = struct {
     id: u64,
     board: []u8,
@@ -42,6 +66,7 @@ pub const Post = struct {
     text: []u8,
     ts: i64,
     trip: ?[]u8 = null,
+    acct: ?u64 = null,
 };
 
 pub const Comment = struct {
@@ -52,11 +77,29 @@ pub const Comment = struct {
     text: []u8,
     ts: i64,
     trip: ?[]u8 = null,
+    acct: ?u64 = null,
+};
+
+/// One row of the `accounts` table. `id` is implicit: accounts are
+/// append-only (no delete path), so `id == index + 1` in `accounts`.
+/// `pass_hash` is "salt_hex$iterations$hash_hex" — the plaintext
+/// password is never stored. `auth_token` is the live `zfxa` cookie
+/// value (NULL = logged out); the by-token map borrows this slice.
+pub const Account = struct {
+    name: []u8,
+    pass_hash: []u8,
+    auth_token: ?[]u8 = null,
+    created: i64,
 };
 
 pub const ModelError = error{
     InvalidText,
     InvalidTrip,
+    InvalidName,
+    InvalidPassword,
+    NameTaken,
+    BadLogin,
+    NotFound,
     UnknownBoard,
     PostNotFound,
     CommentNotFound,
@@ -88,6 +131,11 @@ fn likeKindChar(k: LikeKind) u8 {
 /// disjoint (id 0 is never a real post, used for dangling routes).
 pub const SCOPE_HOME: u64 = 0;
 const SCOPE_POST_BASE: u64 = 1 << 40;
+/// Scope for pages that render no model rows (login/register): the
+/// key is never bumped, so `scopeVersion` stays 0 and their render
+/// groups only re-render on fork-forced view-input changes (the auth
+/// transition itself), never on content churn.
+pub const SCOPE_STATIC: u64 = std.math.maxInt(u64);
 
 pub fn scopeBoard(idx: usize) u64 {
     return @as(u64, idx) + 1;
@@ -152,6 +200,61 @@ pub fn tripCode(a: std.mem.Allocator, stored: ?[]const u8) ?[]const u8 {
     return a.dupe(u8, out[0..n]) catch @panic("OOM");
 }
 
+// ── accounts (ADR-0001 phase 2) ─────────────────────────────
+
+/// Account name charset: 1–`max_account_name_len` chars of
+/// `[a-zA-Z0-9_-]`. The "@" display prefix plus this charset keeps
+/// account names disjoint from "Anon#N"/"anon" in render-group keys.
+fn validAccountName(name: []const u8) bool {
+    if (name.len == 0 or name.len > max_account_name_len) return false;
+    for (name) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and ch != '_' and ch != '-') return false;
+    }
+    return true;
+}
+
+fn validPassword(password: []const u8) bool {
+    return password.len >= min_password_len;
+}
+
+/// PBKDF2-HMAC-SHA256 via std.crypto — std's implementation IS the
+/// RFC 2898 loop over `HmacSha256` (same construction the ADR sketched
+/// by hand); `iterations`/`salt` come from the stored hash so verify
+/// recomputes identically.
+fn pbkdf2Hash(password: []const u8, salt: []const u8, iterations: u32, out: *[password_hash_len]u8) void {
+    std.crypto.pwhash.pbkdf2(out, password, salt, iterations, HmacSha256) catch unreachable;
+}
+
+/// `pass_hash` column format: "<salt_hex>$<iterations>$<hash_hex>".
+fn hashPassword(a: std.mem.Allocator, password: []const u8, salt: *const [password_salt_len]u8) error{OutOfMemory}![]u8 {
+    var dk: [password_hash_len]u8 = undefined;
+    pbkdf2Hash(password, salt, pbkdf2_iterations, &dk);
+    const shex = std.fmt.bytesToHex(salt, .lower);
+    const dhex = std.fmt.bytesToHex(dk, .lower);
+    return std.fmt.allocPrint(a, "{s}${d}${s}", .{ shex[0..], pbkdf2_iterations, dhex[0..] }) catch error.OutOfMemory;
+}
+
+/// Recompute + constant-time compare against a stored `pass_hash`.
+/// Malformed stored values simply fail — they can only come from a
+/// hand-edited db.
+fn verifyPassword(stored: []const u8, password: []const u8) bool {
+    var it = std.mem.splitScalar(u8, stored, '$');
+    const salt_hex = it.next() orelse return false;
+    const iter_s = it.next() orelse return false;
+    const hash_hex = it.next() orelse return false;
+    if (it.next() != null) return false;
+    const iterations = std.fmt.parseInt(u32, iter_s, 10) catch return false;
+    if (iterations == 0) return false;
+    if (salt_hex.len != password_salt_len * 2 or hash_hex.len != password_hash_len * 2) return false;
+    var salt: [password_salt_len]u8 = undefined;
+    _ = std.fmt.hexToBytes(salt[0..], salt_hex) catch return false;
+    var want: [password_hash_len]u8 = undefined;
+    _ = std.fmt.hexToBytes(want[0..], hash_hex) catch return false;
+    var got: [password_hash_len]u8 = undefined;
+    pbkdf2Hash(password, &salt, iterations, &got);
+    return std.crypto.timing_safe.eql([password_hash_len]u8, got, want);
+}
+
 /// The shared model instance, installed by `board_main` before
 /// `serve()` (and by tests). All access is serialized by the server's
 /// session mutex.
@@ -185,7 +288,8 @@ const schema =
     \\    user TEXT NOT NULL,
     \\    text TEXT NOT NULL,
     \\    ts INTEGER NOT NULL,
-    \\    trip TEXT
+    \\    trip TEXT,
+    \\    acct INTEGER
     \\);
     \\CREATE TABLE IF NOT EXISTS comments (
     \\    id INTEGER PRIMARY KEY,
@@ -194,7 +298,15 @@ const schema =
     \\    user TEXT NOT NULL,
     \\    text TEXT NOT NULL,
     \\    ts INTEGER NOT NULL,
-    \\    trip TEXT
+    \\    trip TEXT,
+    \\    acct INTEGER
+    \\);
+    \\CREATE TABLE IF NOT EXISTS accounts (
+    \\    id INTEGER PRIMARY KEY,
+    \\    name TEXT UNIQUE NOT NULL,
+    \\    pass_hash TEXT NOT NULL,
+    \\    auth_token TEXT,
+    \\    created INTEGER NOT NULL
     \\);
     \\CREATE TABLE IF NOT EXISTS likes (
     \\    kind TEXT NOT NULL,
@@ -230,6 +342,13 @@ pub const BoardModel = struct {
     comments: std.ArrayListUnmanaged(Comment) = .empty,
     /// zfxu token -> display name ("Anon#<base36(rownum)>").
     users: std.StringHashMapUnmanaged([]u8) = .empty,
+    /// Accounts in id order — `id == index + 1` (append-only, no
+    /// delete). `account_by_name`/`account_by_token` map to indices;
+    /// their keys BORROW the Account's owned slices (posts_by_board
+    /// precedent — freed via the Account, never via the maps).
+    accounts: std.ArrayListUnmanaged(Account) = .empty,
+    account_by_name: std.StringHashMapUnmanaged(usize) = .empty,
+    account_by_token: std.StringHashMapUnmanaged(usize) = .empty,
     /// post id -> comment count, maintained on load/addComment so
     /// `commentCount` is O(1) instead of a full scan per post card.
     post_counts: std.AutoHashMapUnmanaged(u64, u32) = .empty,
@@ -311,6 +430,16 @@ pub const BoardModel = struct {
             self.gpa.free(e.value_ptr.*);
         }
         self.users.deinit(self.gpa);
+        for (self.accounts.items) |acct| {
+            self.gpa.free(acct.name);
+            self.gpa.free(acct.pass_hash);
+            if (acct.auth_token) |t| self.gpa.free(t);
+        }
+        self.accounts.deinit(self.gpa);
+        // account_by_name/account_by_token keys borrow Account slices —
+        // deinit frees map storage only, never the keys.
+        self.account_by_name.deinit(self.gpa);
+        self.account_by_token.deinit(self.gpa);
         self.post_counts.deinit(self.gpa);
         var lit = self.liked_by.iterator();
         while (lit.next()) |e| self.gpa.free(e.key_ptr.*);
@@ -362,21 +491,29 @@ pub const BoardModel = struct {
         return false;
     }
 
-    /// Minimal forward-migration for pre-trip databases: add the
-    /// `trip` column to posts/comments when missing. Fresh databases
-    /// already have it from `schema` — the pragma probe makes this a
-    /// no-op there.
+    /// Minimal forward-migration for pre-account databases: add the
+    /// `trip`/`acct` columns to posts/comments when missing. Fresh
+    /// databases already have them from `schema` — the pragma probe
+    /// makes this a no-op there. `accounts` needs no migration: it's
+    /// CREATE TABLE IF NOT EXISTS.
     fn migrate(self: *BoardModel) !void {
-        for ([_][]const u8{ "posts", "comments" }) |table| {
-            if (try self.hasColumn(table, "trip")) continue;
-            var sql_buf: [96]u8 = undefined;
-            const sql = std.fmt.bufPrint(&sql_buf, "ALTER TABLE {s} ADD COLUMN trip TEXT", .{table}) catch unreachable;
+        const adds = [_]struct { table: []const u8, col: []const u8, ddl: []const u8 }{
+            .{ .table = "posts", .col = "trip", .ddl = "TEXT" },
+            .{ .table = "comments", .col = "trip", .ddl = "TEXT" },
+            .{ .table = "posts", .col = "acct", .ddl = "INTEGER" },
+            .{ .table = "comments", .col = "acct", .ddl = "INTEGER" },
+        };
+        for (adds) |a| {
+            if (try self.hasColumn(a.table, a.col)) continue;
+            var sql_buf: [128]u8 = undefined;
+            const sql = std.fmt.bufPrint(&sql_buf, "ALTER TABLE {s} ADD COLUMN {s} {s}", .{ a.table, a.col, a.ddl }) catch unreachable;
             try self.db.exec(self.gpa, sql);
         }
     }
 
     /// Load all rows; names are assigned by user row order so they are
-    /// stable across restarts (Anon#1, Anon#2, ...).
+    /// stable across restarts (Anon#1, Anon#2, ...). Account ids are
+    /// contiguous rowids — `accounts.items[i]` is account `i + 1`.
     fn load(self: *BoardModel) !void {
         {
             var st = try self.db.prepare(self.gpa, "SELECT token FROM users ORDER BY rowid");
@@ -390,10 +527,35 @@ pub const BoardModel = struct {
             }
         }
         {
-            var st = try self.db.prepare(self.gpa, "SELECT id, board, user, text, ts, trip FROM posts ORDER BY id");
+            var st = try self.db.prepare(self.gpa, "SELECT id, name, pass_hash, auth_token, created FROM accounts ORDER BY id");
+            defer st.finalize();
+            while (try st.step()) {
+                const tok_col = st.columnText(3);
+                const acct = Account{
+                    .name = try self.gpa.dupe(u8, st.columnText(1)),
+                    .pass_hash = try self.gpa.dupe(u8, st.columnText(2)),
+                    .auth_token = if (tok_col.len == 0) null else try self.gpa.dupe(u8, tok_col),
+                    .created = st.columnInt(4),
+                };
+                errdefer {
+                    self.gpa.free(acct.name);
+                    self.gpa.free(acct.pass_hash);
+                    if (acct.auth_token) |t| self.gpa.free(t);
+                }
+                const idx = self.accounts.items.len;
+                try self.accounts.append(self.gpa, acct);
+                // Index maps key on the Account's owned slices (borrowed).
+                self.account_by_name.put(self.gpa, acct.name, idx) catch @panic("OOM");
+                if (acct.auth_token) |t| self.account_by_token.put(self.gpa, t, idx) catch @panic("OOM");
+                std.debug.assert(st.columnInt(0) == @as(i64, @intCast(idx + 1)));
+            }
+        }
+        {
+            var st = try self.db.prepare(self.gpa, "SELECT id, board, user, text, ts, trip, acct FROM posts ORDER BY id");
             defer st.finalize();
             while (try st.step()) {
                 const trip_col = st.columnText(5);
+                const acct_col = st.columnInt(6);
                 const p = Post{
                     .id = @intCast(st.columnInt(0)),
                     .board = try self.gpa.dupe(u8, st.columnText(1)),
@@ -401,6 +563,7 @@ pub const BoardModel = struct {
                     .text = try self.gpa.dupe(u8, st.columnText(3)),
                     .ts = st.columnInt(4),
                     .trip = if (trip_col.len == 0) null else try self.gpa.dupe(u8, trip_col),
+                    .acct = if (acct_col == 0) null else @as(?u64, @intCast(acct_col)),
                 };
                 errdefer {
                     self.gpa.free(p.board);
@@ -414,11 +577,12 @@ pub const BoardModel = struct {
             }
         }
         {
-            var st = try self.db.prepare(self.gpa, "SELECT id, post, parent, user, text, ts, trip FROM comments ORDER BY id");
+            var st = try self.db.prepare(self.gpa, "SELECT id, post, parent, user, text, ts, trip, acct FROM comments ORDER BY id");
             defer st.finalize();
             while (try st.step()) {
                 const parent_col = st.columnInt(2);
                 const trip_col = st.columnText(6);
+                const acct_col = st.columnInt(7);
                 const c = Comment{
                     .id = @intCast(st.columnInt(0)),
                     .post = @intCast(st.columnInt(1)),
@@ -427,6 +591,7 @@ pub const BoardModel = struct {
                     .text = try self.gpa.dupe(u8, st.columnText(4)),
                     .ts = st.columnInt(5),
                     .trip = if (trip_col.len == 0) null else try self.gpa.dupe(u8, trip_col),
+                    .acct = if (acct_col == 0) null else @as(?u64, @intCast(acct_col)),
                 };
                 errdefer {
                     self.gpa.free(c.user);
@@ -438,22 +603,38 @@ pub const BoardModel = struct {
                 self.next_id = @max(self.next_id, c.id + 1);
             }
         }
-        {
-            var st = try self.db.prepare(self.gpa, "SELECT kind, target, user FROM likes");
-            defer st.finalize();
-            while (try st.step()) {
-                const kind_ch = st.columnText(0)[0];
-                const target: u64 = @intCast(st.columnInt(1));
-                const token = st.columnText(2);
-                const gop = self.like_counts.getOrPut(self.gpa, target) catch @panic("OOM");
-                if (!gop.found_existing) gop.value_ptr.* = 0;
-                gop.value_ptr.* += 1;
-                var kbuf: [320]u8 = undefined;
-                const key = std.fmt.bufPrint(&kbuf, "{c}{d}:{s}", .{ kind_ch, target, token }) catch @panic("key too long");
-                const owned = self.gpa.dupe(u8, key) catch @panic("OOM");
-                self.liked_by.put(self.gpa, owned, {}) catch @panic("OOM");
-            }
+        try self.loadLikes();
+    }
+
+    /// Populate `like_counts`/`liked_by` from the likes table. Called
+    /// from `load` and after deletes (which remove like rows
+    /// write-through, then rebuild the in-memory mirrors here).
+    /// `liked_by` keys are owned dupes — `clearLikes` frees them first.
+    fn loadLikes(self: *BoardModel) !void {
+        self.clearLikes();
+        var st = try self.db.prepare(self.gpa, "SELECT kind, target, user FROM likes");
+        defer st.finalize();
+        while (try st.step()) {
+            const kind_ch = st.columnText(0)[0];
+            const target: u64 = @intCast(st.columnInt(1));
+            const token = st.columnText(2);
+            const gop = self.like_counts.getOrPut(self.gpa, target) catch @panic("OOM");
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* += 1;
+            var kbuf: [320]u8 = undefined;
+            const key = std.fmt.bufPrint(&kbuf, "{c}{d}:{s}", .{ kind_ch, target, token }) catch @panic("key too long");
+            const owned = self.gpa.dupe(u8, key) catch @panic("OOM");
+            self.liked_by.put(self.gpa, owned, {}) catch @panic("OOM");
         }
+    }
+
+    fn clearLikes(self: *BoardModel) void {
+        var lit = self.liked_by.iterator();
+        while (lit.next()) |e| self.gpa.free(e.key_ptr.*);
+        self.liked_by.deinit(self.gpa);
+        self.liked_by = .empty;
+        self.like_counts.deinit(self.gpa);
+        self.like_counts = .empty;
     }
 
     /// Display name for a token, or null when the user row doesn't exist.
@@ -488,6 +669,98 @@ pub const BoardModel = struct {
             error.OutOfMemory => error.OutOfMemory,
             else => error.Sqlite,
         };
+    }
+
+    // ── accounts ──────────────────────────────────────────────
+
+    /// Display name for an account id ("alice" — the view adds "@").
+    pub fn accountName(self: *const BoardModel, id: u64) ?[]const u8 {
+        if (id == 0 or id > self.accounts.items.len) return null;
+        return self.accounts.items[id - 1].name;
+    }
+
+    /// Account id holding `auth_token` (the zfxa cookie value), or null.
+    pub fn accountByAuthToken(self: *const BoardModel, token: []const u8) ?u64 {
+        if (token.len == 0) return null;
+        const idx = self.account_by_token.get(token) orelse return null;
+        return idx + 1;
+    }
+
+    /// Register `name`/`password` and attach `auth_token` in one step
+    /// (register == auto-login). `salt` is caller-minted randomness —
+    /// the model stays io-free like `ensureUser`. Returns the new id.
+    /// Auth writes do NOT bump `global_seq`: nothing any other session
+    /// renders depends on the accounts table.
+    pub fn registerAccount(self: *BoardModel, name_in: []const u8, password: []const u8, salt: *const [password_salt_len]u8, auth_token: []const u8) ModelError!u64 {
+        if (!validAccountName(name_in)) return error.InvalidName;
+        if (!validPassword(password)) return error.InvalidPassword;
+        if (self.account_by_name.contains(name_in)) return error.NameTaken;
+        const pass_hash = hashPassword(self.gpa, password, salt) catch return error.OutOfMemory;
+        errdefer self.gpa.free(pass_hash);
+        const created = nowSeconds();
+        var st = self.db.prepare(self.gpa, "INSERT INTO accounts (name, pass_hash, auth_token, created) VALUES (?, ?, ?, ?)") catch |e| return dbErr(e);
+        defer st.finalize();
+        st.bindText(1, name_in) catch |e| return dbErr(e);
+        st.bindText(2, pass_hash) catch |e| return dbErr(e);
+        st.bindText(3, auth_token) catch |e| return dbErr(e);
+        st.bindInt(4, created) catch |e| return dbErr(e);
+        _ = st.step() catch |e| return dbErr(e);
+
+        const idx = self.accounts.items.len;
+        const acct = Account{
+            .name = self.gpa.dupe(u8, name_in) catch @panic("OOM"),
+            .pass_hash = pass_hash,
+            .auth_token = self.gpa.dupe(u8, auth_token) catch @panic("OOM"),
+            .created = created,
+        };
+        try self.accounts.append(self.gpa, acct);
+        self.account_by_name.put(self.gpa, acct.name, idx) catch @panic("OOM");
+        self.account_by_token.put(self.gpa, acct.auth_token.?, idx) catch @panic("OOM");
+        return idx + 1;
+    }
+
+    /// Verify `name`/`password`; returns the account id. Unknown name
+    /// and wrong password share `error.BadLogin` — no user enumeration.
+    pub fn verifyAccount(self: *const BoardModel, name: []const u8, password: []const u8) ModelError!u64 {
+        const idx = self.account_by_name.get(name) orelse return error.BadLogin;
+        if (!verifyPassword(self.accounts.items[idx].pass_hash, password)) return error.BadLogin;
+        return idx + 1;
+    }
+
+    /// (Re)bind account `id`'s live auth token — login mints a fresh
+    /// zfxa per sign-in; one token per account, so attaching replaces
+    /// any previous one (a second login invalidates the first cookie).
+    pub fn attachAuthToken(self: *BoardModel, id: u64, token: []const u8) ModelError!void {
+        if (id == 0 or id > self.accounts.items.len) return error.NotFound;
+        const acct = &self.accounts.items[id - 1];
+        if (acct.auth_token) |old| {
+            _ = self.account_by_token.fetchRemove(old);
+            self.gpa.free(old);
+        }
+        var st = self.db.prepare(self.gpa, "UPDATE accounts SET auth_token = ? WHERE id = ?") catch |e| return dbErr(e);
+        defer st.finalize();
+        st.bindText(1, token) catch |e| return dbErr(e);
+        st.bindInt(2, @intCast(id)) catch |e| return dbErr(e);
+        _ = st.step() catch |e| return dbErr(e);
+        const owned = self.gpa.dupe(u8, token) catch @panic("OOM");
+        acct.auth_token = owned;
+        self.account_by_token.put(self.gpa, owned, id - 1) catch @panic("OOM");
+    }
+
+    /// Clear account `id`'s auth token (logout) — the zfxa cookie is
+    /// expired client-side AND the stored token dropped, so a replayed
+    /// cookie stops resolving.
+    pub fn detachAuthToken(self: *BoardModel, id: u64) ModelError!void {
+        if (id == 0 or id > self.accounts.items.len) return error.NotFound;
+        const acct = &self.accounts.items[id - 1];
+        const old = acct.auth_token orelse return;
+        _ = self.account_by_token.fetchRemove(old);
+        self.gpa.free(old);
+        acct.auth_token = null;
+        var st = self.db.prepare(self.gpa, "UPDATE accounts SET auth_token = NULL WHERE id = ?") catch |e| return dbErr(e);
+        defer st.finalize();
+        st.bindInt(1, @intCast(id)) catch |e| return dbErr(e);
+        _ = st.step() catch |e| return dbErr(e);
     }
 
     fn findPost(self: *const BoardModel, id: u64) ?usize {
@@ -663,8 +936,9 @@ pub const BoardModel = struct {
     /// Insert a post: validate, write-through INSERT, append, bump seq.
     /// `trip_in` is the raw optional tripcode field — normalized,
     /// HMAC'd (`tripHashHex`) and stored as a hash; the plaintext never
-    /// touches the db.
-    pub fn addPost(self: *BoardModel, board_slug: []const u8, user_token: []const u8, text_in: []const u8, trip_in: ?[]const u8) ModelError!Post {
+    /// touches the db. `acct` is the posting account's id (NULL =
+    /// anonymous) — the row still stores `user_token` for likes.
+    pub fn addPost(self: *BoardModel, board_slug: []const u8, user_token: []const u8, text_in: []const u8, trip_in: ?[]const u8, acct: ?u64) ModelError!Post {
         if (!validText(text_in)) return error.InvalidText;
         if (boardIndex(board_slug) == null) return error.UnknownBoard;
         const tripcode = try normalizeTrip(trip_in);
@@ -672,7 +946,7 @@ pub const BoardModel = struct {
         errdefer if (trip_hash) |h| self.gpa.free(h);
         const id = self.next_id;
         const ts = nowSeconds();
-        var st = self.db.prepare(self.gpa, "INSERT INTO posts (id, board, user, text, ts, trip) VALUES (?, ?, ?, ?, ?, ?)") catch |e| return dbErr(e);
+        var st = self.db.prepare(self.gpa, "INSERT INTO posts (id, board, user, text, ts, trip, acct) VALUES (?, ?, ?, ?, ?, ?, ?)") catch |e| return dbErr(e);
         defer st.finalize();
         st.bindInt(1, @intCast(id)) catch |e| return dbErr(e);
         st.bindText(2, board_slug) catch |e| return dbErr(e);
@@ -680,6 +954,7 @@ pub const BoardModel = struct {
         st.bindText(4, text_in) catch |e| return dbErr(e);
         st.bindInt(5, ts) catch |e| return dbErr(e);
         st.bindText(6, trip_hash) catch |e| return dbErr(e);
+        st.bindInt(7, if (acct) |a| @as(i64, @intCast(a)) else null) catch |e| return dbErr(e);
         _ = st.step() catch |e| return dbErr(e);
 
         const p = Post{
@@ -689,6 +964,7 @@ pub const BoardModel = struct {
             .text = self.gpa.dupe(u8, text_in) catch @panic("OOM"),
             .ts = ts,
             .trip = trip_hash,
+            .acct = acct,
         };
         self.posts.append(self.gpa, p) catch @panic("OOM");
         self.indexPost(self.posts.items.len - 1);
@@ -701,8 +977,9 @@ pub const BoardModel = struct {
 
     /// Insert a comment under `post_id`, optionally replying to `parent_id`
     /// (must be a comment of the same post). Write-through + append.
-    /// `trip_in` is the raw optional tripcode — hashed like addPost's.
-    pub fn addComment(self: *BoardModel, post_id: u64, parent_id: ?u64, user_token: []const u8, text_in: []const u8, trip_in: ?[]const u8) ModelError!Comment {
+    /// `trip_in` is the raw optional tripcode — hashed like addPost's;
+    /// `acct` the posting account's id (NULL = anonymous).
+    pub fn addComment(self: *BoardModel, post_id: u64, parent_id: ?u64, user_token: []const u8, text_in: []const u8, trip_in: ?[]const u8, acct: ?u64) ModelError!Comment {
         if (!validText(text_in)) return error.InvalidText;
         if (self.findPost(post_id) == null) return error.PostNotFound;
         if (parent_id) |pid| {
@@ -714,7 +991,7 @@ pub const BoardModel = struct {
         errdefer if (trip_hash) |h| self.gpa.free(h);
         const id = self.next_id;
         const ts = nowSeconds();
-        var st = self.db.prepare(self.gpa, "INSERT INTO comments (id, post, parent, user, text, ts, trip) VALUES (?, ?, ?, ?, ?, ?, ?)") catch |e| return dbErr(e);
+        var st = self.db.prepare(self.gpa, "INSERT INTO comments (id, post, parent, user, text, ts, trip, acct) VALUES (?, ?, ?, ?, ?, ?, ?, ?)") catch |e| return dbErr(e);
         defer st.finalize();
         st.bindInt(1, @intCast(id)) catch |e| return dbErr(e);
         st.bindInt(2, @intCast(post_id)) catch |e| return dbErr(e);
@@ -723,6 +1000,7 @@ pub const BoardModel = struct {
         st.bindText(5, text_in) catch |e| return dbErr(e);
         st.bindInt(6, ts) catch |e| return dbErr(e);
         st.bindText(7, trip_hash) catch |e| return dbErr(e);
+        st.bindInt(8, if (acct) |a| @as(i64, @intCast(a)) else null) catch |e| return dbErr(e);
         _ = st.step() catch |e| return dbErr(e);
 
         const c = Comment{
@@ -733,6 +1011,7 @@ pub const BoardModel = struct {
             .text = self.gpa.dupe(u8, text_in) catch @panic("OOM"),
             .ts = ts,
             .trip = trip_hash,
+            .acct = acct,
         };
         self.comments.append(self.gpa, c) catch @panic("OOM");
         self.indexComment(self.comments.items.len - 1);
@@ -748,11 +1027,206 @@ pub const BoardModel = struct {
         }
         return c;
     }
+
+    // ── deletes (own-content only, ADR-0001 phase 2) ──────────
+
+    /// Rebuild every derived index after row removal — the indexes
+    /// store `items` positions, so ANY delete invalidates them all.
+    /// Deletes are rare and human-paced; an O(rows) rebuild beats
+    /// surgical index surgery. `scope_seq` is NOT touched: it's
+    /// monotonic mutation history, not derived state.
+    fn rebuildIndexes(self: *BoardModel) !void {
+        // Index containers hold borrowed keys (Post.board) or owned
+        // values (per-key ArrayLists) — free the values, drop the maps.
+        var pbit = self.posts_by_board.iterator();
+        while (pbit.next()) |e| e.value_ptr.deinit(self.gpa);
+        self.posts_by_board.deinit(self.gpa);
+        self.posts_by_board = .empty;
+        var tbit = self.tops_by_post.iterator();
+        while (tbit.next()) |e| e.value_ptr.deinit(self.gpa);
+        self.tops_by_post.deinit(self.gpa);
+        self.tops_by_post = .empty;
+        var cbit = self.children_by_parent.iterator();
+        while (cbit.next()) |e| e.value_ptr.deinit(self.gpa);
+        self.children_by_parent.deinit(self.gpa);
+        self.children_by_parent = .empty;
+        self.post_by_id.deinit(self.gpa);
+        self.post_by_id = .empty;
+        self.comment_by_id.deinit(self.gpa);
+        self.comment_by_id = .empty;
+        self.post_counts.deinit(self.gpa);
+        self.post_counts = .empty;
+
+        for (self.posts.items, 0..) |_, i| self.indexPost(i);
+        for (self.comments.items, 0..) |_, i| self.indexComment(i);
+        try self.loadLikes();
+    }
+
+    /// Remove `posts.items[i]`'s owned strings, then the slot itself.
+    fn removePostAt(self: *BoardModel, i: usize) void {
+        const p = &self.posts.items[i];
+        self.gpa.free(p.board);
+        self.gpa.free(p.user);
+        self.gpa.free(p.text);
+        if (p.trip) |t| self.gpa.free(t);
+        _ = self.posts.orderedRemove(i);
+    }
+
+    fn removeCommentAt(self: *BoardModel, i: usize) void {
+        const c = &self.comments.items[i];
+        self.gpa.free(c.user);
+        self.gpa.free(c.text);
+        if (c.trip) |t| self.gpa.free(t);
+        _ = self.comments.orderedRemove(i);
+    }
+
+    /// Delete a post and EVERYTHING under it — all its comments
+    /// (top-level and replies alike) plus every like on the post and
+    /// those comments. Gate: the row's `acct` must equal the caller's
+    /// account — anonymous rows (`acct == null`) are never deletable,
+    /// and a null `acct` caller matches nothing. Missing/foreign rows
+    /// all report `error.NotFound` (no existence leak). Write-through
+    /// DELETEs + `global_seq`/scope bumps mirror addPost.
+    pub fn deletePost(self: *BoardModel, id: u64, acct: ?u64) ModelError!void {
+        const pi = self.findPost(id) orelse return error.NotFound;
+        const caller = acct orelse return error.NotFound;
+        const p = &self.posts.items[pi];
+        const row_acct = p.acct orelse return error.NotFound;
+        if (row_acct != caller) return error.NotFound;
+        const bi = boardIndex(p.board);
+
+        // Likes first: the comment-id subquery must run before the
+        // comments rows are gone.
+        var st = self.db.prepare(self.gpa, "DELETE FROM likes WHERE (kind = 'p' AND target = ?) OR (kind = 'c' AND target IN (SELECT id FROM comments WHERE post = ?))") catch |e| return dbErr(e);
+        defer st.finalize();
+        st.bindInt(1, @intCast(id)) catch |e| return dbErr(e);
+        st.bindInt(2, @intCast(id)) catch |e| return dbErr(e);
+        _ = st.step() catch |e| return dbErr(e);
+        var stc = self.db.prepare(self.gpa, "DELETE FROM comments WHERE post = ?") catch |e| return dbErr(e);
+        defer stc.finalize();
+        stc.bindInt(1, @intCast(id)) catch |e| return dbErr(e);
+        _ = stc.step() catch |e| return dbErr(e);
+        var stp = self.db.prepare(self.gpa, "DELETE FROM posts WHERE id = ?") catch |e| return dbErr(e);
+        defer stp.finalize();
+        stp.bindInt(1, @intCast(id)) catch |e| return dbErr(e);
+        _ = stp.step() catch |e| return dbErr(e);
+
+        // In-memory: drop every comment of the post (backwards so
+        // orderedRemove indices stay valid), then the post itself.
+        var i = self.comments.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.comments.items[i].post == id) self.removeCommentAt(i);
+        }
+        self.removePostAt(pi);
+        try self.rebuildIndexes();
+
+        self.bump();
+        if (bi) |b| self.scopeBump(scopeBoard(b));
+        self.scopeBump(SCOPE_HOME);
+        self.scopeBump(scopePost(id)); // thread/permalink groups → not-found view
+    }
+
+    /// Delete a comment plus its whole descendant reply subtree and
+    /// the likes on every removed comment. Same acct gate as
+    /// deletePost; scope bumps mirror addComment (post scope + board +
+    /// home when still in the latest window).
+    pub fn deleteComment(self: *BoardModel, id: u64, acct: ?u64) ModelError!void {
+        const ci = self.findComment(id) orelse return error.NotFound;
+        const caller = acct orelse return error.NotFound;
+        const c = &self.comments.items[ci];
+        const row_acct = c.acct orelse return error.NotFound;
+        if (row_acct != caller) return error.NotFound;
+        const post_id = c.post;
+        const pi = self.findPost(post_id);
+        const bi = if (pi) |post_i| boardIndex(self.posts.items[post_i].board) else null;
+
+        // Doomed set: the comment + every descendant via parent links.
+        var doomed: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        var stack: std.ArrayListUnmanaged(u64) = .empty;
+        stack.append(self.gpa, id) catch @panic("OOM");
+        while (stack.pop()) |cid| {
+            if (doomed.contains(cid)) continue;
+            doomed.put(self.gpa, cid, {}) catch @panic("OOM");
+            for (self.comments.items) |ch| {
+                if (ch.parent != null and ch.parent.? == cid) {
+                    stack.append(self.gpa, ch.id) catch @panic("OOM");
+                }
+            }
+        }
+        defer {
+            doomed.deinit(self.gpa);
+            stack.deinit(self.gpa);
+        }
+
+        // Likes on every doomed comment, then the comment rows.
+        var st = self.db.prepare(self.gpa, "DELETE FROM likes WHERE kind = 'c' AND target = ?") catch |e| return dbErr(e);
+        defer st.finalize();
+        var stc = self.db.prepare(self.gpa, "DELETE FROM comments WHERE id = ?") catch |e| return dbErr(e);
+        defer stc.finalize();
+        var dit = doomed.keyIterator();
+        while (dit.next()) |dk| {
+            const did = dk.*;
+            st.reset();
+            st.bindInt(1, @intCast(did)) catch |e| return dbErr(e);
+            _ = st.step() catch |e| return dbErr(e);
+            stc.reset();
+            stc.bindInt(1, @intCast(did)) catch |e| return dbErr(e);
+            _ = stc.step() catch |e| return dbErr(e);
+        }
+
+        var i = self.comments.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (doomed.contains(self.comments.items[i].id)) self.removeCommentAt(i);
+        }
+        try self.rebuildIndexes();
+
+        self.bump();
+        self.scopeBump(scopePost(post_id));
+        if (pi) |post_i| {
+            if (bi) |b| self.scopeBump(scopeBoard(b));
+            if (post_i + latest_home_count >= self.posts.items.len) self.scopeBump(SCOPE_HOME);
+        }
+    }
 };
 
 // ─────────────────────────────────────────────
 // tests
 // ─────────────────────────────────────────────
+
+/// Scratch file-db paths, unique per test PROCESS: the same test
+/// bodies run in both the zforest and zboard test binaries, which
+/// `zig build test` executes concurrently — a fixed /tmp name would
+/// race (one binary's cleanup deleting the other's live db).
+const TmpDb = struct {
+    path: []u8,
+    wal: []u8,
+    shm: []u8,
+
+    fn deinit(self: TmpDb, a: std.mem.Allocator) void {
+        a.free(self.path);
+        a.free(self.wal);
+        a.free(self.shm);
+    }
+};
+
+fn tmpDbPaths(a: std.mem.Allocator, comptime tag: []const u8) !TmpDb {
+    const base = try std.fmt.allocPrint(a, "/tmp/zboard-test-{s}-{d}", .{ tag, std.c.getpid() });
+    errdefer a.free(base);
+    const wal = try std.fmt.allocPrint(a, "{s}-wal", .{base});
+    errdefer a.free(wal);
+    const shm = try std.fmt.allocPrint(a, "{s}-shm", .{base});
+    errdefer a.free(shm);
+    return .{ .path = base, .wal = wal, .shm = shm };
+}
+
+/// Delete the db + WAL sidecars before and after a file-db test.
+fn cleanTmpDb(io: std.Io, t: TmpDb) void {
+    std.Io.Dir.deleteFileAbsolute(io, t.path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, t.wal) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, t.shm) catch {};
+}
 
 test "board model: add/load, ordering, ids, validation" {
     const alloc = std.testing.allocator;
@@ -765,15 +1239,15 @@ test "board model: add/load, ordering, ids, validation" {
     try std.testing.expectEqualStrings("Anon#2", try m.ensureUser(tok2));
     try std.testing.expectEqualStrings("Anon#1", try m.ensureUser(tok1));
 
-    const p1 = try m.addPost("b", tok1, "first post", null);
-    const p2 = try m.addPost("tech", tok2, "second post", null);
+    const p1 = try m.addPost("b", tok1, "first post", null, null);
+    const p2 = try m.addPost("tech", tok2, "second post", null, null);
     try std.testing.expectEqual(@as(u64, 1), p1.id);
     try std.testing.expectEqual(@as(u64, 2), p2.id);
     try std.testing.expectEqual(@as(usize, 2), m.posts.items.len);
 
-    const c1 = try m.addComment(p1.id, null, tok2, "first comment", null);
-    const c2 = try m.addComment(p1.id, c1.id, tok1, "nested reply", null);
-    const c3 = try m.addComment(p2.id, null, tok1, "on post 2", null);
+    const c1 = try m.addComment(p1.id, null, tok2, "first comment", null, null);
+    const c2 = try m.addComment(p1.id, c1.id, tok1, "nested reply", null, null);
+    const c3 = try m.addComment(p2.id, null, tok1, "on post 2", null, null);
     try std.testing.expectEqual(@as(u64, 3), c1.id);
     try std.testing.expectEqual(@as(?u64, c1.id), c2.parent);
     // Shared id space across posts+comments: 1,2 posts → 3,4,5 comments.
@@ -801,11 +1275,11 @@ test "board model: add/load, ordering, ids, validation" {
     try std.testing.expect(m.comment(999) == null);
 
     // Validation.
-    try std.testing.expectError(error.InvalidText, m.addPost("b", tok1, "", null));
-    try std.testing.expectError(error.InvalidText, m.addComment(p1.id, null, tok1, "", null));
-    try std.testing.expectError(error.UnknownBoard, m.addPost("nope", tok1, "x", null));
-    try std.testing.expectError(error.PostNotFound, m.addComment(999, null, tok1, "x", null));
-    try std.testing.expectError(error.ParentNotFound, m.addComment(p2.id, c1.id, tok1, "wrong post", null));
+    try std.testing.expectError(error.InvalidText, m.addPost("b", tok1, "", null, null));
+    try std.testing.expectError(error.InvalidText, m.addComment(p1.id, null, tok1, "", null, null));
+    try std.testing.expectError(error.UnknownBoard, m.addPost("nope", tok1, "x", null, null));
+    try std.testing.expectError(error.PostNotFound, m.addComment(999, null, tok1, "x", null, null));
+    try std.testing.expectError(error.ParentNotFound, m.addComment(p2.id, c1.id, tok1, "wrong post", null, null));
 
     const seq = m.global_seq.load(.seq_cst);
     try std.testing.expect(seq >= 5); // 2 posts + 3 comments
@@ -817,14 +1291,14 @@ test "board indexes reproduce the old scan semantics and track addComment" {
     defer m.deinit();
 
     _ = try m.ensureUser("tok-idx");
-    const p1 = try m.addPost("b", "tok-idx", "alpha", null);
-    const p2 = try m.addPost("tech", "tok-idx", "beta", null);
-    const p3 = try m.addPost("b", "tok-idx", "gamma", null);
-    const c1 = try m.addComment(p1.id, null, "tok-idx", "t1", null);
-    const c2 = try m.addComment(p1.id, c1.id, "tok-idx", "r1", null);
-    const c3 = try m.addComment(p2.id, null, "tok-idx", "other post", null);
-    const c4 = try m.addComment(p1.id, null, "tok-idx", "t2", null);
-    const c5 = try m.addComment(p1.id, c2.id, "tok-idx", "r2", null);
+    const p1 = try m.addPost("b", "tok-idx", "alpha", null, null);
+    const p2 = try m.addPost("tech", "tok-idx", "beta", null, null);
+    const p3 = try m.addPost("b", "tok-idx", "gamma", null, null);
+    const c1 = try m.addComment(p1.id, null, "tok-idx", "t1", null, null);
+    const c2 = try m.addComment(p1.id, c1.id, "tok-idx", "r1", null, null);
+    const c3 = try m.addComment(p2.id, null, "tok-idx", "other post", null, null);
+    const c4 = try m.addComment(p1.id, null, "tok-idx", "t2", null, null);
+    const c5 = try m.addComment(p1.id, c2.id, "tok-idx", "r2", null, null);
     _ = c3;
     _ = c5;
 
@@ -886,8 +1360,8 @@ test "board indexes reproduce the old scan semantics and track addComment" {
     }
 
     // addComment updates the indexes immediately, preserving order.
-    const c6 = try m.addComment(p1.id, c4.id, "tok-idx", "late reply", null);
-    const c7 = try m.addComment(p1.id, c1.id, "tok-idx", "second reply", null);
+    const c6 = try m.addComment(p1.id, c4.id, "tok-idx", "late reply", null, null);
+    const c7 = try m.addComment(p1.id, c1.id, "tok-idx", "second reply", null, null);
     const kids1 = try m.childIdx(alloc, c1.id);
     defer alloc.free(kids1);
     try std.testing.expectEqual(@as(usize, 2), kids1.len);
@@ -922,30 +1396,27 @@ test "board model: ensureUser bumps global_seq only on real mutation" {
 test "board model persists and reloads from a file db" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
-    const path = "/tmp/zboard-test-rt.db";
-    std.Io.Dir.deleteFileAbsolute(io, path) catch {};
-    defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
-    std.Io.Dir.deleteFileAbsolute(io, path ++ "-wal") catch {};
-    defer std.Io.Dir.deleteFileAbsolute(io, path ++ "-wal") catch {};
-    std.Io.Dir.deleteFileAbsolute(io, path ++ "-shm") catch {};
-    defer std.Io.Dir.deleteFileAbsolute(io, path ++ "-shm") catch {};
+    const t = try tmpDbPaths(alloc, "rt");
+    defer t.deinit(alloc);
+    cleanTmpDb(io, t);
+    defer cleanTmpDb(io, t);
 
     var trip_saved: []u8 = &.{};
     var c2_trip: []u8 = &.{};
     defer if (trip_saved.len != 0) alloc.free(trip_saved);
     defer if (c2_trip.len != 0) alloc.free(c2_trip);
     {
-        var m = try BoardModel.init(alloc, path);
+        var m = try BoardModel.init(alloc, t.path);
         _ = try m.ensureUser("tok-persist");
-        const p = try m.addPost("tech", "tok-persist", "survives restart", "persist-trip");
+        const p = try m.addPost("tech", "tok-persist", "survives restart", "persist-trip", null);
         trip_saved = try alloc.dupe(u8, p.trip.?);
-        const c = try m.addComment(1, null, "tok-persist", "persisted comment", null);
-        const c2 = try m.addComment(1, c.id, "tok-persist", "persisted reply", "reply-trip");
+        const c = try m.addComment(1, null, "tok-persist", "persisted comment", null, null);
+        const c2 = try m.addComment(1, c.id, "tok-persist", "persisted reply", "reply-trip", null);
         c2_trip = try alloc.dupe(u8, c2.trip.?);
         m.deinit();
     }
     {
-        var m = try BoardModel.init(alloc, path);
+        var m = try BoardModel.init(alloc, t.path);
         defer m.deinit();
         try std.testing.expectEqual(@as(usize, 1), m.posts.items.len);
         try std.testing.expectEqualStrings("survives restart", m.posts.items[0].text);
@@ -961,7 +1432,7 @@ test "board model persists and reloads from a file db" {
         defer alloc.free(kids);
         try std.testing.expectEqual(@as(usize, 1), kids.len);
         // next_id continues the shared sequence.
-        const p = try m.addPost("b", "tok-persist", "second life", null);
+        const p = try m.addPost("b", "tok-persist", "second life", null, null);
         try std.testing.expect(p.id > 1);
     }
 }
@@ -972,8 +1443,8 @@ test "board model: likes toggle once per account, counts, kind isolation" {
     defer m.deinit();
     _ = try m.ensureUser("tok-a");
     _ = try m.ensureUser("tok-b");
-    const p = try m.addPost("tech", "tok-a", "liked post", null);
-    const c = try m.addComment(p.id, null, "tok-a", "liked comment", null);
+    const p = try m.addPost("tech", "tok-a", "liked post", null, null);
+    const c = try m.addComment(p.id, null, "tok-a", "liked comment", null, null);
 
     // First toggle inserts, second removes — the same token can never
     // hold two votes on one target.
@@ -1002,27 +1473,24 @@ test "board model: likes toggle once per account, counts, kind isolation" {
 test "board model: likes survive reload from a file db" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
-    const path = "/tmp/zboard-test-likes.db";
-    std.Io.Dir.deleteFileAbsolute(io, path) catch {};
-    defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
-    std.Io.Dir.deleteFileAbsolute(io, path ++ "-wal") catch {};
-    defer std.Io.Dir.deleteFileAbsolute(io, path ++ "-wal") catch {};
-    std.Io.Dir.deleteFileAbsolute(io, path ++ "-shm") catch {};
-    defer std.Io.Dir.deleteFileAbsolute(io, path ++ "-shm") catch {};
+    const t = try tmpDbPaths(alloc, "likes");
+    defer t.deinit(alloc);
+    cleanTmpDb(io, t);
+    defer cleanTmpDb(io, t);
 
     {
-        var m = try BoardModel.init(alloc, path);
+        var m = try BoardModel.init(alloc, t.path);
         _ = try m.ensureUser("tok-like");
-        const p = try m.addPost("tech", "tok-like", "persisted likes", null);
+        const p = try m.addPost("tech", "tok-like", "persisted likes", null, null);
         _ = try m.toggleLike(.post, p.id, "tok-like");
         _ = try m.toggleLike(.post, p.id, "tok-like"); // toggles back off
         _ = try m.toggleLike(.post, p.id, "tok-like"); // and on again
-        const c = try m.addComment(p.id, null, "tok-like", "liked reply", null);
+        const c = try m.addComment(p.id, null, "tok-like", "liked reply", null, null);
         _ = try m.toggleLike(.comment, c.id, "tok-like");
         m.deinit();
     }
     {
-        var m = try BoardModel.init(alloc, path);
+        var m = try BoardModel.init(alloc, t.path);
         defer m.deinit();
         try std.testing.expectEqual(@as(u32, 1), m.likeCount(1));
         // Reloaded liked_by set lets the same account toggle OFF.
@@ -1039,7 +1507,7 @@ test "board model: tripcodes hash per-user and derive stable !codes" {
     _ = try m.ensureUser("tok-t1");
     _ = try m.ensureUser("tok-t2");
 
-    const p = try m.addPost("b", "tok-t1", "tripped post", "swordfish");
+    const p = try m.addPost("b", "tok-t1", "tripped post", "swordfish", null);
     const trip = p.trip orelse return error.TestUnexpectedResult;
     // The column holds the HMAC hex (64 chars) — never the plaintext.
     try std.testing.expectEqual(@as(usize, 64), trip.len);
@@ -1051,56 +1519,53 @@ test "board model: tripcodes hash per-user and derive stable !codes" {
 
     // Same token + tripcode (modulo surrounding whitespace) → the same
     // stored hash and the same derived code.
-    const p2 = try m.addPost("b", "tok-t1", "again", "  swordfish  ");
+    const p2 = try m.addPost("b", "tok-t1", "again", "  swordfish  ", null);
     try std.testing.expectEqualStrings(trip, p2.trip.?);
     const code2 = tripCode(alloc, p2.trip).?;
     defer alloc.free(code2);
     try std.testing.expectEqualStrings(code, code2);
 
     // A different tripcode hashes differently.
-    const p3 = try m.addPost("b", "tok-t1", "other", "different");
+    const p3 = try m.addPost("b", "tok-t1", "other", "different", null);
     try std.testing.expect(!std.mem.eql(u8, trip, p3.trip.?));
 
     // The hash binds the user token: same tripcode, different poster →
     // different stored hash and different public code.
-    const p4 = try m.addPost("b", "tok-t2", "other user", "swordfish");
+    const p4 = try m.addPost("b", "tok-t2", "other user", "swordfish", null);
     try std.testing.expect(!std.mem.eql(u8, trip, p4.trip.?));
     const code4 = tripCode(alloc, p4.trip).?;
     defer alloc.free(code4);
     try std.testing.expect(!std.mem.eql(u8, code, code4));
 
     // Comments carry their own independent trip.
-    const c = try m.addComment(p.id, null, "tok-t2", "tripped comment", "reply-trip");
+    const c = try m.addComment(p.id, null, "tok-t2", "tripped comment", "reply-trip", null);
     try std.testing.expect(c.trip != null);
     try std.testing.expect(!std.mem.eql(u8, c.trip.?, trip));
 
     // Empty/whitespace/absent trip → no trip stored.
-    const p5 = try m.addPost("b", "tok-t1", "plain", "   ");
+    const p5 = try m.addPost("b", "tok-t1", "plain", "   ", null);
     try std.testing.expect(p5.trip == null);
-    const p6 = try m.addPost("b", "tok-t1", "plain2", null);
+    const p6 = try m.addPost("b", "tok-t1", "plain2", null, null);
     try std.testing.expect(p6.trip == null);
 
     // Over-long tripcodes are rejected outright.
     var long_buf: [max_trip_len + 1]u8 = @splat('x');
-    try std.testing.expectError(error.InvalidTrip, m.addPost("b", "tok-t1", "x", &long_buf));
-    try std.testing.expectError(error.InvalidTrip, m.addComment(p.id, null, "tok-t1", "x", &long_buf));
+    try std.testing.expectError(error.InvalidTrip, m.addPost("b", "tok-t1", "x", &long_buf, null));
+    try std.testing.expectError(error.InvalidTrip, m.addComment(p.id, null, "tok-t1", "x", &long_buf, null));
 }
 
 test "board model: migrates a pre-trip schema; legacy rows load with null trip" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
-    const path = "/tmp/zboard-test-migrate.db";
-    std.Io.Dir.deleteFileAbsolute(io, path) catch {};
-    defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
-    std.Io.Dir.deleteFileAbsolute(io, path ++ "-wal") catch {};
-    defer std.Io.Dir.deleteFileAbsolute(io, path ++ "-wal") catch {};
-    std.Io.Dir.deleteFileAbsolute(io, path ++ "-shm") catch {};
-    defer std.Io.Dir.deleteFileAbsolute(io, path ++ "-shm") catch {};
+    const t = try tmpDbPaths(alloc, "migrate");
+    defer t.deinit(alloc);
+    cleanTmpDb(io, t);
+    defer cleanTmpDb(io, t);
 
     {
         // Hand-build a database with the PRE-trip schema (what an old
         // zboard binary created) plus one legacy row.
-        var d = try db.Db.open(alloc, path);
+        var d = try db.Db.open(alloc, t.path);
         defer d.close();
         try d.exec(alloc,
             \\CREATE TABLE users (
@@ -1141,26 +1606,234 @@ test "board model: migrates a pre-trip schema; legacy rows load with null trip" 
         _ = try cins.step();
     }
     {
-        var m = try BoardModel.init(alloc, path);
+        var m = try BoardModel.init(alloc, t.path);
         defer m.deinit();
         // init's migrate() added the trip column; legacy rows load
         // with trip == null (NULL column → empty columnText).
         try std.testing.expectEqual(@as(usize, 1), m.posts.items.len);
         try std.testing.expectEqualStrings("legacy post", m.posts.items[0].text);
         try std.testing.expect(m.posts.items[0].trip == null);
+        try std.testing.expect(m.posts.items[0].acct == null);
         try std.testing.expectEqual(@as(usize, 1), m.comments.items.len);
         try std.testing.expect(m.comments.items[0].trip == null);
+        try std.testing.expect(m.comments.items[0].acct == null);
         // New writes on the migrated db carry trips.
-        const p = try m.addPost("b", "old-tok", "new post", "tc");
+        const p = try m.addPost("b", "old-tok", "new post", "tc", null);
         try std.testing.expect(p.trip != null);
         try std.testing.expect(m.posts.items[0].trip == null);
         // defer deinits at block end → the column survives a reopen.
     }
     {
-        var m = try BoardModel.init(alloc, path);
+        var m = try BoardModel.init(alloc, t.path);
         defer m.deinit();
         try std.testing.expectEqual(@as(usize, 2), m.posts.items.len);
         try std.testing.expect(m.posts.items[1].trip != null);
         try std.testing.expect(m.posts.items[0].trip == null);
     }
+}
+
+test "board model: accounts register, verify, and resolve auth tokens" {
+    const alloc = std.testing.allocator;
+    var m = try BoardModel.init(alloc, ":memory:");
+    defer m.deinit();
+    _ = try m.ensureUser("tok-acct");
+
+    var salt: [password_salt_len]u8 = @splat(0x5a);
+    const id = try m.registerAccount("alice", "correct horse", &salt, "tok-a1");
+    try std.testing.expectEqual(@as(u64, 1), id);
+    try std.testing.expectEqualStrings("alice", m.accountName(1).?);
+    try std.testing.expect(m.accountName(2) == null);
+    try std.testing.expectEqual(@as(?u64, 1), m.accountByAuthToken("tok-a1"));
+    try std.testing.expect(m.accountByAuthToken("") == null);
+    try std.testing.expect(m.accountByAuthToken("bogus") == null);
+
+    // Validation + uniqueness: name charset/length, password length,
+    // duplicate names.
+    try std.testing.expectError(error.NameTaken, m.registerAccount("alice", "whatever1", &salt, "tok-a2"));
+    try std.testing.expectError(error.InvalidName, m.registerAccount("bad name!", "whatever1", &salt, "tok-a2"));
+    try std.testing.expectError(error.InvalidName, m.registerAccount("", "whatever1", &salt, "tok-a2"));
+    var long_name_buf: [max_account_name_len + 1]u8 = @splat('n');
+    try std.testing.expectError(error.InvalidName, m.registerAccount(&long_name_buf, "whatever1", &salt, "tok-a2"));
+    try std.testing.expectError(error.InvalidPassword, m.registerAccount("bob", "short", &salt, "tok-a2"));
+    // The failed registrations left no rows behind.
+    try std.testing.expectEqual(@as(usize, 1), m.accounts.items.len);
+
+    const id2 = try m.registerAccount("bob", "whatever1", &salt, "tok-b1");
+    try std.testing.expectEqual(@as(u64, 2), id2);
+
+    // verifyAccount: right password → id; wrong password AND unknown
+    // name share BadLogin (no user enumeration).
+    try std.testing.expectEqual(@as(u64, 1), try m.verifyAccount("alice", "correct horse"));
+    try std.testing.expectEqual(@as(u64, 2), try m.verifyAccount("bob", "whatever1"));
+    try std.testing.expectError(error.BadLogin, m.verifyAccount("alice", "wrong password"));
+    try std.testing.expectError(error.BadLogin, m.verifyAccount("carol", "correct horse"));
+
+    // attachAuthToken replaces the live token — one zfxa per account,
+    // so a second login invalidates the first cookie.
+    try m.attachAuthToken(1, "tok-a9");
+    try std.testing.expect(m.accountByAuthToken("tok-a1") == null);
+    try std.testing.expectEqual(@as(?u64, 1), m.accountByAuthToken("tok-a9"));
+    try std.testing.expectError(error.NotFound, m.attachAuthToken(99, "tok-x"));
+
+    // detachAuthToken clears it — a replayed cookie stops resolving.
+    try m.detachAuthToken(1);
+    try std.testing.expect(m.accountByAuthToken("tok-a9") == null);
+    try std.testing.expect(m.accounts.items[0].auth_token == null);
+    try std.testing.expectError(error.NotFound, m.detachAuthToken(99));
+}
+
+test "board model: accounts and acct ownership persist across reload" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const t = try tmpDbPaths(alloc, "acct");
+    defer t.deinit(alloc);
+    cleanTmpDb(io, t);
+    defer cleanTmpDb(io, t);
+
+    {
+        var m = try BoardModel.init(alloc, t.path);
+        _ = try m.ensureUser("tok-p");
+        var salt: [password_salt_len]u8 = @splat(0x33);
+        const aid = try m.registerAccount("carol", "s3cret-pass", &salt, "tok-c1");
+        const p = try m.addPost("b", "tok-p", "owned post", null, aid);
+        const c = try m.addComment(p.id, null, "tok-p", "owned comment", null, aid);
+        const anon = try m.addPost("b", "tok-p", "anon post", null, null);
+        _ = c;
+        _ = anon;
+        m.deinit();
+    }
+    {
+        var m = try BoardModel.init(alloc, t.path);
+        defer m.deinit();
+        // Account + password hash + live token all round-tripped.
+        try std.testing.expectEqual(@as(usize, 1), m.accounts.items.len);
+        try std.testing.expectEqualStrings("carol", m.accountName(1).?);
+        try std.testing.expectEqual(@as(u64, 1), try m.verifyAccount("carol", "s3cret-pass"));
+        try std.testing.expectError(error.BadLogin, m.verifyAccount("carol", "wrong-pass1"));
+        try std.testing.expectEqual(@as(?u64, 1), m.accountByAuthToken("tok-c1"));
+        // acct columns survived: owned rows carry 1, anonymous NULL.
+        try std.testing.expectEqual(@as(?u64, 1), m.posts.items[0].acct);
+        try std.testing.expectEqual(@as(?u64, 1), m.comments.items[0].acct);
+        try std.testing.expect(m.posts.items[1].acct == null);
+        // next_id continues across posts+comments.
+        const p = try m.addPost("b", "tok-p", "post-restart", null, null);
+        try std.testing.expect(p.id > 3);
+    }
+}
+
+test "board model: deletePost cascades comments and likes; ownership-gated" {
+    const alloc = std.testing.allocator;
+    var m = try BoardModel.init(alloc, ":memory:");
+    defer m.deinit();
+    _ = try m.ensureUser("tok-a");
+    _ = try m.ensureUser("tok-b");
+    var salt: [password_salt_len]u8 = @splat(0x11);
+    const aid = try m.registerAccount("alice", "password1", &salt, "tok-auth");
+    var salt2: [password_salt_len]u8 = @splat(0x22);
+    const bid = try m.registerAccount("bob", "password2", &salt2, "tok-auth2");
+
+    const p_owned = try m.addPost("b", "tok-a", "my post", null, aid);
+    const p_other = try m.addPost("b", "tok-b", "not mine", null, null);
+    const c1 = try m.addComment(p_owned.id, null, "tok-a", "top", null, aid);
+    const c2 = try m.addComment(p_owned.id, c1.id, "tok-b", "reply", null, null);
+    const c3 = try m.addComment(p_other.id, null, "tok-b", "other post", null, null);
+
+    // Likes on the doomed post + both doomed comments (one is a reply
+    // by a different anonymous user — still cascades).
+    _ = try m.toggleLike(.post, p_owned.id, "tok-a");
+    _ = try m.toggleLike(.comment, c1.id, "tok-b");
+    _ = try m.toggleLike(.comment, c2.id, "tok-a");
+
+    // Gates: missing id, anonymous caller, foreign account, anonymous
+    // row — all report NotFound (no existence leak).
+    try std.testing.expectError(error.NotFound, m.deletePost(999, aid));
+    try std.testing.expectError(error.NotFound, m.deletePost(p_owned.id, null));
+    try std.testing.expectError(error.NotFound, m.deletePost(p_owned.id, bid));
+    try std.testing.expectError(error.NotFound, m.deletePost(p_other.id, aid));
+    // Rejected deletes mutated nothing.
+    try std.testing.expectEqual(@as(usize, 2), m.posts.items.len);
+    try std.testing.expectEqual(@as(usize, 3), m.comments.items.len);
+
+    const seq_before = m.global_seq.load(.seq_cst);
+    try m.deletePost(p_owned.id, aid);
+    try std.testing.expect(m.post(p_owned.id) == null);
+    try std.testing.expect(m.comment(c1.id) == null);
+    try std.testing.expect(m.comment(c2.id) == null);
+    try std.testing.expect(m.comment(c3.id) != null); // other post untouched
+    try std.testing.expectEqual(@as(u32, 0), m.likeCount(p_owned.id));
+    try std.testing.expectEqual(@as(u32, 0), m.likeCount(c1.id));
+    try std.testing.expectEqual(@as(u32, 0), m.likeCount(c2.id));
+    try std.testing.expect(m.global_seq.load(.seq_cst) > seq_before);
+    try std.testing.expectEqual(@as(usize, 1), m.posts.items.len);
+    try std.testing.expectEqual(@as(usize, 1), m.comments.items.len);
+    try std.testing.expectEqual(@as(usize, 1), m.commentCount(p_other.id));
+
+    // Indexes were rebuilt: board/top lookups still resolve correctly.
+    const bidx = try m.boardPostIdx(alloc, "b");
+    defer alloc.free(bidx);
+    try std.testing.expectEqual(@as(usize, 1), bidx.len);
+    try std.testing.expectEqual(p_other.id, m.posts.items[bidx[0]].id);
+    const tops = try m.topCommentIdx(alloc, p_other.id);
+    defer alloc.free(tops);
+    try std.testing.expectEqual(@as(usize, 1), tops.len);
+    try std.testing.expectEqual(c3.id, m.comments.items[tops[0]].id);
+}
+
+test "board model: deleteComment cascades the reply subtree and likes" {
+    const alloc = std.testing.allocator;
+    var m = try BoardModel.init(alloc, ":memory:");
+    defer m.deinit();
+    _ = try m.ensureUser("tok-a");
+    _ = try m.ensureUser("tok-b");
+    var salt: [password_salt_len]u8 = @splat(0x44);
+    const aid = try m.registerAccount("alice", "password1", &salt, "tok-auth");
+    var salt2: [password_salt_len]u8 = @splat(0x55);
+    const bid = try m.registerAccount("bob", "password2", &salt2, "tok-auth2");
+
+    const p = try m.addPost("b", "tok-a", "post", null, aid);
+    // Tree: c1 (acct) → c2 (anon) → c3 (acct reply to c2); c4 sibling.
+    const c1 = try m.addComment(p.id, null, "tok-a", "root", null, aid);
+    const c2 = try m.addComment(p.id, c1.id, "tok-b", "mid", null, null);
+    const c3 = try m.addComment(p.id, c2.id, "tok-a", "leaf", null, aid);
+    const c4 = try m.addComment(p.id, null, "tok-b", "sibling", null, null);
+
+    // Likes on every comment — all of c1/c2/c3's must go, c4's stays.
+    for ([_]u64{ c1.id, c2.id, c3.id, c4.id }, 0..) |cid, i| {
+        const tok: []const u8 = if (i % 2 == 0) "tok-a" else "tok-b";
+        _ = try m.toggleLike(.comment, cid, tok);
+    }
+    try std.testing.expectEqual(@as(u32, 1), m.likeCount(c1.id));
+    try std.testing.expectEqual(@as(u32, 1), m.likeCount(c4.id));
+
+    // Gates: anonymous caller, foreign account, missing id.
+    try std.testing.expectError(error.NotFound, m.deleteComment(c1.id, null));
+    try std.testing.expectError(error.NotFound, m.deleteComment(c1.id, bid));
+    try std.testing.expectError(error.NotFound, m.deleteComment(999, aid));
+    // An anonymous row is never deletable even by its "owner".
+    try std.testing.expectError(error.NotFound, m.deleteComment(c2.id, aid));
+    // And bob can't delete alice's leaf either.
+    try std.testing.expectError(error.NotFound, m.deleteComment(c3.id, bid));
+
+    try m.deleteComment(c1.id, aid);
+    // The whole subtree went; the sibling and the post survived.
+    try std.testing.expect(m.comment(c1.id) == null);
+    try std.testing.expect(m.comment(c2.id) == null);
+    try std.testing.expect(m.comment(c3.id) == null);
+    try std.testing.expect(m.comment(c4.id) != null);
+    try std.testing.expect(m.post(p.id) != null);
+    for ([_]u64{ c1.id, c2.id, c3.id }) |cid| {
+        try std.testing.expectEqual(@as(u32, 0), m.likeCount(cid));
+    }
+    try std.testing.expectEqual(@as(u32, 1), m.likeCount(c4.id));
+    try std.testing.expectEqual(@as(usize, 1), m.comments.items.len);
+    try std.testing.expectEqual(@as(usize, 1), m.commentCount(p.id));
+
+    // Indexes rebuilt: c4 is now the only top-level comment.
+    const tops = try m.topCommentIdx(alloc, p.id);
+    defer alloc.free(tops);
+    try std.testing.expectEqual(@as(usize, 1), tops.len);
+    try std.testing.expectEqual(c4.id, m.comments.items[tops[0]].id);
+    const kids4 = try m.childIdx(alloc, c4.id);
+    defer alloc.free(kids4);
+    try std.testing.expectEqual(@as(usize, 0), kids4.len);
 }

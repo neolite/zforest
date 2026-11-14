@@ -9,12 +9,15 @@ const forest = @import("forest");
 const model = @import("model.zig");
 const routes = @import("gen/routes.zig");
 
-/// Request routes: "/" home, "/b/<slug>", "/t/<post>", "/t/<post>/c/<comment>".
+/// Request routes: "/" home, "/b/<slug>", "/t/<post>", "/t/<post>/c/<comment>",
+/// "/login", "/register" (auth pages — static, no model rows).
 pub const Route = union(enum) {
     home,
     board: usize,
     thread: u64,
     comment: u64,
+    login,
+    register,
 };
 
 /// Top-level comment ordering on thread pages — a per-session
@@ -33,9 +36,15 @@ pub const ViewEnv = struct {
     /// Top-level comment order — `.new` newest-first (default),
     /// `.top` by like count. Mirrors the session's `sort`.
     sort: Sort = .new,
-    /// Resolved display name for the `#who` chip ("Anon#N" / "anon") —
-    /// post/comment authors still resolve their own tokens via `nameOf`.
+    /// Resolved AUTH display name for the `#who` chip — "@<account>"
+    /// when logged in, else the anonymous name ("Anon#N" / "anon").
+    /// Post/comment authors still resolve their own tokens/accts via
+    /// `authorName`. This IS a render-group key input (with
+    /// `account_id`): every member of a group renders the same chrome.
     name: []const u8 = "anon",
+    /// Viewer account id (null = anonymous) — gates own-content
+    /// delete buttons and the "posting as" label. Group-key input.
+    account_id: ?u64 = null,
     /// Cursor `buildView` stamps with `global_seq` — written only by view
     /// builds that actually sync tracked Dom state (diff/seed), never by
     /// incidental SSR/snapshot serialization of an already-current group.
@@ -53,9 +62,15 @@ pub fn nameOf(token: []const u8) []const u8 {
     return model.get().userName(token) orelse "anon";
 }
 
-/// Post/comment author label: "Anon#N" plus "!code" when the row
-/// carries a trip hash (4chan-style per-post identity, ADR-0001).
-fn authorName(a: std.mem.Allocator, token: []const u8, trip: ?[]const u8) []const u8 {
+/// Post/comment author label: "@<account>" for account-owned rows
+/// (the trip is ignored — account identity already proves authorship,
+/// ADR-0001 phase 2), else "Anon#N" plus "!code" when the row carries
+/// a trip hash (4chan-style per-post identity, ADR-0001 phase 1).
+fn authorName(a: std.mem.Allocator, token: []const u8, trip: ?[]const u8, acct: ?u64) []const u8 {
+    if (acct) |id| {
+        const n = model.get().accountName(id) orelse return nameOf(token);
+        return std.fmt.allocPrint(a, "@{s}", .{n}) catch @panic("OOM");
+    }
     const base = nameOf(token);
     const code = model.tripCode(a, trip) orelse return base;
     return std.fmt.allocPrint(a, "{s}!{s}", .{ base, code }) catch @panic("OOM");
@@ -89,9 +104,21 @@ fn homeHref(a: std.mem.Allocator) []const u8 {
     return routes.href(a, .{ .index = .{} });
 }
 
+fn loginHref(a: std.mem.Allocator) []const u8 {
+    return routes.href(a, .{ .login = .{} });
+}
+
+fn registerHref(a: std.mem.Allocator) []const u8 {
+    return routes.href(a, .{ .register = .{} });
+}
+
 // ── view components ───────────────────────────────────────────────
 
-/// Sidebar: real links (full navigation) + the poster identity chip.
+/// Sidebar: real links (full navigation) + the auth-aware identity
+/// chip. Anonymous viewers get "login · register" links; logged-in
+/// viewers get "@name" plus a logout action button. `env.name` is the
+/// resolved AUTH display name — identical for every member of a
+/// render group, which is exactly why auth state is a group-key input.
 fn navView(a: std.mem.Allocator, env: ViewEnv) forest.Node {
     var links: std.ArrayListUnmanaged(forest.Node) = .empty;
     const home_on = env.route == .home;
@@ -106,10 +133,19 @@ fn navView(a: std.mem.Allocator, env: ViewEnv) forest.Node {
             .class = if (on) "on" else null,
         }, b.title)) catch @panic("OOM");
     }
-    // Identity chip is bound (`#who` + .text) so the first POST's minted
-    // "Anon#N" name patches in live. `env.name` is the RESOLVED display
-    // name — identical for every member of a render group.
+    // Identity chip is bound (`#who` + .text) so identity changes
+    // patch in live.
     links.append(a, forest.el(a, .span, .{ .id = "who", .class = "who", .text = env.name }, .{})) catch @panic("OOM");
+    if (env.account_id != null) {
+        links.append(a, forest.el(a, .button, .{
+            .class = "mini nav-logout",
+            .on = .{ .click = "logout" },
+        }, "log out")) catch @panic("OOM");
+    } else {
+        links.append(a, forest.el(a, .a, .{ .href = loginHref(a), .class = "auth-link" }, "login")) catch @panic("OOM");
+        links.append(a, forest.text(" · ")) catch @panic("OOM");
+        links.append(a, forest.el(a, .a, .{ .href = registerHref(a), .class = "auth-link" }, "register")) catch @panic("OOM");
+    }
     return forest.el(a, .div, .{ .class = "bnav" }, links.toOwnedSlice(a) catch @panic("OOM"));
 }
 
@@ -124,37 +160,56 @@ fn likeLabel(a: std.mem.Allocator, count: u32) []const u8 {
     return std.fmt.allocPrint(a, "\u{25B2} {d}", .{count}) catch @panic("OOM");
 }
 
-fn postCard(a: std.mem.Allocator, p: *const model.Post, show_link: bool) forest.Node {
+/// Own-content delete button — rendered only when the row's `acct`
+/// matches the viewer's account (env.account_id); anonymous rows and
+/// other accounts' rows never show it. `action` is "delete_post" or
+/// "delete_comment"; the model re-checks ownership server-side.
+fn deleteButton(a: std.mem.Allocator, action: []const u8, id: u64) forest.Node {
+    return forest.el(a, .button, .{
+        .class = "del-btn",
+        .on = .{ .click = action },
+        .arg = u64str(a, id),
+    }, "del");
+}
+
+fn postCard(a: std.mem.Allocator, env: ViewEnv, p: *const model.Post, show_link: bool) forest.Node {
     const mm = model.get();
     const count = mm.commentCount(p.id);
     const lcount = mm.likeCount(p.id);
+    const own = env.account_id != null and p.acct != null and p.acct.? == env.account_id.?;
     var kids: std.ArrayListUnmanaged(forest.Node) = .empty;
     kids.append(a, forest.el(a, .div, .{ .class = "meta" }, .{
         forest.el(a, .span, .{ .class = "pid" }, std.fmt.allocPrint(a, "#{d}", .{p.id}) catch @panic("OOM")),
         forest.text(" · "),
         forest.el(a, .a, .{ .href = boardHref(a, p.board), .class = "bref" }, p.board),
         forest.text(" · "),
-        forest.el(a, .span, .{ .class = "who" }, authorName(a, p.user, p.trip)),
+        forest.el(a, .span, .{ .class = "who" }, authorName(a, p.user, p.trip, p.acct)),
         forest.text(" · "),
         forest.el(a, .span, .{ .class = "ts" }, fmtTs(a, p.ts)),
     })) catch @panic("OOM");
     kids.append(a, forest.el(a, .div, .{ .class = "ptext" }, p.text)) catch @panic("OOM");
-    if (show_link) {
-        kids.append(a, forest.el(a, .div, .{ .class = "actions" }, .{
-            forest.el(a, .a, .{
+    if (show_link or own) {
+        var acts: std.ArrayListUnmanaged(forest.Node) = .empty;
+        if (show_link) {
+            acts.append(a, forest.el(a, .a, .{
                 .lid = "go",
                 .href = threadHref(a, p.id),
                 .text = std.fmt.allocPrint(a, "→ тред ({d})", .{count}) catch @panic("OOM"),
-            }, .{}),
-            forest.text(" "),
-            forest.el(a, .button, .{
+            }, .{})) catch @panic("OOM");
+            acts.append(a, forest.text(" ")) catch @panic("OOM");
+            acts.append(a, forest.el(a, .button, .{
                 .id = std.fmt.allocPrint(a, "like-p{d}", .{p.id}) catch @panic("OOM"),
                 .class = "like-btn",
                 .on = .{ .click = "like" },
                 .arg = likeArg(a, 'p', p.id),
                 .text = likeLabel(a, lcount),
-            }, .{}),
-        })) catch @panic("OOM");
+            }, .{})) catch @panic("OOM");
+        }
+        if (own) {
+            acts.append(a, forest.text(" ")) catch @panic("OOM");
+            acts.append(a, deleteButton(a, "delete_post", p.id)) catch @panic("OOM");
+        }
+        kids.append(a, forest.el(a, .div, .{ .class = "actions" }, acts.toOwnedSlice(a) catch @panic("OOM"))) catch @panic("OOM");
     }
     return forest.el(a, .div, .{
         .id = std.fmt.allocPrint(a, "post-{d}", .{p.id}) catch @panic("OOM"),
@@ -162,34 +217,43 @@ fn postCard(a: std.mem.Allocator, p: *const model.Post, show_link: bool) forest.
     }, kids.toOwnedSlice(a) catch @panic("OOM"));
 }
 
+/// "posting as @name" hint shown inside post/comment forms for
+/// logged-in viewers (env.name is already the "@account" display).
+fn postingAs(a: std.mem.Allocator, env: ViewEnv) ?forest.Node {
+    if (env.account_id == null) return null;
+    const label = std.fmt.allocPrint(a, "posting as {s}", .{env.name}) catch @panic("OOM");
+    return forest.el(a, .div, .{ .class = "posting-as" }, label);
+}
+
 /// New-post form: hidden `board` field + textarea + optional `trip`
-/// input; `post` action.
-fn postForm(a: std.mem.Allocator, slug: []const u8) forest.Node {
+/// input; `post` action. `env` only feeds the posting-as hint.
+fn postForm(a: std.mem.Allocator, env: ViewEnv, slug: []const u8) forest.Node {
+    var kids: std.ArrayListUnmanaged(forest.Node) = .empty;
+    kids.append(a, forest.el(a, .input, .{ .type = "hidden", .name = "board", .value = slug }, .{})) catch @panic("OOM");
+    kids.append(a, forest.el(a, .textarea, .{
+        .name = "text",
+        .placeholder = "Текст поста…",
+        .rows = "4",
+        .maxlength = model.max_text_len,
+        .autofocus = true,
+    }, .{})) catch @panic("OOM");
+    // Tripcode stays AFTER the text field: client.js's draft
+    // stash/clear picks the first editable named input.
+    kids.append(a, forest.el(a, .input, .{
+        .name = "trip",
+        .class = "trip",
+        .type = "text",
+        .placeholder = "tripcode (optional)",
+        .maxlength = model.max_trip_len,
+    }, .{})) catch @panic("OOM");
+    if (postingAs(a, env)) |pa| kids.append(a, pa) catch @panic("OOM");
+    kids.append(a, forest.el(a, .button, .{ .type = "submit" }, "Запостить")) catch @panic("OOM");
     return forest.el(a, .form, .{
         .id = "post-form",
         .class = "post-form",
         .autocomplete = "off",
         .on = .{ .submit = "post" },
-    }, .{
-        forest.el(a, .input, .{ .type = "hidden", .name = "board", .value = slug }, .{}),
-        forest.el(a, .textarea, .{
-            .name = "text",
-            .placeholder = "Текст поста…",
-            .rows = "4",
-            .maxlength = model.max_text_len,
-            .autofocus = true,
-        }, .{}),
-        // Tripcode stays AFTER the text field: client.js's draft
-        // stash/clear picks the first editable named input.
-        forest.el(a, .input, .{
-            .name = "trip",
-            .class = "trip",
-            .type = "text",
-            .placeholder = "tripcode (optional)",
-            .maxlength = model.max_trip_len,
-        }, .{}),
-        forest.el(a, .button, .{ .type = "submit" }, "Запостить"),
-    });
+    }, kids.toOwnedSlice(a) catch @panic("OOM"));
 }
 
 /// Format a u64 id once per use site — shared by `data-arg`, hidden
@@ -200,8 +264,8 @@ fn u64str(a: std.mem.Allocator, v: u64) []const u8 {
 }
 
 /// Comment form: hidden `post` (+ optional `parent`) + text input +
-/// optional `trip` input.
-fn commentFormNodes(a: std.mem.Allocator, post_str: []const u8, parent_str: ?[]const u8, is_inline: bool) []const forest.Node {
+/// optional `trip` input + posting-as hint for account viewers.
+fn commentFormNodes(a: std.mem.Allocator, env: ViewEnv, post_str: []const u8, parent_str: ?[]const u8, is_inline: bool) []const forest.Node {
     var kids: std.ArrayListUnmanaged(forest.Node) = .empty;
     kids.append(a, forest.el(a, .input, .{ .type = "hidden", .name = "post", .value = post_str }, .{})) catch @panic("OOM");
     if (parent_str) |ps| {
@@ -221,6 +285,7 @@ fn commentFormNodes(a: std.mem.Allocator, post_str: []const u8, parent_str: ?[]c
             .placeholder = "tripcode (optional)",
             .maxlength = model.max_trip_len,
         }, .{})) catch @panic("OOM");
+        if (postingAs(a, env)) |pa| kids.append(a, pa) catch @panic("OOM");
         kids.append(a, forest.el(a, .button, .{ .type = "submit", .class = "mini" }, "→")) catch @panic("OOM");
         kids.append(a, forest.el(a, .button, .{
             .type = "button",
@@ -242,28 +307,29 @@ fn commentFormNodes(a: std.mem.Allocator, post_str: []const u8, parent_str: ?[]c
             .placeholder = "tripcode (optional)",
             .maxlength = model.max_trip_len,
         }, .{})) catch @panic("OOM");
+        if (postingAs(a, env)) |pa| kids.append(a, pa) catch @panic("OOM");
         kids.append(a, forest.el(a, .button, .{ .type = "submit" }, "Комментировать")) catch @panic("OOM");
     }
     return kids.toOwnedSlice(a) catch @panic("OOM");
 }
 
-fn commentForm(a: std.mem.Allocator, post_id: u64, parent_id: ?u64) forest.Node {
+fn commentForm(a: std.mem.Allocator, env: ViewEnv, post_id: u64, parent_id: ?u64) forest.Node {
     const post_str = u64str(a, post_id);
     const parent_str = if (parent_id) |pid| u64str(a, pid) else null;
     return forest.el(a, .form, .{
         .class = "comment-form",
         .autocomplete = "off",
         .on = .{ .submit = "comment" },
-    }, commentFormNodes(a, post_str, parent_str, false));
+    }, commentFormNodes(a, env, post_str, parent_str, false));
 }
 
 /// Inline reply form mounted under comment `c` via the `w-rep-N` anchor.
-fn replyForm(a: std.mem.Allocator, post_str: []const u8, parent_str: []const u8) forest.Node {
+fn replyForm(a: std.mem.Allocator, env: ViewEnv, post_str: []const u8, parent_str: []const u8) forest.Node {
     return forest.el(a, .form, .{
         .class = "reply-form",
         .autocomplete = "off",
         .on = .{ .submit = "comment" },
-    }, commentFormNodes(a, post_str, parent_str, true));
+    }, commentFormNodes(a, env, post_str, parent_str, true));
 }
 
 /// One comment node: meta (id, Anon, time, «ответить»), text, the inline
@@ -276,36 +342,41 @@ fn commentNode(a: std.mem.Allocator, env: ViewEnv, c: *const model.Comment, post
     const replying = env.reply_to != null and env.reply_to.? == c.id;
     const num = u64str(a, c.id);
     const hash = std.fmt.allocPrint(a, "#{d}", .{c.id}) catch @panic("OOM");
+    const own = env.account_id != null and c.acct != null and c.acct.? == env.account_id.?;
+
+    var meta_kids: std.ArrayListUnmanaged(forest.Node) = .empty;
+    meta_kids.append(a, forest.el(a, .a, .{
+        .class = "plink",
+        .href = commentHref(a, c.post, c.id),
+    }, hash)) catch @panic("OOM");
+    meta_kids.append(a, forest.text(" · ")) catch @panic("OOM");
+    meta_kids.append(a, forest.el(a, .span, .{ .class = "who" }, authorName(a, c.user, c.trip, c.acct))) catch @panic("OOM");
+    meta_kids.append(a, forest.text(" · ")) catch @panic("OOM");
+    meta_kids.append(a, forest.el(a, .span, .{ .class = "ts" }, fmtTs(a, c.ts))) catch @panic("OOM");
+    meta_kids.append(a, forest.text(" ")) catch @panic("OOM");
+    meta_kids.append(a, forest.el(a, .button, .{
+        .class = "reply-btn",
+        .on = .{ .click = "reply" },
+        .arg = num,
+    }, "ответить")) catch @panic("OOM");
+    meta_kids.append(a, forest.text(" ")) catch @panic("OOM");
+    meta_kids.append(a, forest.el(a, .button, .{
+        .id = std.fmt.allocPrint(a, "like-c{d}", .{c.id}) catch @panic("OOM"),
+        .class = "like-btn",
+        .on = .{ .click = "like" },
+        .arg = likeArg(a, 'c', c.id),
+        .text = likeLabel(a, mm.likeCount(c.id)),
+    }, .{})) catch @panic("OOM");
+    if (own) {
+        meta_kids.append(a, forest.text(" ")) catch @panic("OOM");
+        meta_kids.append(a, deleteButton(a, "delete_comment", c.id)) catch @panic("OOM");
+    }
 
     var kids: std.ArrayListUnmanaged(forest.Node) = .empty;
-    kids.append(a, forest.el(a, .div, .{ .class = "cmeta" }, .{
-        // #id doubles as the permalink to the comment page.
-        forest.el(a, .a, .{
-            .class = "plink",
-            .href = commentHref(a, c.post, c.id),
-        }, hash),
-        forest.text(" · "),
-        forest.el(a, .span, .{ .class = "who" }, authorName(a, c.user, c.trip)),
-        forest.text(" · "),
-        forest.el(a, .span, .{ .class = "ts" }, fmtTs(a, c.ts)),
-        forest.text(" "),
-        forest.el(a, .button, .{
-            .class = "reply-btn",
-            .on = .{ .click = "reply" },
-            .arg = num,
-        }, "ответить"),
-        forest.text(" "),
-        forest.el(a, .button, .{
-            .id = std.fmt.allocPrint(a, "like-c{d}", .{c.id}) catch @panic("OOM"),
-            .class = "like-btn",
-            .on = .{ .click = "like" },
-            .arg = likeArg(a, 'c', c.id),
-            .text = likeLabel(a, mm.likeCount(c.id)),
-        }, .{}),
-    })) catch @panic("OOM");
+    kids.append(a, forest.el(a, .div, .{ .class = "cmeta" }, meta_kids.toOwnedSlice(a) catch @panic("OOM"))) catch @panic("OOM");
     kids.append(a, forest.el(a, .div, .{ .class = "ctext" }, c.text)) catch @panic("OOM");
     // Inline reply form mounts between the text and the children list.
-    kids.append(a, forest.when(a, .{ .id = rep_id }, replying, replyForm(a, post_str, num))) catch @panic("OOM");
+    kids.append(a, forest.when(a, .{ .id = rep_id }, replying, replyForm(a, env, post_str, num))) catch @panic("OOM");
 
     const kid_idx = mm.childIdx(a, c.id) catch @panic("OOM");
     var ck: std.ArrayListUnmanaged(forest.Node) = .empty;
@@ -339,9 +410,70 @@ fn notFoundView(a: std.mem.Allocator, what: []const u8) forest.Node {
     return forest.el(a, .p, .{ .class = "empty", .id = "not-found" }, what);
 }
 
+// ── auth pages (ADR-0001 phase 2) ────────────────────────────────
+// /login + /register are ordinary file-routed pages whose forms post
+// the `login`/`register` actions through the same data-on-submit
+// protocol as post/comment. Errors ride the existing path: a rejected
+// action returns HTTP 400 and client.js's showError displays it.
+
+/// One auth form input: placeholder doubles as the visible label.
+fn authField(a: std.mem.Allocator, name: []const u8, ptype: []const u8, placeholder: []const u8, autocomplete: ?[]const u8) forest.Node {
+    return forest.el(a, .input, .{
+        .type = ptype,
+        .name = name,
+        .class = "auth-input",
+        .placeholder = placeholder,
+        .autocomplete = autocomplete,
+        .required = true,
+    }, .{});
+}
+
+/// Shared auth-page body: heading, optional already-authed note, the
+/// form card, and cross-links. `fields` are the form's inputs (hidden
+/// payload fields are NOT needed — login/register take `fields` only).
+fn authPage(a: std.mem.Allocator, env: ViewEnv, title: []const u8, action_name: []const u8, fields: []const forest.Node, submit_label: []const u8, other: struct { label: []const u8, href: []const u8 }) forest.Node {
+    var kids: std.ArrayListUnmanaged(forest.Node) = .empty;
+    kids.append(a, forest.el(a, .h1, .{}, title)) catch @panic("OOM");
+    if (env.account_id != null) {
+        const note = std.fmt.allocPrint(a, "Вы уже вошли как {s}.", .{env.name}) catch @panic("OOM");
+        kids.append(a, forest.el(a, .p, .{ .class = "auth-note" }, note)) catch @panic("OOM");
+    }
+    var fkids: std.ArrayListUnmanaged(forest.Node) = .empty;
+    for (fields) |f| fkids.append(a, f) catch @panic("OOM");
+    fkids.append(a, forest.el(a, .button, .{ .type = "submit", .class = "auth-submit" }, submit_label)) catch @panic("OOM");
+    kids.append(a, forest.el(a, .form, .{
+        .class = "auth-form",
+        .autocomplete = "off",
+        .on = .{ .submit = action_name },
+    }, fkids.toOwnedSlice(a) catch @panic("OOM"))) catch @panic("OOM");
+    kids.append(a, forest.el(a, .p, .{ .class = "auth-links" }, .{
+        forest.el(a, .a, .{ .href = other.href }, other.label),
+        forest.text(" · "),
+        forest.el(a, .a, .{ .href = homeHref(a) }, "на главную"),
+    })) catch @panic("OOM");
+    return forest.fragment(a, kids.toOwnedSlice(a) catch @panic("OOM"));
+}
+
+fn loginView(a: std.mem.Allocator, env: ViewEnv) forest.Node {
+    const fields = [_]forest.Node{
+        authField(a, "name", "text", "имя", "username"),
+        authField(a, "password", "password", "пароль", "current-password"),
+    };
+    return authPage(a, env, "Вход", "login", &fields, "Войти", .{ .label = "нет аккаунта? регистрация", .href = registerHref(a) });
+}
+
+fn registerView(a: std.mem.Allocator, env: ViewEnv) forest.Node {
+    const fields = [_]forest.Node{
+        authField(a, "name", "text", "имя (1–32: a-z 0-9 _ -)", "username"),
+        authField(a, "password", "password", "пароль (мин. 8)", "new-password"),
+        authField(a, "confirm", "password", "пароль ещё раз", "new-password"),
+    };
+    return authPage(a, env, "Регистрация", "register", &fields, "Создать аккаунт", .{ .label = "уже есть аккаунт? вход", .href = loginHref(a) });
+}
+
 // ── routes ────────────────────────────────────────────────────────
 
-fn homeView(a: std.mem.Allocator) forest.Node {
+fn homeView(a: std.mem.Allocator, env: ViewEnv) forest.Node {
     const mm = model.get();
     var kids: std.ArrayListUnmanaged(forest.Node) = .empty;
     kids.append(a, forest.el(a, .h1, .{}, .{
@@ -359,24 +491,24 @@ fn homeView(a: std.mem.Allocator) forest.Node {
     const latest_idx = mm.latestPostIdx(a, model.latest_home_count) catch @panic("OOM");
     var lp: std.ArrayListUnmanaged(forest.Node) = .empty;
     for (latest_idx) |pi| {
-        lp.append(a, postCard(a, &mm.posts.items[pi], true)) catch @panic("OOM");
+        lp.append(a, postCard(a, env, &mm.posts.items[pi], true)) catch @panic("OOM");
     }
     kids.append(a, forest.el(a, .div, .{ .id = "latest", .class = "posts" }, forest.each(lp.toOwnedSlice(a) catch @panic("OOM")))) catch @panic("OOM");
     kids.append(a, forest.when(a, .{ .id = "w-latest-empty" }, latest_idx.len == 0, forest.el(a, .p, .{ .class = "empty" }, "Пока пусто — напиши первым пост."))) catch @panic("OOM");
     return forest.fragment(a, kids.toOwnedSlice(a) catch @panic("OOM"));
 }
 
-fn boardView(a: std.mem.Allocator, idx: usize) forest.Node {
+fn boardView(a: std.mem.Allocator, env: ViewEnv, idx: usize) forest.Node {
     const b = model.boards[idx];
     const mm = model.get();
     var kids: std.ArrayListUnmanaged(forest.Node) = .empty;
     kids.append(a, forest.el(a, .h1, .{}, b.title)) catch @panic("OOM");
-    kids.append(a, postForm(a, b.slug)) catch @panic("OOM");
+    kids.append(a, postForm(a, env, b.slug)) catch @panic("OOM");
 
     const pidx = mm.boardPostIdx(a, b.slug) catch @panic("OOM");
     var pk: std.ArrayListUnmanaged(forest.Node) = .empty;
     for (pidx) |pi| {
-        pk.append(a, postCard(a, &mm.posts.items[pi], true)) catch @panic("OOM");
+        pk.append(a, postCard(a, env, &mm.posts.items[pi], true)) catch @panic("OOM");
     }
     kids.append(a, forest.el(a, .div, .{ .id = "posts", .class = "posts" }, forest.each(pk.toOwnedSlice(a) catch @panic("OOM")))) catch @panic("OOM");
     kids.append(a, forest.when(a, .{ .id = "w-board-empty" }, pidx.len == 0, forest.el(a, .p, .{ .class = "empty", .id = "empty-posts" }, "Пока пусто — напиши первым пост."))) catch @panic("OOM");
@@ -441,8 +573,8 @@ fn threadView(a: std.mem.Allocator, env: ViewEnv, post_id: u64) forest.Node {
     };
     var kids: std.ArrayListUnmanaged(forest.Node) = .empty;
     kids.append(a, crumbsView(a, p, &[_]u64{})) catch @panic("OOM");
-    kids.append(a, postCard(a, p, false)) catch @panic("OOM");
-    kids.append(a, commentForm(a, post_id, null)) catch @panic("OOM");
+    kids.append(a, postCard(a, env, p, false)) catch @panic("OOM");
+    kids.append(a, commentForm(a, env, post_id, null)) catch @panic("OOM");
 
     const tops = mm.topCommentIdx(a, post_id) catch @panic("OOM");
     const ordered = sortTops(a, mm, tops, env.sort);
@@ -479,7 +611,7 @@ fn commentView(a: std.mem.Allocator, env: ViewEnv, cid: u64) forest.Node {
 
     var kids: std.ArrayListUnmanaged(forest.Node) = .empty;
     kids.append(a, crumbsView(a, p, chain_rev.items)) catch @panic("OOM");
-    kids.append(a, commentForm(a, p.id, null)) catch @panic("OOM");
+    kids.append(a, commentForm(a, env, p.id, null)) catch @panic("OOM");
     // Arena-allocate the single-row slice — a `&.{…}` temporary would
     // dangle once the statement ends (the keyed list outlives it).
     const only = a.alloc(forest.Node, 1) catch @panic("OOM");
@@ -496,10 +628,12 @@ fn commentView(a: std.mem.Allocator, env: ViewEnv, cid: u64) forest.Node {
 pub fn buildView(a: std.mem.Allocator, env: ViewEnv) []const forest.Node {
     if (env.seen) |p| p.* = model.get().global_seq.load(.seq_cst);
     const content = switch (env.route) {
-        .home => homeView(a),
-        .board => |i| boardView(a, i),
+        .home => homeView(a, env),
+        .board => |i| boardView(a, env, i),
         .thread => |pid| threadView(a, env, pid),
         .comment => |cid| commentView(a, env, cid),
+        .login => loginView(a, env),
+        .register => registerView(a, env),
     };
     const nodes = a.alloc(forest.Node, 2) catch @panic("OOM");
     nodes[0] = navView(a, env);

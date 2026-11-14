@@ -53,6 +53,7 @@ extern "c" fn sqlite3_bind_text(
 extern "c" fn sqlite3_bind_int64(stmt: *sqlite3_stmt, i: c_int, v: i64) c_int;
 extern "c" fn sqlite3_bind_null(stmt: *sqlite3_stmt, i: c_int) c_int;
 extern "c" fn sqlite3_step(stmt: *sqlite3_stmt) c_int;
+extern "c" fn sqlite3_reset(stmt: *sqlite3_stmt) c_int;
 extern "c" fn sqlite3_column_text(stmt: *sqlite3_stmt, i: c_int) ?[*]const u8;
 extern "c" fn sqlite3_column_bytes(stmt: *sqlite3_stmt, i: c_int) c_int;
 extern "c" fn sqlite3_column_int64(stmt: *sqlite3_stmt, i: c_int) i64;
@@ -108,6 +109,13 @@ pub const Stmt = struct {
         const st = try self.raw();
         const rc = if (v) |x| sqlite3_bind_int64(st, i, x) else sqlite3_bind_null(st, i);
         if (rc != SQLITE_OK) return sqliteErr(sqlite3_db_handle(st), "bind_int");
+    }
+
+    /// Return the statement to its initial state so it can be re-bound
+    /// and stepped again — sqlite requires this between executions of
+    /// the same prepared statement (step-after-DONE is SQLITE_MISUSE).
+    pub fn reset(self: *Stmt) void {
+        if (self.h) |p| _ = sqlite3_reset(p);
     }
 
     /// Advance: true = row available (read columns), false = DONE.

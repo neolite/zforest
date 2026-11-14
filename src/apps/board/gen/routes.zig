@@ -8,6 +8,8 @@ const zmeta = @import("../../../zmeta/root.zig");
 
 const index_page = @import("../pages/index.zig");
 const b_page = @import("../pages/b/[slug].zig");
+const login_page = @import("../pages/login.zig");
+const register_page = @import("../pages/register.zig");
 const t_page = @import("../pages/t/[post]/index.zig");
 const t_c_page = @import("../pages/t/[post]/c/[comment].zig");
 
@@ -16,6 +18,8 @@ const t_c_page = @import("../pages/t/[post]/c/[comment].zig");
 pub const Route = union(enum) {
     index: index_page.params,
     b: b_page.params,
+    login: login_page.params,
+    register: register_page.params,
     t: t_page.params,
     t_c: t_c_page.params,
 };
@@ -44,6 +48,12 @@ pub fn parseRoute(path: []const u8) ?Route {
         if (n == 2 and std.mem.eql(u8, segs[0], "b")) {
             const slug = segs[1];
             break :result Route{ .b = .{ .slug = slug } };
+        }
+        if (n == 1 and std.mem.eql(u8, segs[0], "login")) {
+            break :result Route{ .login = .{} };
+        }
+        if (n == 1 and std.mem.eql(u8, segs[0], "register")) {
+            break :result Route{ .register = .{} };
         }
         if (n == 2 and std.mem.eql(u8, segs[0], "t")) {
             const post = std.fmt.parseInt(u64, segs[1], 10) catch break :result null;
@@ -79,6 +89,8 @@ pub fn href(a: std.mem.Allocator, r: Route) []const u8 {
     return switch (r) {
         .index => "/",
         .b => |p| std.fmt.allocPrint(a, "/b/{s}", .{p.slug}) catch @panic("OOM"),
+        .login => "/login",
+        .register => "/register",
         .t => |p| std.fmt.allocPrint(a, "/t/{d}", .{p.post}) catch @panic("OOM"),
         .t_c => |p| std.fmt.allocPrint(a, "/t/{d}/c/{d}", .{p.post, p.comment}) catch @panic("OOM"),
     };
@@ -94,6 +106,8 @@ pub fn prepare(s: anytype, env: *const zmeta.Env) !void {
     switch (s.deps.route) {
         .index => |p| try preparePage(index_page, s, p, env),
         .b => |p| try preparePage(b_page, s, p, env),
+        .login => |p| try preparePage(login_page, s, p, env),
+        .register => |p| try preparePage(register_page, s, p, env),
         .t => |p| try preparePage(t_page, s, p, env),
         .t_c => |p| try preparePage(t_c_page, s, p, env),
     }
@@ -108,6 +122,8 @@ pub fn viewNodes(a: std.mem.Allocator, s: anytype, env: *const zmeta.Env) []cons
     nodes[0] = switch (s.deps.route) {
         .index => |p| index_page.view(a, s, p, env),
         .b => |p| b_page.view(a, s, p, env),
+        .login => |p| login_page.view(a, s, p, env),
+        .register => |p| register_page.view(a, s, p, env),
         .t => |p| t_page.view(a, s, p, env),
         .t_c => |p| t_c_page.view(a, s, p, env),
     };
@@ -125,6 +141,8 @@ pub fn isLive(r: Route) bool {
     return switch (r) {
         .index => pageLive(index_page),
         .b => pageLive(b_page),
+        .login => pageLive(login_page),
+        .register => pageLive(register_page),
         .t => pageLive(t_page),
         .t_c => pageLive(t_c_page),
     };

@@ -171,7 +171,7 @@ footer { margin-top: .9rem; color: var(--muted); font-size: .85rem; }
   margin-bottom: .9rem;
 }
 .app-board form.reply-form { margin: .4rem 0 .2rem; }
-.app-board textarea, .app-board input[type="text"], .app-board form input:not([type]) {
+.app-board textarea, .app-board input[type="text"], .app-board input[type="password"], .app-board form input:not([type]) {
   width: 100%;
   padding: .5rem .65rem;
   border: 1px solid var(--line);
@@ -228,6 +228,52 @@ footer { margin-top: .9rem; color: var(--muted); font-size: .85rem; }
 .app-board button.mini { padding: .2rem .55rem; font-size: .85rem; align-self: flex-start; }
 .app-board button.mini.cancel { color: var(--muted); }
 .app-board .empty { color: var(--muted); font-size: .9rem; }
+
+/* ── zboard auth (ADR-0001 phase 2) ────────────────────────── */
+.app-board .bnav .auth-link { color: var(--muted); font-size: .85rem; }
+.app-board .bnav .auth-link:hover { color: var(--accent); }
+.app-board .bnav button.nav-logout {
+  border: none;
+  background: none;
+  color: var(--muted);
+  font-size: .85rem;
+  padding: 0;
+  cursor: pointer;
+}
+.app-board .bnav button.nav-logout:hover { color: var(--accent); }
+.app-board .posting-as { color: var(--muted); font-size: .8rem; }
+.app-board .del-btn {
+  border: none;
+  background: none;
+  color: var(--muted);
+  font-size: .8rem;
+  padding: 0 .2rem;
+  cursor: pointer;
+}
+.app-board .del-btn:hover { color: #c0392b; }
+.app-board form.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: .55rem;
+  max-width: 22rem;
+  margin: 0 0 1rem;
+}
+.app-board .auth-form input.auth-input { width: 100%; }
+.app-board .auth-form button.auth-submit {
+  align-self: flex-start;
+  padding: .45rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: .45rem;
+  background: var(--panel);
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+.app-board .auth-form button.auth-submit:hover { border-color: var(--accent); color: var(--accent); }
+.app-board .auth-note { color: var(--muted); font-size: .9rem; }
+.app-board .auth-links { font-size: .85rem; color: var(--muted); }
+.app-board .auth-links a { color: var(--accent); text-decoration: none; }
+.app-board .auth-links a:hover { text-decoration: underline; }
 
 /* ── zmon dashboard ─────────────────────────────────────────── */
 .app-mon { max-width: 52rem; }

@@ -26,15 +26,23 @@ const view = @import("view.zig");
 
 /// Immutable group-key inputs. `name` is borrowed only for the duration
 /// of `join`/`keyStringInto`; the group stores its own copy as a suffix
-/// of `key_string`.
+/// of `key_string`. `account_id` is the auth dimension (ADR-0001
+/// phase 2): null = anonymous viewer, else the account id — it gates
+/// own-content delete buttons in the view, so it MUST be a key input
+/// (two accounts rendering the same page still diverge on deletes).
 pub const Key = struct {
     route: view.Route,
     reply_to: ?u64,
-    /// Resolved display name ("Anon#N" / "anon") — NOT the user token:
-    /// two tokens resolving to the same name render identically.
+    /// Resolved auth display name ("@<account>" / "Anon#N" / "anon") —
+    /// NOT the user token: sessions with identical rendered identity
+    /// share a group. Account names are unique+immutable, so "@name"
+    /// is bijective with `account_id` (both carried anyway: the view
+    /// needs the numeric id for ownership checks).
     name: []const u8,
     /// Top-level comment sort — per-session view input like reply_to.
     sort: view.Sort = .new,
+    /// Viewer account id (null = anonymous) — auth group dimension.
+    account_id: ?u64 = null,
 };
 
 /// One render group: shared tracked DOM state, patch log, revisioned
@@ -80,6 +88,7 @@ pub const RenderGroup = struct {
             .reply_to = self.key.reply_to,
             .sort = self.key.sort,
             .name = self.key.name,
+            .account_id = self.key.account_id,
             .seen = &self.last_rendered_seq,
         };
     }
@@ -142,24 +151,29 @@ pub const RenderGroup = struct {
 var groups: std.StringHashMapUnmanaged(*RenderGroup) = .empty;
 var next_incarnation: u64 = 1;
 
-/// Canonical key encoding: "\x01"-separated route code, reply marker and
-/// display name. Components are server-generated (fixed route codes,
-/// u64 ids, "Anon#<base36>"/"anon" names) so the separator cannot appear
-/// inside a field — the encoding is injective for every reachable key.
-/// `buf` must hold ~192 bytes; the result borrows `buf`.
-pub fn keyStringInto(buf: []u8, route: view.Route, reply_to: ?u64, name: []const u8, sort: view.Sort) []const u8 {
+/// Canonical key encoding: "\x01"-separated route code, reply marker,
+/// sort, account class and display name. Components are server-generated
+/// (fixed route codes, u64 ids, "acct:<id>"/"anon", "@name"/"Anon#<base36>"/
+/// "anon" names) so the separator cannot appear inside a field — the
+/// encoding is injective for every reachable key. `buf` must hold
+/// ~224 bytes; the result borrows `buf`.
+pub fn keyStringInto(buf: []u8, route: view.Route, reply_to: ?u64, name: []const u8, sort: view.Sort, account_id: ?u64) []const u8 {
     var rbuf: [48]u8 = undefined;
     const rpart = switch (route) {
         .home => "home",
         .board => |i| std.fmt.bufPrint(&rbuf, "board:{d}", .{i}) catch unreachable,
         .thread => |id| std.fmt.bufPrint(&rbuf, "thread:{d}", .{id}) catch unreachable,
         .comment => |id| std.fmt.bufPrint(&rbuf, "comment:{d}", .{id}) catch unreachable,
+        .login => "login",
+        .register => "register",
     };
     var pbuf: [24]u8 = undefined;
     const ppart = if (reply_to) |r| std.fmt.bufPrint(&pbuf, "reply:{d}", .{r}) catch unreachable else "reply:-";
     const spart = if (sort == .top) "top" else "new";
+    var abuf: [24]u8 = undefined;
+    const apart = if (account_id) |id| std.fmt.bufPrint(&abuf, "acct:{d}", .{id}) catch unreachable else "anon";
     // name stays LAST: createGroup borrows it as the key_string suffix.
-    return std.fmt.bufPrint(buf, "{s}\x01{s}\x01{s}\x01{s}", .{ rpart, ppart, spart, name }) catch @panic("group key buf too small");
+    return std.fmt.bufPrint(buf, "{s}\x01{s}\x01{s}\x01{s}\x01{s}", .{ rpart, ppart, spart, apart, name }) catch @panic("group key buf too small");
 }
 
 /// Live group count — test/diagnostic helper.
@@ -172,7 +186,7 @@ pub fn registryCount() usize {
 /// key means joining a foreign stream namespace → snapshot.
 pub fn contains(key: Key) bool {
     var kbuf: [256]u8 = undefined;
-    const ks = keyStringInto(&kbuf, key.route, key.reply_to, key.name, key.sort);
+    const ks = keyStringInto(&kbuf, key.route, key.reply_to, key.name, key.sort, key.account_id);
     return groups.get(ks) != null;
 }
 
@@ -185,7 +199,7 @@ fn createGroup(gpa: std.mem.Allocator, ks: []const u8, key: Key) *RenderGroup {
     g.* = .{
         .gpa = gpa,
         .key_string = undefined,
-        .key = .{ .route = key.route, .reply_to = key.reply_to, .name = &.{}, .sort = key.sort },
+        .key = .{ .route = key.route, .reply_to = key.reply_to, .name = &.{}, .sort = key.sort, .account_id = key.account_id },
         .scope = app.Session.scopeForRoute(key.route),
         .incarnation = next_incarnation,
         .dom = forest.Dom.init(gpa),
@@ -206,7 +220,7 @@ fn createGroup(gpa: std.mem.Allocator, ks: []const u8, key: Key) *RenderGroup {
 /// `members` is incremented on every call; pair with `leave`.
 pub fn join(gpa: std.mem.Allocator, key: Key) *RenderGroup {
     var kbuf: [256]u8 = undefined;
-    const ks = keyStringInto(&kbuf, key.route, key.reply_to, key.name, key.sort);
+    const ks = keyStringInto(&kbuf, key.route, key.reply_to, key.name, key.sort, key.account_id);
     if (groups.get(ks)) |g| {
         g.members += 1;
         return g;
@@ -234,7 +248,7 @@ pub fn join(gpa: std.mem.Allocator, key: Key) *RenderGroup {
 pub fn fork(gpa: std.mem.Allocator, src: *RenderGroup, key: Key) *RenderGroup {
     src.publish(); // defensive: render+publish are atomic under the mutex, never clone a pending log
     var kbuf: [256]u8 = undefined;
-    const ks = keyStringInto(&kbuf, key.route, key.reply_to, key.name, key.sort);
+    const ks = keyStringInto(&kbuf, key.route, key.reply_to, key.name, key.sort, key.account_id);
     std.debug.assert(groups.get(ks) == null);
     const g = createGroup(gpa, ks, key);
     // The fresh dom/history shells hold no allocations — overwrite.
@@ -272,16 +286,22 @@ pub fn leave(gpa: std.mem.Allocator, g: *RenderGroup) void {
 // tests
 // ─────────────────────────────────────────────
 
-test "key encoding is injective across route/reply/name" {
-    var b1: [256]u8 = undefined;
-    var b2: [256]u8 = undefined;
-    const a = keyStringInto(&b1, .home, null, "anon", .new);
-    const b = keyStringInto(&b2, .home, null, "Anon#1", .new);
+test "key encoding is injective across route/reply/name/account" {
+    var bufs: [4][256]u8 = undefined;
+    const a = keyStringInto(&bufs[0], .home, null, "anon", .new, null);
+    const b = keyStringInto(&bufs[1], .home, null, "Anon#1", .new, null);
     try std.testing.expect(!std.mem.eql(u8, a, b));
-    const c = keyStringInto(&b2, .home, @as(?u64, 7), "anon", .new);
+    const c = keyStringInto(&bufs[1], .home, @as(?u64, 7), "anon", .new, null);
     try std.testing.expect(!std.mem.eql(u8, a, c));
-    const d = keyStringInto(&b2, .{ .thread = 7 }, null, "anon", .new);
+    const d = keyStringInto(&bufs[1], .{ .thread = 7 }, null, "anon", .new, null);
     try std.testing.expect(!std.mem.eql(u8, a, d));
-    const e = keyStringInto(&b2, .home, null, "anon", .new);
+    const e = keyStringInto(&bufs[1], .home, null, "anon", .new, null);
     try std.testing.expect(std.mem.eql(u8, a, e));
+    // Auth dimension: same route/name/sort, different account class.
+    const f = keyStringInto(&bufs[2], .home, null, "@alice", .new, @as(?u64, 7));
+    try std.testing.expect(!std.mem.eql(u8, a, f));
+    const g = keyStringInto(&bufs[3], .home, null, "@alice", .new, @as(?u64, 8));
+    try std.testing.expect(!std.mem.eql(u8, f, g));
+    const h = keyStringInto(&bufs[2], .home, null, "@alice", .new, @as(?u64, 7));
+    try std.testing.expect(std.mem.eql(u8, f, h));
 }

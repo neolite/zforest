@@ -1,6 +1,6 @@
 # Board auth: phased identity — tripcodes first, accounts second
 
-**Status:** phase 1 landed (tripcodes); accounts still proposed
+**Status:** landed — phases 1 (tripcodes) and 2 (accounts) both shipped
 
 zboard today is purely anonymous: the `users` table stores only
 `zfxu` cookie tokens and `anonName(rownum)` derives display names.
@@ -64,11 +64,18 @@ Ship auth in two phases:
   at render time — `model.tripCode`, `view.authorName`. The `trip`
   input rides the existing `fields` payload on post/comment/reply —
   no new actions, no gen/ changes.
-- Phase 2 adds an auth cookie alongside `zfxu`, the `accounts` table,
-  and the group-key auth dimension; it reuses phase 1's
-  `PRAGMA`-guarded `ALTER TABLE` migration pattern for new columns.
-  Session cap accounting is unchanged (auth rides the existing
-  session).
+- Phase 2 **landed** as designed: `accounts` (`name UNIQUE`,
+  `pass_hash` = `salt_hex$iterations$hash_hex` over PBKDF2-HMAC-SHA256,
+  `auth_token` = the live `zfxa` value — one token per account, a fresh
+  login replaces it), nullable `acct` on posts/comments (same
+  `PRAGMA`-guarded `ALTER TABLE` migration), `register`/`login`/
+  `logout`/`delete_post`/`delete_comment` actions, `/login` +
+  `/register` file-routed pages, and the group-key auth dimension
+  (`acct:<id>`/`anon` + the `@name` display name). Own-content delete
+  cascades comments+likes (post) or the reply subtree+likes (comment);
+  ownership failures report `NotFound` — no existence leak. Session cap
+  accounting is unchanged (auth rides the existing session; `zfxa`
+  rides a second `Set-Cookie` via `Session.out_cookie2`).
 - PBKDF2 iteration count is a demo-grade trade-off; if zboard ever
   holds real accounts, swap the KDF — the `pass_hash` column format
   (`salt$iterations$hash`) leaves room.

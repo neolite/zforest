@@ -13,6 +13,11 @@ pub const act = struct {
     pub const cancel_reply = "cancel_reply";
     pub const sort = "sort";
     pub const like = "like";
+    pub const register = "register";
+    pub const login = "login";
+    pub const logout = "logout";
+    pub const delete_post = "delete_post";
+    pub const delete_comment = "delete_comment";
 };
 
 /// Dispatch skeleton: each whitelisted action calls the app's
@@ -33,5 +38,10 @@ pub fn dispatch(
     if (std.mem.eql(u8, action, act.cancel_reply)) return D.on_cancel_reply(s, arg, value, fields);
     if (std.mem.eql(u8, action, act.sort)) return D.on_sort(s, arg, value, fields);
     if (std.mem.eql(u8, action, act.like)) return D.on_like(s, arg, value, fields);
+    if (std.mem.eql(u8, action, act.register)) return D.on_register(s, arg, value, fields);
+    if (std.mem.eql(u8, action, act.login)) return D.on_login(s, arg, value, fields);
+    if (std.mem.eql(u8, action, act.logout)) return D.on_logout(s, arg, value, fields);
+    if (std.mem.eql(u8, action, act.delete_post)) return D.on_delete_post(s, arg, value, fields);
+    if (std.mem.eql(u8, action, act.delete_comment)) return D.on_delete_comment(s, arg, value, fields);
     return error.InvalidAction;
 }

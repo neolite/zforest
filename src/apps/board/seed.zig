@@ -175,13 +175,13 @@ pub fn apply(m: *model.BoardModel) !struct { posts: usize, comments: usize } {
     if (m.posts.items.len != 0) return error.NonEmpty;
     for (posts) |sp| {
         _ = try m.ensureUser(sp.user);
-        const p = try m.addPost(sp.board, sp.user, sp.text, sp.trip);
+        const p = try m.addPost(sp.board, sp.user, sp.text, sp.trip, null);
         // Temp parent indexes → real ids.
         var real: [64]u64 = undefined;
         for (sp.comments, 0..) |sc, i| {
             _ = try m.ensureUser(sc.user);
             const parent: ?u64 = if (sc.parent) |pi| real[pi] else null;
-            const c = try m.addComment(p.id, parent, sc.user, sc.text, sc.trip);
+            const c = try m.addComment(p.id, parent, sc.user, sc.text, sc.trip, null);
             real[i] = c.id;
         }
     }

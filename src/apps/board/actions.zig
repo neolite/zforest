@@ -9,4 +9,9 @@ pub const actions = .{
     "cancel_reply",
     "sort",
     "like",
+    "register",
+    "login",
+    "logout",
+    "delete_post",
+    "delete_comment",
 };

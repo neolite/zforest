@@ -38,6 +38,10 @@ const sse_heartbeat_ticks = 200; // 200 * 50ms ≈ 10s
 ///     model is shared (board) re-render when `model.global_seq` moved.
 ///   - `out_cookie: []const u8` — Set-Cookie value for the /action response
 ///     ("" = none); used to mint per-user cookies on first POST.
+///   - Optional `outCookie2() []const u8` decl — a SECOND Set-Cookie on
+///     the same response (board's `zfxa` account auth); probed via
+///     `@hasDecl` so single-cookie apps are unaffected. Must be a decl
+///     (fn/const), not a field — @hasDecl can't see struct fields.
 ///   - `page_title` / `page_class` — <title> text and <main> class.
 ///   - `cookie_name` — session cookie name (avoid host-wide clobbering).
 ///   - Optional `readCookies(cookie_header)` — called before dispatch so
@@ -346,10 +350,17 @@ fn handle(
             s.log.clear();
         }
 
-        // Per-action Set-Cookie hook (e.g. minted on first POST) — the
-        // value stays valid in `extra` because the session owns it.
+        // Per-action Set-Cookie hooks (e.g. minted on first POST) — the
+        // values stay valid in `extra` because the session owns them.
+        // `outCookie2()` is an optional second auxiliary cookie (board's
+        // `zfxa` account auth): it's a DECL accessor, not a field —
+        // @hasDecl can't see struct fields — so sessions that don't
+        // declare it skip the probe entirely.
         if (s.out_cookie.len != 0) {
             extra.append(arena, .{ .name = "set-cookie", .value = s.out_cookie }) catch @panic("OOM");
+        }
+        if (@hasDecl(Session, "outCookie2") and s.outCookie2().len != 0) {
+            extra.append(arena, .{ .name = "set-cookie", .value = s.outCookie2() }) catch @panic("OOM");
         }
 
         var ack: std.Io.Writer.Allocating = .init(arena);
