@@ -69,6 +69,25 @@ fn likeKindChar(k: LikeKind) u8 {
     };
 }
 
+/// Scope keys for dirty-only dispatch. A render group re-renders only
+/// when the scope its route reads bumped — a comment on /t/6 no longer
+/// forces buildView+diff on home, other boards, or other threads.
+/// `SCOPE_HOME` covers the latest-posts view; `scopeBoard(i)` one board;
+/// `scopePost(id)` a thread plus every comment permalink under it
+/// (comment views read their whole post's subtree). Board indices are
+/// tiny, post ids start at 1 — SCOPE_POST_BASE keeps the namespaces
+/// disjoint (id 0 is never a real post, used for dangling routes).
+pub const SCOPE_HOME: u64 = 0;
+const SCOPE_POST_BASE: u64 = 1 << 40;
+
+pub fn scopeBoard(idx: usize) u64 {
+    return @as(u64, idx) + 1;
+}
+
+pub fn scopePost(id: u64) u64 {
+    return SCOPE_POST_BASE + id;
+}
+
 /// Wall-clock seconds since the unix epoch — libc `time(3)`, already
 /// linked via the sqlite amalgamation (Zig 0.17 needs an `Io` for
 /// `Clock.Timestamp`, which the model deliberately doesn't carry).
@@ -156,6 +175,11 @@ pub const BoardModel = struct {
     /// one-like-per-account toggle check. Both rebuilt on load.
     like_counts: std.AutoHashMapUnmanaged(u64, u32) = .empty,
     liked_by: std.StringHashMapUnmanaged(void) = .empty,
+    /// Per-scope mutation counters for dirty-only dispatch: a render
+    /// group re-renders only when a scope its route reads has bumped,
+    /// instead of on every `global_seq` tick. Keys: `SCOPE_HOME`,
+    /// `scopeBoard(i)`, `scopePost(id)` — see the constants below.
+    scope_seq: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     /// Shared id space across posts+comments: display "#N".
     next_id: u64 = 1,
     /// Bumped on every mutation; sessions poll it for cross-session fan-out.
@@ -212,12 +236,25 @@ pub const BoardModel = struct {
         while (lit.next()) |e| self.gpa.free(e.key_ptr.*);
         self.liked_by.deinit(self.gpa);
         self.like_counts.deinit(self.gpa);
+        self.scope_seq.deinit(self.gpa);
         self.db.close();
         self.gpa.destroy(self);
     }
 
     fn bump(self: *BoardModel) void {
         _ = self.global_seq.fetchAdd(1, .seq_cst);
+    }
+
+    fn scopeBump(self: *BoardModel, key: u64) void {
+        const gop = self.scope_seq.getOrPut(self.gpa, key) catch @panic("OOM");
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* +%= 1;
+    }
+
+    /// Current version of a scope — 0 until the first bump. Render
+    /// groups compare this against their `scope_seen` cursor.
+    pub fn scopeVersion(self: *const BoardModel, key: u64) u64 {
+        return self.scope_seq.get(key) orelse 0;
     }
 
     fn validText(text: []const u8) bool {
@@ -453,6 +490,7 @@ pub const BoardModel = struct {
             .post => if (self.findPost(target) == null) return error.PostNotFound,
             .comment => if (self.findComment(target) == null) return error.CommentNotFound,
         }
+        self.scopeBumpLike(kind, target);
         var kbuf: [320]u8 = undefined;
         const key = std.fmt.bufPrint(&kbuf, "{c}{d}:{s}", .{ likeKindChar(kind), target, user_token }) catch @panic("key too long");
         var kbuf2: [2]u8 = undefined;
@@ -488,6 +526,26 @@ pub const BoardModel = struct {
         return true;
     }
 
+    /// Dirty the scopes a like/unlike touches: post likes render on
+    /// home/board cards (plus the post scope as insurance), comment
+    /// likes inside their post's thread/permalink scope. Home only
+    /// when the post is still in the latest-N window.
+    fn scopeBumpLike(self: *BoardModel, kind: LikeKind, target: u64) void {
+        switch (kind) {
+            .post => {
+                const pi = self.findPost(target) orelse return;
+                const p = &self.posts.items[pi];
+                if (boardIndex(p.board)) |bi| self.scopeBump(scopeBoard(bi));
+                self.scopeBump(scopePost(target));
+                if (pi + latest_home_count >= self.posts.items.len) self.scopeBump(SCOPE_HOME);
+            },
+            .comment => {
+                const ci = self.findComment(target) orelse return;
+                self.scopeBump(scopePost(self.comments.items[ci].post));
+            },
+        }
+    }
+
     /// Insert a post: validate, write-through INSERT, append, bump seq.
     pub fn addPost(self: *BoardModel, board_slug: []const u8, user_token: []const u8, text_in: []const u8) ModelError!Post {
         if (!validText(text_in)) return error.InvalidText;
@@ -514,6 +572,8 @@ pub const BoardModel = struct {
         self.indexPost(self.posts.items.len - 1);
         self.next_id += 1;
         self.bump();
+        if (boardIndex(board_slug)) |bi| self.scopeBump(scopeBoard(bi));
+        self.scopeBump(SCOPE_HOME);
         return p;
     }
 
@@ -550,6 +610,14 @@ pub const BoardModel = struct {
         self.indexComment(self.comments.items.len - 1);
         self.next_id += 1;
         self.bump();
+        // The comment count renders on the post's card (its board view
+        // + home when still in the latest-N window) and the comment
+        // tree on the post's thread/permalink scope.
+        self.scopeBump(scopePost(post_id));
+        if (self.findPost(post_id)) |pi| {
+            if (boardIndex(self.posts.items[pi].board)) |bi| self.scopeBump(scopeBoard(bi));
+            if (pi + latest_home_count >= self.posts.items.len) self.scopeBump(SCOPE_HOME);
+        }
         return c;
     }
 };

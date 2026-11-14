@@ -851,3 +851,23 @@ reload (liked_by survives → same account toggles OFF after restart).
 View: `sortTops` new/top ordering + tie-break; dispatch like/sort
 incl. InvalidAction paths; sort re-key → clone-fork with NO epoch
 bump, key_string carries the sort field.
+
+## zboard: dirty-only dispatch (done)
+
+`global_seq` bumped on EVERY mutation forced every render group through
+buildView+diff — a comment on /t/6 re-rendered home, other boards and
+other threads just to emit empty patches. Now `BoardModel.scope_seq`
+keeps per-scope u64 counters and each `RenderGroup` records the single
+scope its route reads (`scopeForRoute`: home→SCOPE_HOME, board→
+scopeBoard(i), thread/comment→scopePost(post_id) — comment permalinks
+read their whole post's subtree, over-broad but correct).
+
+Mutations declare their footprint: addPost→home+board, addComment→
+post scope + its board + home only when still in latest-N,
+toggleLike(.post)→home(if latest)+board+post scope, toggleLike(.comment)
+→post scope, ensureUser→none (names are immutable post-mint; the
+session's own name change re-keys the group anyway). `RenderGroup.
+isCurrent()` gates both `syncPull` (no ping → no flush → no SSE
+traffic) and `render()`; `needs_render` still forces fork renders.
+Scope keys are u64-tagged (home=0, boards=1..N, posts=2^40+id) — no
+string allocs on the hot path.

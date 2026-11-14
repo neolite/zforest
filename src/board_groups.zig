@@ -62,10 +62,16 @@ pub const RenderGroup = struct {
     /// cursor. Written only by view builds that actually sync the Dom
     /// (seed/render), never by SSR/snapshot serialization.
     last_rendered_seq: u64 = 0,
-    /// Forces one render even when `global_seq` is unchanged — set by
-    /// `fork`, whose view inputs differ from the cloned Dom's while the
-    /// model may not have moved.
+    /// Forces one render even when scopes are current — set by
+    /// `fork`, whose view inputs differ from the cloned Dom's while
+    /// the model may not have moved.
     needs_render: bool = false,
+    /// The single model scope this group's route reads (dirty-only
+    /// dispatch): `scope_seq[scope]` vs `scope_seen` decides whether
+    /// buildView+diff runs at all.
+    scope: u64 = 0,
+    /// Scope version the Dom last diffed against.
+    scope_seen: u64 = 0,
 
     fn viewEnv(self: *RenderGroup) board_app.ViewEnv {
         return .{
@@ -77,6 +83,14 @@ pub const RenderGroup = struct {
         };
     }
 
+    /// Whether the group needs no render pass: not fork-forced and the
+    /// scope its route reads is at the version the Dom last diffed.
+    /// A mutation on an unrelated route leaves this true — no ping, no
+    /// buildView, no rev bump, no SSE traffic.
+    pub fn isCurrent(self: *const RenderGroup) bool {
+        return !self.needs_render and self.scope_seen == board_app.Session.scopeVersion(self.scope);
+    }
+
     /// Seed a fresh group's Dom to the current view WITHOUT publishing:
     /// diffing against an empty Dom emits creates that are discarded —
     /// tracked state only. `buildView` stamps `last_rendered_seq`.
@@ -85,21 +99,23 @@ pub const RenderGroup = struct {
         const a = self.arena.allocator();
         forest.diff(a, board_app.buildView(a, self.viewEnv()), &self.dom, &self.log);
         self.log.clear();
+        self.scope_seen = board_app.Session.scopeVersion(self.scope);
     }
 
-    /// Reconcile Dom against the current shared model when `global_seq`
-    /// moved — THE dedup point: any member may trigger it, the rest see
-    /// `last_rendered_seq` already current and skip. Stamps the next
-    /// group revision into the log; `publish` ships it.
+    /// Reconcile Dom against the shared model when a scope this group's
+    /// route reads moved — THE dedup point, now per-scope: a comment on
+    /// /t/6 doesn't re-render home or /t/1. Stamps the next group
+    /// revision into the log; `publish` ships it.
     pub fn render(self: *RenderGroup) void {
-        const seq = board_app.globalSeq();
-        if (!self.needs_render and self.last_rendered_seq == seq) return;
+        if (self.isCurrent()) return;
         self.needs_render = false;
+        const seen = board_app.Session.scopeVersion(self.scope);
         _ = self.arena.reset(.retain_capacity);
         const a = self.arena.allocator();
         forest.diff(a, board_app.buildView(a, self.viewEnv()), &self.dom, &self.log);
         self.rev += 1;
         self.log.revision = self.rev;
+        self.scope_seen = seen;
     }
 
     /// Serialize + publish the pending batch into the group history — at
@@ -169,6 +185,7 @@ fn createGroup(gpa: std.mem.Allocator, ks: []const u8, key: Key) *RenderGroup {
         .gpa = gpa,
         .key_string = undefined,
         .key = .{ .route = key.route, .reply_to = key.reply_to, .name = &.{}, .sort = key.sort },
+        .scope = board_app.Session.scopeForRoute(key.route),
         .incarnation = next_incarnation,
         .dom = forest.Dom.init(gpa),
         .log = forest.PatchLog.init(gpa),

@@ -236,9 +236,38 @@ pub const Session = struct {
     /// sessions dedup on the GROUP's `last_rendered_seq`, so N members on
     /// one group cost one buildView+diff per model version.
     pub fn syncPull(self: *Session) void {
-        const rendered = if (self.group) |g| g.last_rendered_seq else self.seen_seq;
+        if (self.group) |g| {
+            // Dirty-only dispatch: ping only when a scope this group's
+            // route reads actually bumped (or a fork forced a render).
+            if (g.isCurrent()) return;
+            self.ping.emit(.{});
+            return;
+        }
+        const rendered = self.seen_seq;
         if (m().global_seq.load(.seq_cst) == rendered) return;
         self.ping.emit(.{});
+    }
+
+    /// The model scope a route's view reads — render groups gate
+    /// buildView+diff on this version (dirty-only dispatch). Comment
+    /// permalinks read their whole post's scope: a reply anywhere in
+    /// the thread re-renders them (over-broad but correct).
+    pub fn scopeForRoute(route: Route) u64 {
+        return switch (route) {
+            .home => board.SCOPE_HOME,
+            .board => |i| board.scopeBoard(i),
+            .thread => |pid| board.scopePost(pid),
+            .comment => |cid| blk: {
+                const c = m().comment(cid) orelse break :blk board.scopePost(0);
+                break :blk board.scopePost(c.post);
+            },
+        };
+    }
+
+    /// Current version of a scope key — groups compare it against
+    /// their `scope_seen` cursor.
+    pub fn scopeVersion(key: u64) u64 {
+        return m().scopeVersion(key);
     }
 
     // ── render groups ──────────────────────────────────────────────
@@ -1608,4 +1637,49 @@ test "like/sort actions: per-account votes, sort re-keys the group" {
     try std.testing.expectEqual(Sort.new, a.sort);
     try std.testing.expectEqual(Sort.new, a.group.?.key.sort);
     try std.testing.expect(std.mem.indexOf(u8, a.group.?.key_string, "new") != null);
+}
+
+test "dirty-only dispatch: unrelated scope mutations skip group renders" {
+    const alloc = std.testing.allocator;
+    const mm = testModel(alloc);
+    defer mm.deinit();
+    model = mm;
+    defer model = null;
+    _ = try mm.addPost("b", "tok", "post one");
+    _ = try mm.addPost("b", "tok", "post two");
+
+    const a = createSession(alloc, std.testing.io);
+    defer a.deinit();
+    const b = createSession(alloc, std.testing.io);
+    defer b.deinit();
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    try std.testing.expect(try a.servePage("/t/1", &aw.writer));
+    _ = aw.writer.consumeAll();
+    try std.testing.expect(try b.servePage("/t/2", &aw.writer));
+    const ga = a.group.?;
+    const gb = b.group.?;
+    const rev_a = ga.rev;
+    const rev_b = gb.rev;
+
+    // Comment on post 2: only post-2's scope (plus board/home card
+    // counts) bumps — /t/1's group must not re-render at all.
+    var cf: std.json.ObjectMap = .empty;
+    defer cf.deinit(alloc);
+    try cf.put(alloc, "post", .{ .string = "2" });
+    try cf.put(alloc, "text", .{ .string = "on two" });
+    try b.dispatch("comment", null, null, &cf);
+    a.syncPull();
+    b.syncPull();
+    try std.testing.expectEqual(rev_a, ga.rev); // skipped: scope untouched
+    try std.testing.expect(gb.rev > rev_b); // rendered: its scope bumped
+
+    // Comment on post 1 now renders /t/1's group.
+    var cf2: std.json.ObjectMap = .empty;
+    defer cf2.deinit(alloc);
+    try cf2.put(alloc, "post", .{ .string = "1" });
+    try cf2.put(alloc, "text", .{ .string = "on one" });
+    try a.dispatch("comment", null, null, &cf2);
+    a.syncPull();
+    try std.testing.expect(ga.rev > rev_a);
 }
