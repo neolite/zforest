@@ -9,3 +9,5 @@
 pub const Archetype = @import("session.zig").Archetype;
 pub const Env = @import("env.zig").Env;
 pub const Session = @import("session.zig").Session;
+/// Fluent HTML builder over `forest.view` — `h.div(a).id("x").node()`.
+pub const h = @import("h.zig");

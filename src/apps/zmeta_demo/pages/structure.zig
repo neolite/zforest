@@ -1,8 +1,8 @@
 //! "/structure" — how this demo is put together: the file tree the
 //! generator scans and the pipeline from file → route → session.
 const std = @import("std");
-const forest = @import("forest");
 const zmeta = @import("../zmeta.zig");
+const h = zmeta.h;
 
 pub const params = struct {};
 
@@ -36,17 +36,17 @@ const flow =
     \\  → after-flush: forest.diff → PatchLog → SSE patch {rev, ops}
 ;
 
-pub fn view(a: std.mem.Allocator, s: anytype, p: params, env: *const zmeta.Env) forest.Node {
+pub fn view(a: std.mem.Allocator, s: anytype, p: params, env: *const zmeta.Env) h.Node {
     _ = s;
     _ = p;
     _ = env;
-    return forest.fragment(a, .{
-        forest.el(a, .h1, .{ .id = "title" }, "how it's made"),
-        forest.el(a, .p, .{ .id = "blurb" }, "one file per route — the generator does the rest"),
-        forest.el(a, .h2, .{}, "file structure"),
-        forest.el(a, .pre, .{ .id = "tree", .class = "code" }, tree),
-        forest.el(a, .h2, .{}, "request lifecycle"),
-        forest.el(a, .pre, .{ .id = "flow", .class = "code" }, flow),
-        forest.el(a, .p, .{ .id = "back" }, forest.el(a, .a, .{ .href = "/" }, "← back")),
+    return h.fragment(a, .{
+        h.h1(a).id("title").child("how it's made").node(),
+        h.p(a).id("blurb").child("one file per route — the generator does the rest").node(),
+        h.h2(a).child("file structure").node(),
+        h.pre(a).id("tree").class("code").child(tree).node(),
+        h.h2(a).child("request lifecycle").node(),
+        h.pre(a).id("flow").class("code").child(flow).node(),
+        h.p(a).id("back").child(h.a(a).href("/").child("← back")).node(),
     });
 }
