@@ -6,5 +6,6 @@
 //! `server/http.zig` sees. Apps import `zmeta/root.zig` (or the files
 //! directly) — never `@import("zmeta")` as a package name.
 
+pub const Archetype = @import("session.zig").Archetype;
 pub const Env = @import("env.zig").Env;
 pub const Session = @import("session.zig").Session;

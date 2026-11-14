@@ -906,3 +906,50 @@ per exe; a named `zmeta` module would fork `History` away from
   `s.deps.*` field access).
 - Deferred: file-based routing codegen, typed action tables, typed
   route params, `/api/*`, soft-nav, islands — all per §5/§7.
+
+## zmeta: `.shared_model` archetype + render-group stream hooks
+
+`Session(Deps)` now supports the §4.1 `.shared_model` archetype on
+`feat/zmeta-shared`. `Deps` may declare `pub const archetype:
+zmeta.Archetype = .per_session | .shared_model | .live_shared`
+(metadata only — exported via `zmeta/root.zig`).
+
+The four http.zig stream hooks (`publishPending`/`streamRev`/
+`streamHistory`/`membershipEpoch`) are emitted ALL-OR-NOTHING: Zig
+0.17 has no `usingnamespace` and no conditional named declarations, so
+the skeleton cannot emit "only the hooks Deps declares" — and the four
+are meaningless in isolation anyway (custom `streamRev` without
+`streamHistory` breaks `History.fetch` contiguity; grouped sessions
+need the epoch to force snapshots). `Session(Deps)` comptime-selects
+two thin session types:
+
+- none declared → `SessionPlain`: the methods do not exist on the
+  type, `@hasDecl` probes fail, server keeps per-session defaults;
+- all four declared → `SessionGrouped`: each is a pure pass-through to
+  the matching `Deps` fn (`fn(s: *Session) T`). The render-group
+  registry/key/group pointer stay app-owned in `s.deps` — the
+  skeleton forwards, it owns no group state (§4.1 verdict stands);
+- some declared → `@compileError` naming the missing hooks.
+
+Implementation shape (forced by the missing `usingnamespace`): all
+method bodies live ONCE in `SessionMethods(Deps)` taking
+`self: anytype` (the `stream.zig` duck-typing style); each variant
+struct declares the identical field list and aliases every method via
+`pub const name = M.name` — the post-`usingnamespace` idiom. Only the
+field list is duplicated. `Deps.init`/`wire`/`view`/`dispatch` still
+receive the exact `*Session` type per variant, so existing Deps code
+is unaffected (`todo.Session` resolves to `SessionPlain` unchanged).
+
+`syncPull` stays independently optional (shared-model fan-out without
+groups = the zmon shape; `live_shared` is reserved — `bindTree` live
+render mode is still Deps-owned future work). Env is unchanged: the
+hooks take `*Session`, so group state is reached through `s.deps` —
+no new Env accessors were needed.
+
+Deferred for real zboard migration: grouped `servePage`/`render`/
+`writeView`/`buildViewNodes`/`seedDom` overrides (board's grouped
+servePage syncs membership + ensures the group current instead of
+`dom.reset`+`seedDom`; the skeleton's diff-render assumes per-session
+Dom) — needs optional `Deps` hooks for the render path, or per-app
+skeleton specialization. Contract proven on a test `SharedDeps` only;
+no app migrated yet.
