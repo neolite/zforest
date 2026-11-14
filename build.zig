@@ -81,6 +81,33 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(zcar);
 
+    // zmeta codegen: `zig build gen` regenerates src/apps/*/gen/*.zig
+    // from each app's pages/ tree + actions.zig manifest. The output is
+    // deterministic and checked in — the demo module below compiles the
+    // checked-in files directly (no build-time codegen dependency).
+    const gen_mod = b.createModule(.{
+        .root_source_file = b.path("src/zmeta/gen.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const gen_tool = b.addExecutable(.{ .name = "zmeta-gen", .root_module = gen_mod });
+    const gen_step = b.step("gen", "Regenerate zmeta app gen/ files (routes.zig, actions.zig)");
+    const gen_run = b.addRunArtifact(gen_tool);
+    gen_run.setCwd(b.path("."));
+    gen_step.dependOn(&gen_run.step);
+
+    // The zmeta demo app: file-based routes with typed params + the
+    // comptime action table, served through the zmeta Session skeleton.
+    const demo_mod = b.createModule(.{
+        .root_source_file = b.path("src/zmeta_demo_main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &app_imports,
+    });
+    const demo = b.addExecutable(.{ .name = "zmeta-demo", .root_module = demo_mod });
+
+    b.installArtifact(demo);
+
     const run_step = b.step("run", "Run the todo server");
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
@@ -100,6 +127,11 @@ pub fn build(b: *std.Build) void {
     const run_car_cmd = b.addRunArtifact(zcar);
     run_car_step.dependOn(&run_car_cmd.step);
     run_car_cmd.step.dependOn(b.getInstallStep());
+
+    const run_demo_step = b.step("run-demo", "Run the zmeta demo app");
+    const run_demo_cmd = b.addRunArtifact(demo);
+    run_demo_step.dependOn(&run_demo_cmd.step);
+    run_demo_cmd.step.dependOn(b.getInstallStep());
 
     const zefx_tests = b.addTest(.{ .root_module = zefx_mod });
     const run_zefx_tests = b.addRunArtifact(zefx_tests);
@@ -129,6 +161,12 @@ pub fn build(b: *std.Build) void {
     const zcar_tests = b.addTest(.{ .root_module = zcar_mod });
     const run_zcar_tests = b.addRunArtifact(zcar_tests);
 
+    const demo_tests = b.addTest(.{ .root_module = demo_mod });
+    const run_demo_tests = b.addRunArtifact(demo_tests);
+
+    const gen_tests = b.addTest(.{ .root_module = gen_mod });
+    const run_gen_tests = b.addRunArtifact(gen_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_zefx_tests.step);
     test_step.dependOn(&run_forest_tests.step);
@@ -136,4 +174,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_zboard_tests.step);
     test_step.dependOn(&run_zmon_tests.step);
     test_step.dependOn(&run_zcar_tests.step);
+    test_step.dependOn(&run_demo_tests.step);
+    test_step.dependOn(&run_gen_tests.step);
 }
