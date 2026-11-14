@@ -32,7 +32,7 @@ pub fn Store(comptime T: type) type {
         /// The comparison runs at WRITE time, before the caller may
         /// recycle the old value's backing storage — slice-valued stores
         /// backed by reset-on-refresh arenas must keep stable storage or
-        /// skip `eq` (see mon_app's fmt_arena stores).
+        /// skip `eq` (see zmon's fmt_arena (apps/mon/app.zig) stores).
         pub const EqFn = *const fn (T, T) bool;
         pub const WatcherFn = *const fn (T) void;
         pub const CtxWatcherFn = *const fn (ctx: *anyopaque, T) void;

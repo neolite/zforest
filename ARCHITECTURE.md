@@ -1376,3 +1376,37 @@ the call site. Caveats recorded in the spike doc: no entities,
 components, loops or spread; whitespace-only runs containing newlines
 are dropped (same-line spaces preserved); generated type errors need
 the header-comment hop.
+
+## zcar + zmon on the `src/apps/` file-based convention (done)
+
+Completes the app-dir migration started with todo (`df1ccc6`): every
+app except zboard now lives under `src/apps/<name>/` with the full
+zmeta convention — `app.zig` (Deps + domain), `pages/index.zig`,
+`actions.zig` manifest, `zmeta.zig` shim, checked-in `gen/`.
+
+- **zcar** (`src/apps/car/`): `car_app.zig` split into `app.zig`
+  (CarDeps: vehicle cascade, cart, bookings, `mutate` event,
+  `on_<action>` handlers, cart math) + `car_data.zig` (static
+  catalogue) + `pages/index.zig` (the whole single-page view).
+  Rebuild+diff path unchanged — the skeleton's default render
+  pipeline applies untouched.
+- **zmon** (`src/apps/mon/`): `mon_app.zig` → `app.zig` keeping the
+  `.live_shared` archetype and ALL live render-path overrides
+  (`servePage`/`render`/`writeView`/`buildViewNodes`/`seedDom` —
+  the cached once-built tree pipeline); `mon_model.zig` moved
+  alongside; the dashboard view moved to `pages/index.zig`.
+  `viewNodes` now goes through generated `routes.viewNodes` into the
+  view arena — same single-build semantics.
+- Dispatch: hand-rolled `if/else` action matching replaced by
+  generated `actions.dispatch` → `Deps.on_<name>` handlers
+  (set_brand/set_model/set_year/toggle_svc/add_svc/book and the
+  seven zmon actions). Validation/error semantics preserved 1:1.
+- `zmeta.zig` app shims gained an `Archetype` export (mon declares
+  `.live_shared`); all four shims now mirror `zmeta/root.zig`.
+- `car_main.zig`/`mon_main.zig` import the new paths; old flat files
+  deleted (git tracks them as renames).
+
+zboard stays flat (`src/board*.zig`) deliberately: its render-group
+hooks predate the file-routing codegen and its routes are already
+hand-typed — migrating it is a separate decision, not part of this
+convention sweep.

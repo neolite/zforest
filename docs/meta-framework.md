@@ -28,11 +28,14 @@ zforest is server-authoritative UI in Zig 0.17.1:
 - `src/client.js` — ~200-line framework-free op applier + delegated
   `data-on-*` event → action POST plumbing. No app knowledge, no
   hydration, no router.
-- Apps: `todo_app.zig`/`car_app.zig` (per-session models, diff path),
-  `board.zig`+`board_app.zig`+`board_groups.zig` (shared SQLite-backed
-  `BoardModel`, `global_seq` fan-out, render groups sharing one
-  Dom/History/revision across N sessions), `mon_app.zig` (shared model
-  + per-session live-bound stores).
+- Apps: `src/apps/todo/` + `src/apps/car/` (per-session models, diff
+  path, file-based routing), `board.zig`+`board_app.zig`+
+  `board_groups.zig` (shared SQLite-backed `BoardModel`, `global_seq`
+  fan-out, render groups sharing one Dom/History/revision across N
+  sessions), `src/apps/mon/` (shared model + per-session live-bound
+  stores, `.live_shared`). All four apps run on the `zmeta.Session`
+  skeleton; todo/car/mon use the `src/apps/<name>/` file-based
+  routing convention (`pages/` + `actions.zig` + checked-in `gen/`).
 
 The transport invariants a meta-framework must preserve: sessions are
 `(cookie token, route)` — route IS part of session identity; every
@@ -403,7 +406,7 @@ Three session archetypes coexist today and a framework must let an
 app declare which without copy-paste:
 
 - **Per-session state** — todo/car: model fields live on `Session`,
-  `syncPull` is a no-op (todo_app.zig:143, car_app.zig:110).
+  `syncPull` is a no-op.
 - **Shared model + per-session view state** — board: module-global
   `board_app.model`, `syncPull` re-renders when a scope its route
   reads moved (`scope_seq` counters + `RenderGroup.isCurrent()`,
@@ -412,7 +415,7 @@ app declare which without copy-paste:
   `streamRev`/`streamHistory`/`membershipEpoch`, http.zig:47-59).
 - **Shared model + per-session live stores** — zmon: `MonModel`
   global, per-session stores refreshed under `batch`, `bindTree`
-  subscriptions (mon_app.zig:206-281).
+  subscriptions (`apps/mon/app.zig` `refreshStores`/`seedDom`).
 
 v0 answer: the generated `Session` skeleton takes the archetype as a
 manifest field and emits the right stubs (`syncPull` no-op vs
@@ -606,7 +609,8 @@ pipeline (membership sync + group render instead of `dom.reset` +
 `seedDom`) — landed on `feat/zmeta-grouped`, see ARCHITECTURE.md
 "zmeta: render-path overrides for grouped apps".
 This kills the ~150 lines of contract boilerplate every current app
-repeats (compare `todo_app.zig:60-160` vs `board_app.zig:86-200`).
+repeats (compare `apps/todo/app.zig` vs `board_app.zig` — the board
+app still hand-rolls what the skeleton now provides).
 It is the single biggest DX win and the lowest-risk piece: the
 contract is already stable and compile-enforced.
 

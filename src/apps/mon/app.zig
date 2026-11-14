@@ -17,12 +17,21 @@
 //! already pushed their ops during the notify phase — and the
 //! page/snapshot/seed pipelines are overridden to reuse the cached
 //! once-built tree (see the render-path overrides on `MonDeps`).
+//!
+//! zmeta app dir: `app.zig` holds `MonDeps` + the live render-path
+//! overrides, `pages/index.zig` the once-built dashboard view,
+//! `actions.zig` the manifest, `gen/` the checked-in codegen.
 
 const std = @import("std");
 const zefx = @import("zefx");
 const forest = @import("forest");
-const zmeta = @import("zmeta/root.zig");
+const zmeta = @import("zmeta.zig");
+const routes = @import("gen/routes.zig");
+const actions = @import("gen/actions.zig");
 const MonModel = @import("mon_model.zig").MonModel;
+
+pub const Route = routes.Route;
+pub const act = actions.act;
 
 /// The shared model, installed by mon_main before serve(). The ticker
 /// thread mutates under the model mutex; sessions read snapshots under
@@ -37,6 +46,14 @@ fn m() *MonModel {
 /// `onPing` reducer (registered by `MonDeps.wire`) bumps the patch
 /// revision in the pure phase.
 const Ping = struct {};
+
+fn isOk(bp: u64) bool {
+    return bp <= 500;
+}
+
+fn isBad(bp: u64) bool {
+    return bp > 500;
+}
 
 /// zmon domain state + graph handles — the zmeta `Deps` for the
 /// `.live_shared` archetype (docs/meta-framework.md §4.1/§5.3). The
@@ -53,6 +70,10 @@ pub const MonDeps = struct {
     pub const page_title = "zmon";
     pub const page_class = "app app-mon";
     pub const cookie_name = "zfxm";
+
+    /// Current typed route — written by the generated `routes.setRoute`
+    /// glue; single "/" page.
+    route: routes.Route = .{ .index = .{} },
 
     // Dashboard stores — strings formatted in refreshStores, slices into
     // fmt_arena (valid until the next refresh; every consumer refreshes
@@ -144,9 +165,19 @@ pub const MonDeps = struct {
         s.deps.ping.onReducer(s, &onPing);
     }
 
-    /// `Deps.validPath` — single-page app: only "/" is a page route.
+    /// Route validation + typed-route storage — generated glue.
+    pub fn setRoute(s: *Session, path: []const u8) bool {
+        return routes.setRoute(s, path);
+    }
+
+    /// Pure route pre-check — generated glue.
     pub fn validPath(path: []const u8) bool {
-        return std.mem.eql(u8, path, "/");
+        return routes.validPath(path);
+    }
+
+    /// Route-param gate — generated dispatch to page `prepare`s.
+    pub fn prepare(s: *Session, env: *const zmeta.Env) !void {
+        try routes.prepare(s, env);
     }
 
     /// `Deps.syncPull` — SSE-worker hook: when the shared model moved,
@@ -159,8 +190,7 @@ pub const MonDeps = struct {
         refreshAndPing(s);
     }
 
-    /// `Deps.dispatch` — whitelisted action entry — inject synthetic
-    /// requests so the dashboard moves without waiting for the ticker.
+    /// Whitelisted action entry — generated dispatch to `on_<name>`.
     pub fn dispatch(
         s: *Session,
         action: []const u8,
@@ -168,37 +198,102 @@ pub const MonDeps = struct {
         value: ?[]const u8,
         fields: ?*const std.json.ObjectMap,
     ) !void {
+        return actions.dispatch(s, action, arg, value, fields);
+    }
+
+    /// act.inject_ok — one synthetic 200 request.
+    pub fn on_inject_ok(
+        s: *Session,
+        arg: ?[]const u8,
+        value: ?[]const u8,
+        fields: ?*const std.json.ObjectMap,
+    ) !void {
+        _ = arg;
+        _ = value;
+        _ = fields;
+        const roll = beginAction(s);
+        m().record(.{ .ok = true, .lat_ms = 6.0 + @as(f64, @floatFromInt(roll % 30)), .method = "POST", .path = "/inject/ok", .status = 200 });
+        refreshAndPing(s);
+    }
+
+    /// act.inject_err — one synthetic 500 request.
+    pub fn on_inject_err(
+        s: *Session,
+        arg: ?[]const u8,
+        value: ?[]const u8,
+        fields: ?*const std.json.ObjectMap,
+    ) !void {
+        _ = arg;
+        _ = value;
+        _ = fields;
+        const roll = beginAction(s);
+        m().record(.{ .ok = false, .lat_ms = 250.0 + @as(f64, @floatFromInt(roll % 500)), .method = "POST", .path = "/inject/err", .status = 500 });
+        refreshAndPing(s);
+    }
+
+    /// act.inject_slow — one synthetic slow 200 request.
+    pub fn on_inject_slow(
+        s: *Session,
+        arg: ?[]const u8,
+        value: ?[]const u8,
+        fields: ?*const std.json.ObjectMap,
+    ) !void {
+        _ = arg;
+        _ = value;
+        _ = fields;
+        const roll = beginAction(s);
+        m().record(.{ .ok = true, .lat_ms = 700.0 + @as(f64, @floatFromInt(roll % 400)), .method = "POST", .path = "/inject/slow", .status = 200 });
+        refreshAndPing(s);
+    }
+
+    /// act.inject_storm — 400 synthetic requests at once.
+    pub fn on_inject_storm(
+        s: *Session,
+        arg: ?[]const u8,
+        value: ?[]const u8,
+        fields: ?*const std.json.ObjectMap,
+    ) !void {
+        _ = arg;
+        _ = value;
+        _ = fields;
+        _ = beginAction(s);
+        m().storm(400);
+        refreshAndPing(s);
+    }
+
+    /// act.ctl_rate / act.ctl_err / act.ctl_lat — traffic sliders;
+    /// `value` carries the percent, clamped inside the model.
+    pub fn on_ctl_rate(
+        s: *Session,
+        arg: ?[]const u8,
+        value: ?[]const u8,
+        fields: ?*const std.json.ObjectMap,
+    ) !void {
         _ = arg;
         _ = fields;
-        s.out_cookie = "";
-        var rb: [16]u8 = undefined;
-        s.io.random(&rb);
-        const roll = std.mem.readInt(u32, rb[0..4], .little);
-        if (std.mem.eql(u8, action, "inject_ok")) {
-            m().record(.{ .ok = true, .lat_ms = 6.0 + @as(f64, @floatFromInt(roll % 30)), .method = "POST", .path = "/inject/ok", .status = 200 });
-        } else if (std.mem.eql(u8, action, "inject_err")) {
-            m().record(.{ .ok = false, .lat_ms = 250.0 + @as(f64, @floatFromInt(roll % 500)), .method = "POST", .path = "/inject/err", .status = 500 });
-        } else if (std.mem.eql(u8, action, "inject_slow")) {
-            m().record(.{ .ok = true, .lat_ms = 700.0 + @as(f64, @floatFromInt(roll % 400)), .method = "POST", .path = "/inject/slow", .status = 200 });
-        } else if (std.mem.eql(u8, action, "inject_storm")) {
-            m().storm(400);
-        } else if (std.mem.eql(u8, action, "ctl_rate") or
-            std.mem.eql(u8, action, "ctl_err") or
-            std.mem.eql(u8, action, "ctl_lat"))
-        {
-            const v = value orelse return error.InvalidAction;
-            const n = std.fmt.parseInt(u32, v, 10) catch return error.InvalidAction;
-            const kind: MonModel.ParamKind = if (std.mem.eql(u8, action, "ctl_rate"))
-                .rate
-            else if (std.mem.eql(u8, action, "ctl_err"))
-                .err
-            else
-                .lat;
-            m().setParam(kind, n);
-        } else {
-            return error.InvalidAction;
-        }
-        refreshAndPing(s);
+        try ctlParam(s, .rate, value);
+    }
+
+    pub fn on_ctl_err(
+        s: *Session,
+        arg: ?[]const u8,
+        value: ?[]const u8,
+        fields: ?*const std.json.ObjectMap,
+    ) !void {
+        _ = arg;
+        _ = fields;
+        try ctlParam(s, .err, value);
+    }
+
+    pub fn on_ctl_lat(
+        s: *Session,
+        arg: ?[]const u8,
+        value: ?[]const u8,
+        fields: ?*const std.json.ObjectMap,
+    ) !void {
+        _ = arg;
+        _ = fields;
+        try ctlParam(s, .lat, value);
     }
 
     // ── render-path overrides ────────────────────────────────────
@@ -274,9 +369,28 @@ pub const Session = zmeta.Session(MonDeps);
 
 // ── session-state helpers (file scope, take *Session) ─────────
 
+/// Shared action prelude: clear any pending Set-Cookie and roll the
+/// jitter source the inject handlers use for latencies.
+fn beginAction(s: *Session) u32 {
+    s.out_cookie = "";
+    var rb: [16]u8 = undefined;
+    s.io.random(&rb);
+    return std.mem.readInt(u32, rb[0..4], .little);
+}
+
 /// ping reducer — bumps the revision in the pure phase.
 fn onPing(s: *Session, _: Ping) void {
     s.bumpSeq();
+}
+
+/// Shared ctl_* validation: `value` must parse as u32; the model
+/// clamps the range. Then the usual refresh+ping.
+fn ctlParam(s: *Session, kind: MonModel.ParamKind, value: ?[]const u8) !void {
+    _ = beginAction(s);
+    const v = value orelse return error.InvalidAction;
+    const n = std.fmt.parseInt(u32, v, 10) catch return error.InvalidAction;
+    m().setParam(kind, n);
+    refreshAndPing(s);
 }
 
 /// Store refresh + ping under ONE batch boundary: ~14 individual
@@ -323,123 +437,14 @@ fn refreshStores(s: *Session) void {
 }
 
 /// The session's view tree — built once into `deps.view_arena` and
-/// reused for SSR, snapshots and live bindings.
+/// reused for SSR, snapshots and live bindings. The generated
+/// `routes.viewNodes` dispatches to `pages/index.zig`'s `view`.
 fn viewNodes(s: *Session) []const forest.Node {
     if (s.deps.view_nodes) |n| return n;
     const a = s.deps.view_arena.allocator();
-    s.deps.view_nodes = buildView(a, s);
+    var env = zmeta.Env{};
+    s.deps.view_nodes = routes.viewNodes(a, s, &env);
     return s.deps.view_nodes.?;
-}
-
-// ── view ──────────────────────────────────────────────────────────
-
-fn card(a: std.mem.Allocator, id: []const u8, label: []const u8, val: anytype) forest.Node {
-    return forest.el(a, .div, .{ .class = "card" }, .{
-        forest.el(a, .div, .{ .class = "clabel" }, label),
-        forest.el(a, .div, .{ .class = "cval", .id = id, .text = val }, .{}),
-    });
-}
-
-fn btn(a: std.mem.Allocator, action: []const u8, label: []const u8) forest.Node {
-    return forest.el(a, .button, .{ .class = "btn", .on = .{ .click = action } }, label);
-}
-
-/// Range slider bound to a model param via `change` → POST /action.
-fn ctl(
-    a: std.mem.Allocator,
-    label: []const u8,
-    action: []const u8,
-    min: u32,
-    max: u32,
-    step: u32,
-    val: anytype,
-) forest.Node {
-    return forest.el(a, .div, .{ .class = "ctl" }, .{
-        forest.el(a, .span, .{ .class = "ctl-name" }, label),
-        forest.el(a, .input, .{
-            .type = "range",
-            .min = min,
-            .max = max,
-            .step = step,
-            .on = .{ .change = action },
-        }, .{}),
-        forest.el(a, .span, .{ .class = "ctl-val", .text = val }, .{}),
-    });
-}
-
-/// Sparkline card: label + SVG polyline whose `points` attr is a live
-/// leaf bound to a store (attr op per refresh — no rebuild).
-fn spark(a: std.mem.Allocator, id: []const u8, label: []const u8, pts: anytype) forest.Node {
-    return forest.el(a, .div, .{ .class = "spark" }, .{
-        forest.el(a, .div, .{ .class = "clabel" }, label),
-        forest.el(a, .svg, .{ .class = "spark-svg", .viewBox = "0 0 120 28" }, .{
-            forest.el(a, .polyline, .{ .id = id, .class = "spark-line", .points = pts, .fill = "none" }, .{}),
-        }),
-    });
-}
-
-fn errPctText(a: std.mem.Allocator, bp: u64) []const u8 {
-    return std.fmt.allocPrint(a, "{d}.{d}%", .{ bp / 100, bp % 100 }) catch "—";
-}
-
-fn statusText(_: std.mem.Allocator, bp: u64) []const u8 {
-    return if (bp > 500) "DEGRADED" else "HEALTHY";
-}
-
-fn isOk(bp: u64) bool {
-    return bp <= 500;
-}
-
-fn isBad(bp: u64) bool {
-    return bp > 500;
-}
-
-fn buildView(a: std.mem.Allocator, s: *Session) []const forest.Node {
-    const d = &s.deps;
-    const nodes = a.alloc(forest.Node, 1) catch @panic("OOM");
-    nodes[0] = forest.el(a, .div, .{ .class = "mon" }, .{
-        forest.el(a, .div, .{ .class = "mon-head" }, .{
-            forest.el(a, .span, .{ .class = "mon-title" }, "zmon — live ops"),
-            // Structural fine-graining: the pill mounts/unmounts live via
-            // a `variant` key bound to derived stores — no rebuild.
-            forest.variant(a, .{ .id = "mon-pill-ok" }, d.st_ok, .{
-                forest.el(a, .span, .{ .class = "mon-pill ok" }, "HEALTHY"),
-            }),
-            forest.variant(a, .{ .id = "mon-pill-bad" }, d.st_bad, .{
-                forest.el(a, .span, .{ .class = "mon-pill bad" }, "DEGRADED"),
-            }),
-        }),
-        forest.el(a, .div, .{ .class = "mon-grid" }, .{
-            card(a, "mon-rps", "req/s", d.st_rps_s),
-            card(a, "mon-err", "error rate", forest.computed(d.st_err_bp, errPctText)),
-            card(a, "mon-lat", "avg latency", d.st_lat_s),
-            card(a, "mon-total", "total reqs", d.st_total_s),
-            card(a, "mon-up", "uptime", d.st_up_s),
-            card(a, "mon-status", "status", forest.computed(d.st_err_bp, statusText)),
-        }),
-        forest.el(a, .div, .{ .class = "mon-controls" }, .{
-            ctl(a, "traffic", "ctl_rate", 0, 500, 10, d.st_p_rate),
-            ctl(a, "errors", "ctl_err", 0, 3000, 50, d.st_p_err),
-            ctl(a, "latency", "ctl_lat", 0, 400, 10, d.st_p_lat),
-        }),
-        forest.el(a, .div, .{ .class = "mon-sparks" }, .{
-            spark(a, "sp-rps", "req/s", d.st_sp_rps),
-            spark(a, "sp-err", "errors %", d.st_sp_err),
-            spark(a, "sp-lat", "latency ms", d.st_sp_lat),
-        }),
-        forest.el(a, .div, .{ .id = "feed", .class = "feed", .text = d.st_feed }, .{}),
-        forest.el(a, .div, .{ .class = "mon-logwrap" }, .{
-            forest.el(a, .div, .{ .class = "clabel" }, "request log"),
-            forest.el(a, .div, .{ .id = "mon-log", .class = "mon-log", .text = d.st_log }, .{}),
-        }),
-        forest.el(a, .div, .{ .class = "mon-actions" }, .{
-            btn(a, "inject_ok", "ok req"),
-            btn(a, "inject_err", "err req"),
-            btn(a, "inject_slow", "slow req"),
-            btn(a, "inject_storm", "storm ×400"),
-        }),
-    });
-    return nodes;
 }
 
 // ── tests ───────────────────────────────────────────────────────

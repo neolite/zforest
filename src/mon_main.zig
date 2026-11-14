@@ -1,7 +1,7 @@
 const std = @import("std");
 const server = @import("server/http.zig");
-const mon_model = @import("mon_model.zig");
-const mon_app = @import("mon_app.zig");
+const mon_model = @import("apps/mon/mon_model.zig");
+const mon_app = @import("apps/mon/app.zig");
 
 /// Parse the optional `bind-ip` arg: a dotted IPv4 literal, or loopback
 /// for anything unparsable (safe default for a demo server).
@@ -36,6 +36,6 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test {
-    _ = @import("mon_model.zig");
-    _ = @import("mon_app.zig");
+    _ = @import("apps/mon/mon_model.zig");
+    _ = @import("apps/mon/app.zig");
 }
