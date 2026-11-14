@@ -6,9 +6,22 @@
 //! SSE worker calls `syncPull()` every 50 ms and re-renders (a no-op diff
 //! for sessions whose route doesn't show the change), then publishes the
 //! batch to that session's history — so one POST reaches every open tab.
+//!
+//! zmeta migration: `Session` is the `.shared_model` archetype on the
+//! `zmeta.Session(Deps)` skeleton — `BoardDeps` carries the per-session
+//! state (parsed route, reply target, sort, `zfxu` identity, seen
+//! cursor, render-group membership, the `ping` event) while the skeleton
+//! owns the transport contract (app/seq/dom/log/history/arena/CSRF).
+//! `board_groups.zig` stays board-owned and calls
+//! `board_app.Session.scopeForRoute`/`scopeVersion` as statics, so
+//! `Session` is hand-declared with the skeleton's exact field list and
+//! aliases the skeleton's generic method bodies rather than being
+//! `pub const Session = zmeta.Session(BoardDeps)` verbatim — see the
+//! comment above `Session` below and ARCHITECTURE.md.
 const std = @import("std");
 const zefx = @import("zefx");
 const forest = @import("forest");
+const zmeta = @import("zmeta/root.zig");
 const board = @import("board.zig");
 const board_groups = @import("board_groups.zig");
 const History = @import("server/history.zig").History;
@@ -81,19 +94,35 @@ pub fn parseRoute(path: []const u8) ?Route {
     return null;
 }
 
-/// One browser session: route + reply target + user identity on top of an
-/// isolated zefx graph and DOM patch state (same skeleton as todo.Session).
-pub const Session = struct {
-    /// Session contract for the generic server (see server/http.zig).
+/// Flush-trigger payload — every mutation emits it; the `onPing`
+/// reducer (registered by `BoardDeps.wire`) bumps the patch revision in
+/// the pure phase and the skeleton's after-flush hook renders.
+const Ping = struct {};
+
+/// `zfxu` anonymous-identity cookie — picked up by `Deps.readCookies`
+/// and minted into `Session.out_cookie` on first POST.
+pub const user_cookie_name = "zfxu";
+
+/// Board domain state + graph handles — the zmeta `Deps` for the
+/// `.shared_model` archetype (docs/meta-framework.md §4.1/§5.3). The
+/// `Session` skeleton owns the transport contract (app/seq/dom/log/
+/// history/arena/CSRF/route path); everything domain-specific — the
+/// parsed route, inline-reply target, sort preference, `zfxu` identity,
+/// seen cursor, render-group membership, and the `ping` event — lives
+/// here on `s.deps`. The shared `BoardModel` and the `board_groups`
+/// registry stay module-global (app-owned), exactly as before.
+pub const BoardDeps = struct {
+    /// §4.1 archetype — module-global model + per-session view state.
+    pub const archetype: zmeta.Archetype = .shared_model;
+    /// Page <title> / <main> class / session cookie — forwarded to the
+    /// server contract through `Session`.
     pub const page_title = "zboard";
     pub const page_class = "app app-board";
     pub const cookie_name = "zfxb";
-    pub const user_cookie_name = "zfxu";
 
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    app: zefx.App,
-
+    /// Parsed route — written by `Deps.setRoute`; read by the view and
+    /// the render-group key. The raw path string lives on
+    /// `Session.route` (skeleton-owned, feeds `Env.route`).
     route: Route = .home,
     /// Comment id the inline reply form is mounted under (per-session).
     reply_to: ?u64 = null,
@@ -101,9 +130,9 @@ pub const Session = struct {
     sort: Sort = .new,
     /// zfxu cookie value — the anonymous poster identity ("" = anonymous).
     user_token: []u8 = &.{},
-    /// Scratch for the Set-Cookie value emitted on the minting POST.
+    /// Scratch for the Set-Cookie value emitted on the minting POST —
+    /// `Session.out_cookie` points into it (one-shot per response).
     out_cookie_buf: [600]u8 = undefined,
-    out_cookie: []const u8 = &.{},
     /// Last `model.global_seq` this session rendered — syncPull's cursor
     /// for UNGROUPED (never page-served) sessions; grouped sessions dedup
     /// on their group's `last_rendered_seq` instead.
@@ -112,7 +141,7 @@ pub const Session = struct {
     /// sessions that never served a page keep the solo diff path.
     attached: bool = false,
     /// Render-group membership (board_groups.zig): sessions with equal
-    /// (route, reply_to, resolved name) share one Dom/history/revision.
+    /// (route, reply_to, resolved name, sort) share one Dom/history/rev.
     group: ?*board_groups.RenderGroup = null,
     /// Bumped on every stream-INCOMPATIBLE group transition — join of a
     /// foreign namespace, first attach, group recreation — the SSE
@@ -123,88 +152,39 @@ pub const Session = struct {
     /// (Render groups v2).
     membership_epoch: u64 = 0,
 
+    /// Flush trigger: every mutation emits it; `onPing` bumps `seq` in
+    /// the pure phase and the skeleton's after-flush hook renders.
     ping: *zefx.Event(Ping),
-    seq: *zefx.Store(u64),
 
-    dom: forest.Dom,
-    log: forest.PatchLog,
-    history: History,
-    render_arena: std.heap.ArenaAllocator,
-    csrf_token: []u8 = &.{},
-    /// Store-stamped incarnation (see the Session contract in
-    /// server/http.zig): distinguishes this session from a previous one
-    /// evicted+recreated under the same (cookie token, route) key.
-    incarnation: u64 = 0,
-
-    const Ping = struct {};
-
-    pub fn create(gpa: std.mem.Allocator, io: std.Io) *Session {
-        return createSession(gpa, io);
+    /// `Deps.init` — create the graph handles on the session's engine.
+    /// `seq` already exists (skeleton-owned); `wire` registers the
+    /// reducer next.
+    pub fn init(s: *Session) BoardDeps {
+        return .{ .ping = s.app.createEvent(Ping) };
     }
 
-    pub fn deinit(self: *Session) void {
+    /// `Deps.deinit` — release render-group membership, then free the
+    /// minted identity. Runs before the skeleton tears down
+    /// dom/log/history/arena/app (original ordering preserved).
+    pub fn deinit(s: *Session) void {
         // Release group membership first — the last leaver destroys the
         // group; eviction must not corrupt shared group state.
-        if (self.group) |g| board_groups.leave(self.gpa, g);
-        self.group = null;
-        if (self.csrf_token.len != 0) self.gpa.free(self.csrf_token);
-        if (self.user_token.len != 0) self.gpa.free(self.user_token);
-        self.dom.deinit();
-        self.log.deinit();
-        self.history.deinit();
-        self.render_arena.deinit();
-        self.app.deinit();
-        self.gpa.destroy(self);
+        if (s.deps.group) |g| board_groups.leave(s.gpa, g);
+        s.deps.group = null;
+        if (s.deps.user_token.len != 0) s.gpa.free(s.deps.user_token);
     }
 
-    pub fn setCsrf(self: *Session, token: []u8) void {
-        if (self.csrf_token.len != 0) self.gpa.free(self.csrf_token);
-        self.csrf_token = token;
+    /// `Deps.wire` — pure-phase reducers ONLY. The skeleton installs the
+    /// render after-flush hook itself after this returns, so board must
+    /// not re-register it (the hand-rolled Session used to).
+    pub fn wire(s: *Session) void {
+        s.deps.ping.onReducer(s, &onPing);
     }
 
-    /// Pick up the `zfxu` user cookie before dispatch (called by the
-    /// server with the raw Cookie header on every /action POST).
-    pub fn readCookies(self: *Session, cookie_hdr: ?[]const u8) void {
-        const h = cookie_hdr orelse return;
-        var it = std.mem.splitScalar(u8, h, ';');
-        while (it.next()) |part| {
-            const kv = std.mem.trim(u8, part, " \t");
-            const prefix = user_cookie_name ++ "=";
-            if (std.mem.startsWith(u8, kv, prefix)) {
-                const v = kv[prefix.len..];
-                if (v.len != 0 and self.user_token.len == 0) {
-                    self.user_token = self.gpa.dupe(u8, v) catch @panic("OOM");
-                }
-                return;
-            }
-        }
-    }
-
-    /// Every POST needs a resolvable identity: mint on first contact, or
-    /// heal a cookie token that has no users row (db reset / forged).
-    fn ensureUser(self: *Session) !void {
-        if (self.user_token.len == 0) {
-            var rb: [16]u8 = undefined;
-            self.io.random(&rb);
-            const tok = std.fmt.allocPrint(self.gpa, "{x}", .{std.mem.readInt(u64, rb[0..8], .little)}) catch @panic("OOM");
-            errdefer self.gpa.free(tok);
-            _ = try m().ensureUser(tok);
-            self.out_cookie = std.fmt.bufPrint(&self.out_cookie_buf, "{s}={s}; Path=/; SameSite=Lax", .{ user_cookie_name, tok }) catch @panic("cookie buf too small");
-            self.user_token = tok;
-            return;
-        }
-        if (m().userName(self.user_token) == null) {
-            _ = try m().ensureUser(self.user_token);
-        }
-    }
-
-    // ── routing ────────────────────────────────────────────────────
-
-    pub fn validPath(path: []const u8) bool {
-        return parseRoute(path) != null;
-    }
-
-    pub fn setRoute(self: *Session, path: []const u8) bool {
+    /// `Deps.setRoute` — parse + dangling-id gate, then store the parsed
+    /// route and clear the inline-reply target. The skeleton stores the
+    /// raw path for `Env.route` itself on success.
+    pub fn setRoute(s: *Session, path: []const u8) bool {
         const r = parseRoute(path) orelse return false;
         // Well-formed but dangling ids get a real 404, not an empty page.
         switch (r) {
@@ -212,46 +192,352 @@ pub const Session = struct {
             .comment => |cid| if (m().comment(cid) == null) return false,
             else => {},
         }
-        self.route = r;
-        self.reply_to = null;
+        s.deps.route = r;
+        s.deps.reply_to = null;
         return true;
     }
 
-    /// Full-page render for a navigating client: resolve the route, sync
-    /// render-group membership, bring the group current with the model,
-    /// then write the page body. The shared group Dom is NEVER reset or
-    /// reseeded here — a fresh group was seeded privately at join, and an
-    /// existing group's Dom already matches the view this page ships.
-    pub fn servePage(self: *Session, path: []const u8, writer: anytype) !bool {
-        if (!self.setRoute(path)) return false;
-        self.attached = true;
-        self.syncMembership();
-        self.ensureGroupCurrent();
-        try self.writeView(writer);
+    /// `Deps.validPath` — static route pre-check run before a session is
+    /// minted (parseable shape only; dangling ids still 404 inside
+    /// servePage's setRoute).
+    pub fn validPath(path: []const u8) bool {
+        return parseRoute(path) != null;
+    }
+
+    /// `Deps.readCookies` — pick up the `zfxu` user cookie before
+    /// dispatch/page render (the server calls it with the raw Cookie
+    /// header on every /action POST and page GET).
+    pub fn readCookies(s: *Session, cookie_hdr: ?[]const u8) void {
+        const h = cookie_hdr orelse return;
+        var it = std.mem.splitScalar(u8, h, ';');
+        while (it.next()) |part| {
+            const kv = std.mem.trim(u8, part, " \t");
+            const prefix = user_cookie_name ++ "=";
+            if (std.mem.startsWith(u8, kv, prefix)) {
+                const v = kv[prefix.len..];
+                if (v.len != 0 and s.deps.user_token.len == 0) {
+                    s.deps.user_token = s.gpa.dupe(u8, v) catch @panic("OOM");
+                }
+                return;
+            }
+        }
+    }
+
+    /// `Deps.servePage` — the grouped page pipeline: setRoute →
+    /// render-group membership sync → ensure-group-current → writeView.
+    /// NO dom.reset/seedDom — the shared Dom lives in the render group;
+    /// a fresh group was seeded privately at join and an existing
+    /// group's Dom already matches the view this page ships.
+    pub fn servePage(s: *Session, path: []const u8, writer: anytype) !bool {
+        if (!s.setRoute(path)) return false;
+        s.deps.attached = true;
+        syncMembership(s);
+        ensureGroupCurrent(s);
+        try s.writeView(writer);
         return true;
     }
 
-    /// SSE-worker hook: when the shared model moved past what the session
-    /// (or its group) last rendered, ping → flush → render. Grouped
-    /// sessions dedup on the GROUP's `last_rendered_seq`, so N members on
-    /// one group cost one buildView+diff per model version.
-    pub fn syncPull(self: *Session) void {
-        if (self.group) |g| {
+    /// `Deps.syncPull` — SSE-worker hook: when the shared model moved
+    /// past what the session (or its group) last rendered, ping → flush
+    /// → render. Grouped sessions dedup on the GROUP's
+    /// `last_rendered_seq`, so N members on one group cost one
+    /// buildView+diff per model version.
+    pub fn syncPull(s: *Session) void {
+        if (s.deps.group) |g| {
             // Dirty-only dispatch: ping only when a scope this group's
             // route reads actually bumped (or a fork forced a render).
             if (g.isCurrent()) return;
-            self.ping.emit(.{});
+            s.deps.ping.emit(.{});
             return;
         }
-        const rendered = self.seen_seq;
+        const rendered = s.deps.seen_seq;
         if (m().global_seq.load(.seq_cst) == rendered) return;
-        self.ping.emit(.{});
+        s.deps.ping.emit(.{});
+    }
+
+    // ── render-group stream hooks (all-or-nothing set) ──────────
+    // Declared on Deps → the skeleton emits them on the grouped
+    // Session variant, which is what flips server/http.zig's
+    // @hasDecl probes onto the grouped publish/fetch path.
+
+    /// Drain the pending rendered batch into retained history. Grouped
+    /// sessions publish through their group (the render hook already
+    /// did — this is the safety net); unattached sessions keep the
+    /// inline log→history path the generic server used before grouping.
+    pub fn publishPending(s: *Session) void {
+        if (s.deps.group) |g| {
+            g.publish();
+            return;
+        }
+        if (s.seq.get() <= s.history.latest_rev) {
+            s.log.clear();
+            return;
+        }
+        var jaw: std.Io.Writer.Allocating = .init(s.gpa);
+        defer jaw.deinit();
+        s.log.writeJson(&jaw.writer) catch @panic("OOM");
+        s.history.publish(s.seq.get(), jaw.toOwnedSlice() catch @panic("OOM"));
+        s.log.clear();
+    }
+
+    /// Revision subscribers (SSE cursor, snapshot `rev`, ACK) should
+    /// track — the group's local revision when grouped, else `seq`.
+    pub fn streamRev(s: *Session) u64 {
+        return if (s.deps.group) |g| g.rev else s.seq.get();
+    }
+
+    /// History ring subscribers fetch from — the group's when grouped.
+    pub fn streamHistory(s: *Session) *History {
+        return if (s.deps.group) |g| &g.history else &s.history;
+    }
+
+    /// Membership epoch for the SSE stream: bumped on stream-incompatible
+    /// group transitions; any change forces a snapshot + revision adopt.
+    /// Clone-fork transitions keep the epoch — the forked group continues
+    /// the same rev/history lineage, so the cursor stays valid.
+    pub fn membershipEpoch(s: *Session) u64 {
+        return s.deps.membership_epoch;
+    }
+
+    /// `Deps.dispatch` — whitelisted action entry point: the DOM event
+    /// protocol (`action`, `arg`, `value`, `fields`), verbatim port of
+    /// the hand-rolled Session.dispatch.
+    pub fn dispatch(
+        s: *Session,
+        action: []const u8,
+        arg: ?[]const u8,
+        value: ?[]const u8,
+        fields: ?*const std.json.ObjectMap,
+    ) !void {
+        _ = value;
+        // `out_cookie` is a one-shot: the server emits it on this response
+        // only — later POSTs must not re-send the Set-Cookie header.
+        s.out_cookie = "";
+        // Every POST establishes identity on first contact.
+        try ensureUser(s);
+
+        if (std.mem.eql(u8, action, "post")) {
+            const f = fields orelse return error.InvalidAction;
+            const slug = fieldStr(f, "board") orelse return error.InvalidAction;
+            const text = fieldStr(f, "text") orelse return error.InvalidAction;
+            _ = try m().addPost(slug, s.deps.user_token, text);
+            s.deps.ping.emit(.{});
+        } else if (std.mem.eql(u8, action, "comment")) {
+            const f = fields orelse return error.InvalidAction;
+            const post_id = fieldU64(f, "post") orelse return error.InvalidAction;
+            const parent = fieldU64(f, "parent");
+            const text = fieldStr(f, "text") orelse return error.InvalidAction;
+            _ = try m().addComment(post_id, parent, s.deps.user_token, text);
+            s.deps.reply_to = null;
+            s.deps.ping.emit(.{});
+        } else if (std.mem.eql(u8, action, "reply")) {
+            const a = arg orelse return error.InvalidAction;
+            const cid = std.fmt.parseInt(u64, a, 10) catch return error.InvalidAction;
+            if (m().comment(cid) == null) return error.CommentNotFound;
+            s.deps.reply_to = cid;
+            s.deps.ping.emit(.{});
+        } else if (std.mem.eql(u8, action, "cancel_reply")) {
+            s.deps.reply_to = null;
+            s.deps.ping.emit(.{});
+        } else if (std.mem.eql(u8, action, "sort")) {
+            const a = arg orelse return error.InvalidAction;
+            if (std.mem.eql(u8, a, "top")) {
+                s.deps.sort = .top;
+            } else if (std.mem.eql(u8, a, "new")) {
+                s.deps.sort = .new;
+            } else return error.InvalidAction;
+            s.deps.ping.emit(.{});
+        } else if (std.mem.eql(u8, action, "like")) {
+            const a = arg orelse return error.InvalidAction;
+            if (a.len < 2) return error.InvalidAction;
+            const kind: board.LikeKind = switch (a[0]) {
+                'p' => .post,
+                'c' => .comment,
+                else => return error.InvalidAction,
+            };
+            const target = std.fmt.parseInt(u64, a[1..], 10) catch return error.InvalidAction;
+            _ = try m().toggleLike(kind, target, s.deps.user_token);
+            s.deps.ping.emit(.{});
+        } else {
+            return error.InvalidAction;
+        }
+    }
+
+    // ── render-path overrides ────────────────────────────────────
+    // Grouped sessions replace the whole page pipeline AND the flush
+    // render; writeView/buildViewNodes/seedDom are overridden too so no
+    // skeleton default branch — which would resolve the skeleton's
+    // PRIVATE viewEnv/render decls on this foreign self type — is ever
+    // analyzed through an alias.
+
+    /// `Deps.render` — the after-flush render, reached through the
+    /// skeleton-installed hook. Grouped path: re-key first (reply_to/
+    /// identity may have changed inside dispatch), then render+publish
+    /// through the group — deduped on `last_rendered_seq`, so member
+    /// pings after the first see the group already current. Solo path:
+    /// sessions that never served a page (tests, dead routes) keep the
+    /// original per-session diff.
+    pub fn render(s: *Session) void {
+        if (s.deps.attached) {
+            syncMembership(s);
+            if (s.deps.group) |g| {
+                g.render();
+                g.publish();
+                return;
+            }
+        }
+        _ = s.render_arena.reset(.retain_capacity);
+        const a = s.render_arena.allocator();
+        forest.diff(a, buildView(a, viewEnv(s)), &s.dom, &s.log);
+        s.log.revision = s.seq.get();
+    }
+
+    /// `Deps.writeView` — render the `<main>` inner content for the
+    /// initial page.
+    pub fn writeView(s: *Session, writer: anytype) !void {
+        _ = s.render_arena.reset(.retain_capacity);
+        const a = s.render_arena.allocator();
+        try forest.writeHtml(a, buildView(a, viewEnv(s)), writer);
+    }
+
+    /// `Deps.buildViewNodes` — the session's current view nodes for the
+    /// SSE snapshot writer (`forest.writeSnapshotOps` serializes them).
+    /// Stamps `seen_seq` through `viewEnv().seen` exactly like the
+    /// hand-rolled version — the §4.4 cursor split is preserved:
+    /// session-side builds write the SESSION cursor, and only the
+    /// render group's own seed/render builds (which call
+    /// `board_app.buildView` with the GROUP's ViewEnv,
+    /// `seen = &g.last_rendered_seq`) write the group cursor. Session
+    /// builds never touch `last_rendered_seq`.
+    pub fn buildViewNodes(s: *Session, a: std.mem.Allocator) []const forest.Node {
+        return buildView(a, viewEnv(s));
+    }
+
+    /// `Deps.seedDom` — solo-path helper: render + drop the patch log.
+    /// Grouped sessions never reach this through the pipeline (their
+    /// servePage override skips it and the group's Dom is seeded at
+    /// join); tests call it on unattached sessions only.
+    pub fn seedDom(s: *Session) void {
+        BoardDeps.render(s);
+        s.log.clear();
+    }
+
+    /// `Deps.view` — the contract view entry. Board overrides every
+    /// skeleton default that would call it, so this is the canonical
+    /// wrapper kept for contract completeness (and any future default
+    /// path): rebuild the board `ViewEnv` from `s.deps` — `Env` stays
+    /// the thin `{route}` v0 slice and is ignored here.
+    pub fn view(a: std.mem.Allocator, s: *Session, env: *const zmeta.Env) []const forest.Node {
+        _ = env;
+        return buildView(a, viewEnv(s));
+    }
+};
+
+/// The skeleton type `BoardDeps` instantiates — `SessionGrouped`
+/// because BoardDeps declares all four render-group stream hooks (the
+/// all-or-nothing set `server/http.zig`'s @hasDecl probes look for).
+const Skel = zmeta.Session(BoardDeps);
+
+/// One browser session — the full `server/http.zig` contract.
+///
+/// Why hand-declared instead of `pub const Session =
+/// zmeta.Session(BoardDeps)`: `board_groups.zig` (board-owned,
+/// unchanged by the migration) calls `Session.scopeForRoute`/
+/// `Session.scopeVersion` as STATIC decls on this type, and Zig cannot
+/// extend a type's namespace — the skeleton's SessionGrouped has a
+/// fixed decl list. So `Session` replicates the skeleton's exact field
+/// list and aliases every contract method from `Skel`: the method
+/// bodies live ONCE in `zmeta/session.zig`'s `SessionMethods` as
+/// generic `self: anytype` fns, so `pub const dispatch = Skel.dispatch`
+/// etc. instantiate against `*Session` exactly like they do against
+/// `*SessionGrouped`. The only additions are the two board-owned
+/// statics `board_groups` needs and the `viewEnv`/`render` compat decls
+/// (the skeleton keeps those private — provided here so no aliased
+/// default branch can resolve a missing decl). `create` mirrors the
+/// skeleton's `createSessionImpl`: contract fields → `Deps.init`/
+/// `Deps.wire` → the render after-flush hook LAST.
+pub const Session = struct {
+    // ── contract fields owned by the skeleton ─────────────────
+    // IDENTICAL to SessionGrouped's field list — the aliased
+    // SessionMethods bodies access them by name; `create` below
+    // initializes by field name like createSessionImpl does.
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    /// Per-session reactive graph — events/stores created by
+    /// `BoardDeps.init`/`wire` live here.
+    app: zefx.App,
+    /// Patch revision — the server's `seq.get()` contract field.
+    seq: *zefx.Store(u64),
+    /// App-owned model state + graph handles (the Deps contract).
+    deps: BoardDeps,
+
+    dom: forest.Dom,
+    log: forest.PatchLog,
+    /// Retained patch batches for SSE replay (see server/history.zig).
+    history: History,
+    /// Scratch space for the per-render view tree; reset each render.
+    render_arena: std.heap.ArenaAllocator,
+    /// Per-session CSRF token rendered into the page and verified on
+    /// POST. Owned by the session; set by the server at creation.
+    csrf_token: []u8 = &.{},
+    /// Store-stamped incarnation (see the Session contract in
+    /// server/http.zig): distinguishes this session from a previous
+    /// one evicted+recreated under the same (cookie token, route).
+    incarnation: u64 = 0,
+    /// Extra `Set-Cookie` header emitted on /action responses
+    /// ("" = none). For board this points into `deps.out_cookie_buf`.
+    out_cookie: []const u8 = &.{},
+    /// Last route path accepted by `setRoute` — the `Env.route` source.
+    /// Owned copy: request buffers die with the request.
+    route: []const u8 = "/",
+    route_owned: bool = false,
+
+    /// Page shell metadata — forwarded from BoardDeps (the skeleton
+    /// applies the same defaults when Deps doesn't declare them).
+    pub const page_title = BoardDeps.page_title;
+    pub const page_class = BoardDeps.page_class;
+    pub const cookie_name = BoardDeps.cookie_name;
+    /// §4.1 archetype — `.shared_model`.
+    pub const archetype = BoardDeps.archetype;
+
+    /// Wired session constructor (`io` is for entropy — `ensureUser`
+    /// mints the `zfxu` token from it).
+    pub fn create(gpa: std.mem.Allocator, io: std.Io) *Session {
+        const s = gpa.create(Session) catch @panic("OOM");
+        s.* = .{
+            .gpa = gpa,
+            .io = io,
+            .app = zefx.createApp(gpa),
+            .seq = undefined,
+            .deps = undefined,
+            .dom = forest.Dom.init(gpa),
+            .log = forest.PatchLog.init(gpa),
+            .history = History.init(gpa),
+            .render_arena = std.heap.ArenaAllocator.init(gpa),
+        };
+        s.seq = s.app.createStore(u64, 0);
+        s.deps = BoardDeps.init(s);
+        BoardDeps.wire(s);
+        // After every flush the graph is fully settled → BoardDeps.render
+        // (the skeleton installs this same hook for its own variants;
+        // board installs it directly because `Session` is hand-declared).
+        s.app.eng.onAfterFlush(.{
+            .ctx = @ptrCast(s),
+            .call = &struct {
+                fn render(raw: *anyopaque) void {
+                    const self: *Session = @ptrCast(@alignCast(raw));
+                    BoardDeps.render(self);
+                }
+            }.render,
+        });
+        return s;
     }
 
     /// The model scope a route's view reads — render groups gate
     /// buildView+diff on this version (dirty-only dispatch). Comment
     /// permalinks read their whole post's scope: a reply anywhere in
     /// the thread re-renders them (over-broad but correct).
+    /// Static: `board_groups.zig` calls it as `Session.scopeForRoute`.
     pub fn scopeForRoute(route: Route) u64 {
         return switch (route) {
             .home => board.SCOPE_HOME,
@@ -265,247 +551,137 @@ pub const Session = struct {
     }
 
     /// Current version of a scope key — groups compare it against
-    /// their `scope_seen` cursor.
+    /// their `scope_seen` cursor. Static like `scopeForRoute`.
     pub fn scopeVersion(key: u64) u64 {
         return m().scopeVersion(key);
     }
 
-    // ── render groups ──────────────────────────────────────────────
-
-    /// The session's current group-key inputs — recomputed on every
-    /// render so an identity minted by a (possibly failed) dispatch is
-    /// picked up BEFORE the group is chosen/rendered.
-    fn groupKey(self: *Session) board_groups.Key {
-        return .{ .route = self.route, .reply_to = self.reply_to, .name = nameOf(self.user_token), .sort = self.sort };
+    /// Skeleton-compat decls — the skeleton's SessionMethods bodies
+    /// resolve `self.viewEnv()`/`self.render()` on whatever self type
+    /// they're instantiated with; the real decls on SessionGrouped are
+    /// private, so provide pub equivalents here. Every Deps override is
+    /// declared, so the default branches that would call these are dead
+    /// — they exist only so a future skeleton change can't produce a
+    /// "no field or member named viewEnv" error through an alias.
+    pub fn viewEnv(self: *Session) zmeta.Env {
+        return .{ .route = self.route };
     }
 
-    /// Join/migrate the render group when the key changed. Bumps
-    /// `membership_epoch` on every STREAM-INCOMPATIBLE transition —
-    /// the SSE stream treats a bump as "send a snapshot and adopt the
-    /// new revision". Clone-on-fork transitions (new key absent from
-    /// the registry) do NOT bump: the forked group continues this
-    /// session's rev/history lineage, so patches keep flowing and
-    /// drafts survive (ARCHITECTURE.md "Render groups v2").
-    fn syncMembership(self: *Session) void {
-        if (!self.attached) return;
-        const key = self.groupKey();
-        var kbuf: [256]u8 = undefined;
-        const ks = board_groups.keyStringInto(&kbuf, key.route, key.reply_to, key.name, key.sort);
-        if (self.group) |g| {
-            if (std.mem.eql(u8, g.key_string, ks)) return;
-            if (!board_groups.contains(key)) {
-                // Absent key → clone-fork: new group inherits g's stream
-                // lineage (rev + history + tracked Dom). Epoch stays —
-                // the client's cursor remains valid on the new group.
-                self.group = board_groups.fork(self.gpa, g, key);
-                board_groups.leave(self.gpa, g);
-                return;
-            }
-            board_groups.leave(self.gpa, g);
-            self.group = null;
-        }
-        self.group = board_groups.join(self.gpa, key);
-        self.membership_epoch +%= 1;
+    pub fn render(self: *Session) void {
+        BoardDeps.render(self);
     }
 
-    /// Bring the group current with the shared model — render+publish
-    /// when `global_seq` moved. servePage calls this BEFORE writing SSR
-    /// so the group's tracked Dom always matches the shipped page.
-    fn ensureGroupCurrent(self: *Session) void {
-        const g = self.group orelse return;
-        g.render(); // no-op when last_rendered_seq == global_seq
-        g.publish(); // no-op when nothing pending
-    }
+    // ── contract methods — aliases into the skeleton ────────────
+    // Bodies written once in zmeta/session.zig's SessionMethods as
+    // `self: anytype` generics; each resolves the Deps.* hooks on
+    // BoardDeps and the contract fields on *Session.
 
-    fn viewEnv(self: *Session) ViewEnv {
-        return .{
-            .route = self.route,
-            .reply_to = self.reply_to,
-            .sort = self.sort,
-            .name = nameOf(self.user_token),
-            .seen = &self.seen_seq,
-        };
-    }
-
-    // ── optional server contract (grouped sessions) ────────────────
-    // See the Session contract in server/http.zig: sessions WITHOUT
-    // these decls keep the legacy per-session publish/fetch path.
-
-    /// Drain the pending rendered batch into retained history. Grouped
-    /// sessions publish through their group (the render hook already did
-    /// — this is the safety net); unattached sessions keep the inline
-    /// log→history path the generic server used before grouping.
-    pub fn publishPending(self: *Session) void {
-        if (self.group) |g| {
-            g.publish();
-            return;
-        }
-        if (self.seq.get() <= self.history.latest_rev) {
-            self.log.clear();
-            return;
-        }
-        var jaw: std.Io.Writer.Allocating = .init(self.gpa);
-        defer jaw.deinit();
-        self.log.writeJson(&jaw.writer) catch @panic("OOM");
-        self.history.publish(self.seq.get(), jaw.toOwnedSlice() catch @panic("OOM"));
-        self.log.clear();
-    }
-
-    /// Revision subscribers (SSE cursor, snapshot `rev`, ACK) should
-    /// track — the group's local revision when grouped, else `seq`.
-    pub fn streamRev(self: *Session) u64 {
-        return if (self.group) |g| g.rev else self.seq.get();
-    }
-
-    /// History ring subscribers fetch from — the group's when grouped.
-    pub fn streamHistory(self: *Session) *History {
-        return if (self.group) |g| &g.history else &self.history;
-    }
-
-    /// Membership epoch for the SSE stream: bumped on stream-incompatible
-    /// group transitions; any change forces a snapshot + revision adopt.
-    /// Clone-fork transitions keep the epoch — the forked group continues
-    /// the same rev/history lineage, so the cursor stays valid.
-    pub fn membershipEpoch(self: *Session) u64 {
-        return self.membership_epoch;
-    }
-
-    // ── actions ────────────────────────────────────────────────────
-
-    /// Whitelisted action entry point — same DOM event protocol as the
-    /// todo app: `action`, `arg`, `value`, `fields`.
-    pub fn dispatch(
-        self: *Session,
-        action: []const u8,
-        arg: ?[]const u8,
-        value: ?[]const u8,
-        fields: ?*const std.json.ObjectMap,
-    ) !void {
-        _ = value;
-        // `out_cookie` is a one-shot: the server emits it on this response
-        // only — later POSTs must not re-send the Set-Cookie header.
-        self.out_cookie = "";
-        // Every POST establishes identity on first contact.
-        try self.ensureUser();
-
-        if (std.mem.eql(u8, action, "post")) {
-            const f = fields orelse return error.InvalidAction;
-            const slug = fieldStr(f, "board") orelse return error.InvalidAction;
-            const text = fieldStr(f, "text") orelse return error.InvalidAction;
-            _ = try m().addPost(slug, self.user_token, text);
-            self.ping.emit(.{});
-        } else if (std.mem.eql(u8, action, "comment")) {
-            const f = fields orelse return error.InvalidAction;
-            const post_id = fieldU64(f, "post") orelse return error.InvalidAction;
-            const parent = fieldU64(f, "parent");
-            const text = fieldStr(f, "text") orelse return error.InvalidAction;
-            _ = try m().addComment(post_id, parent, self.user_token, text);
-            self.reply_to = null;
-            self.ping.emit(.{});
-        } else if (std.mem.eql(u8, action, "reply")) {
-            const a = arg orelse return error.InvalidAction;
-            const cid = std.fmt.parseInt(u64, a, 10) catch return error.InvalidAction;
-            if (m().comment(cid) == null) return error.CommentNotFound;
-            self.reply_to = cid;
-            self.ping.emit(.{});
-        } else if (std.mem.eql(u8, action, "cancel_reply")) {
-            self.reply_to = null;
-            self.ping.emit(.{});
-        } else if (std.mem.eql(u8, action, "sort")) {
-            const a = arg orelse return error.InvalidAction;
-            if (std.mem.eql(u8, a, "top")) {
-                self.sort = .top;
-            } else if (std.mem.eql(u8, a, "new")) {
-                self.sort = .new;
-            } else return error.InvalidAction;
-            self.ping.emit(.{});
-        } else if (std.mem.eql(u8, action, "like")) {
-            const a = arg orelse return error.InvalidAction;
-            if (a.len < 2) return error.InvalidAction;
-            const kind: board.LikeKind = switch (a[0]) {
-                'p' => .post,
-                'c' => .comment,
-                else => return error.InvalidAction,
-            };
-            const target = std.fmt.parseInt(u64, a[1..], 10) catch return error.InvalidAction;
-            _ = try m().toggleLike(kind, target, self.user_token);
-            self.ping.emit(.{});
-        } else {
-            return error.InvalidAction;
-        }
-    }
-
-    // ── graph wiring (called once per session) ──────────────────────
-
-    fn wire(self: *Session) void {
-        const eng = &self.app.eng;
-
-        // Pure-phase reducer: any ping bumps the revision; the after-flush
-        // hook then renders the DOM diff into `self.log`.
-        self.ping.onReducer(self, &Session.onPing);
-
-        // After every flush the graph is fully settled → render DOM diff.
-        eng.onAfterFlush(.{
-            .ctx = @ptrCast(self),
-            .call = &struct {
-                fn render(raw: *anyopaque) void {
-                    const s: *Session = @ptrCast(@alignCast(raw));
-                    s.render();
-                }
-            }.render,
-        });
-    }
-
-    /// ping reducer — bumps the revision in the pure phase.
-    fn onPing(self: *Session, _: Ping) void {
-        self.seq.set(self.seq.get() + 1);
-    }
-
-    // ── rendering ───────────────────────────────────────────────────
-
-    fn render(self: *Session) void {
-        if (self.attached) {
-            // Grouped path: re-key first (reply_to/identity may have
-            // changed inside dispatch), then render+publish through the
-            // group — deduped on `last_rendered_seq`, so member pings
-            // after the first see the group already current.
-            self.syncMembership();
-            if (self.group) |g| {
-                g.render();
-                g.publish();
-                return;
-            }
-        }
-        // Solo path: sessions that never served a page (tests, dead
-        // routes) keep the original per-session diff.
-        _ = self.render_arena.reset(.retain_capacity);
-        const a = self.render_arena.allocator();
-        forest.diff(a, buildView(a, self.viewEnv()), &self.dom, &self.log);
-        self.log.revision = self.seq.get();
-    }
-
-    /// Render the `<main>` inner content — used by the initial page.
-    pub fn writeView(self: *Session, writer: anytype) !void {
-        _ = self.render_arena.reset(.retain_capacity);
-        const a = self.render_arena.allocator();
-        try forest.writeHtml(a, buildView(a, self.viewEnv()), writer);
-    }
-
-    /// The session's current view nodes — the SSE snapshot writer
-    /// serializes them via `forest.writeSnapshotOps`.
-    pub fn buildViewNodes(self: *Session, a: std.mem.Allocator) []const forest.Node {
-        return buildView(a, self.viewEnv());
-    }
-
-    /// Seed tracked DOM state to match markup already emitted in the page,
-    /// so the first diff renders only real changes. Solo-path helper —
-    /// grouped sessions never call this (the group's Dom is seeded at
-    /// join and synced by render, never reset).
-    pub fn seedDom(self: *Session) void {
-        self.render();
-        self.log.clear();
-    }
+    pub const deinit = Skel.deinit;
+    pub const setCsrf = Skel.setCsrf;
+    pub const setRoute = Skel.setRoute;
+    pub const validPath = Skel.validPath;
+    pub const readCookies = Skel.readCookies;
+    pub const servePage = Skel.servePage;
+    pub const syncPull = Skel.syncPull;
+    pub const bumpSeq = Skel.bumpSeq;
+    pub const dispatch = Skel.dispatch;
+    pub const writeView = Skel.writeView;
+    pub const buildViewNodes = Skel.buildViewNodes;
+    pub const seedDom = Skel.seedDom;
+    /// Render-group stream hooks — present because Skel is the grouped
+    /// variant; this is what flips http.zig's @hasDecl probes.
+    pub const publishPending = Skel.publishPending;
+    pub const streamRev = Skel.streamRev;
+    pub const streamHistory = Skel.streamHistory;
+    pub const membershipEpoch = Skel.membershipEpoch;
 };
+
+// ── session-state helpers (file scope, take *Session) ─────────
+
+/// Every POST needs a resolvable identity: mint on first contact, or
+/// heal a cookie token that has no users row (db reset / forged).
+fn ensureUser(s: *Session) !void {
+    if (s.deps.user_token.len == 0) {
+        var rb: [16]u8 = undefined;
+        s.io.random(&rb);
+        const tok = std.fmt.allocPrint(s.gpa, "{x}", .{std.mem.readInt(u64, rb[0..8], .little)}) catch @panic("OOM");
+        errdefer s.gpa.free(tok);
+        _ = try m().ensureUser(tok);
+        s.out_cookie = std.fmt.bufPrint(&s.deps.out_cookie_buf, "{s}={s}; Path=/; SameSite=Lax", .{ user_cookie_name, tok }) catch @panic("cookie buf too small");
+        s.deps.user_token = tok;
+        return;
+    }
+    if (m().userName(s.deps.user_token) == null) {
+        _ = try m().ensureUser(s.deps.user_token);
+    }
+}
+
+/// The session's current group-key inputs — recomputed on every render
+/// so an identity minted by a (possibly failed) dispatch is picked up
+/// BEFORE the group is chosen/rendered.
+fn groupKey(s: *Session) board_groups.Key {
+    return .{ .route = s.deps.route, .reply_to = s.deps.reply_to, .name = nameOf(s.deps.user_token), .sort = s.deps.sort };
+}
+
+/// Join/migrate the render group when the key changed. Bumps
+/// `membership_epoch` on every STREAM-INCOMPATIBLE transition —
+/// the SSE stream treats a bump as "send a snapshot and adopt the
+/// new revision". Clone-on-fork transitions (new key absent from
+/// the registry) do NOT bump: the forked group continues this
+/// session's rev/history lineage, so patches keep flowing and
+/// drafts survive (ARCHITECTURE.md "Render groups v2").
+fn syncMembership(s: *Session) void {
+    if (!s.deps.attached) return;
+    const key = groupKey(s);
+    var kbuf: [256]u8 = undefined;
+    const ks = board_groups.keyStringInto(&kbuf, key.route, key.reply_to, key.name, key.sort);
+    if (s.deps.group) |g| {
+        if (std.mem.eql(u8, g.key_string, ks)) return;
+        if (!board_groups.contains(key)) {
+            // Absent key → clone-fork: new group inherits g's stream
+            // lineage (rev + history + tracked Dom). Epoch stays —
+            // the client's cursor remains valid on the new group.
+            s.deps.group = board_groups.fork(s.gpa, g, key);
+            board_groups.leave(s.gpa, g);
+            return;
+        }
+        board_groups.leave(s.gpa, g);
+        s.deps.group = null;
+    }
+    s.deps.group = board_groups.join(s.gpa, key);
+    s.deps.membership_epoch +%= 1;
+}
+
+/// Bring the group current with the shared model — render+publish
+/// when `global_seq` moved. servePage calls this BEFORE writing SSR
+/// so the group's tracked Dom always matches the shipped page.
+fn ensureGroupCurrent(s: *Session) void {
+    const g = s.deps.group orelse return;
+    g.render(); // no-op when last_rendered_seq == global_seq
+    g.publish(); // no-op when nothing pending
+}
+
+/// The board `ViewEnv` for session-side builds — `seen` is the
+/// session's own `seen_seq` cursor. The §4.4 split: only Dom-syncing
+/// builds stamp a cursor, and the render group's own seed/render builds
+/// go through `board_app.buildView` with the GROUP's ViewEnv
+/// (`seen = &g.last_rendered_seq`) instead — session builds never touch
+/// the group cursor.
+fn viewEnv(s: *Session) ViewEnv {
+    return .{
+        .route = s.deps.route,
+        .reply_to = s.deps.reply_to,
+        .sort = s.deps.sort,
+        .name = nameOf(s.deps.user_token),
+        .seen = &s.deps.seen_seq,
+    };
+}
+
+/// ping reducer — bumps the revision in the pure phase (registered by
+/// `BoardDeps.wire`; the skeleton's after-flush hook renders after).
+fn onPing(s: *Session, _: Ping) void {
+    s.bumpSeq();
+}
 
 // ── field helpers ─────────────────────────────────────────────────
 
@@ -949,24 +1125,11 @@ pub fn buildView(a: std.mem.Allocator, env: ViewEnv) []const forest.Node {
     return nodes;
 }
 
-/// Wired session constructor.
+/// Wired session constructor — test/server entry point (the real
+/// wiring lives in `Session.create`, mirroring the skeleton's
+/// `createSessionImpl`).
 pub fn createSession(gpa: std.mem.Allocator, io: std.Io) *Session {
-    const s = gpa.create(Session) catch @panic("OOM");
-    s.* = .{
-        .gpa = gpa,
-        .io = io,
-        .app = zefx.createApp(gpa),
-        .ping = undefined,
-        .seq = undefined,
-        .dom = forest.Dom.init(gpa),
-        .log = forest.PatchLog.init(gpa),
-        .history = History.init(gpa),
-        .render_arena = std.heap.ArenaAllocator.init(gpa),
-    };
-    s.ping = s.app.createEvent(Session.Ping);
-    s.seq = s.app.createStore(u64, 0);
-    s.wire();
-    return s;
+    return Session.create(gpa, io);
 }
 
 // ─────────────────────────────────────────────
@@ -1085,9 +1248,9 @@ test "post/comment actions mutate the shared model; reply_to is per-session" {
     try f.put(alloc, "board", .{ .string = "b" });
     try f.put(alloc, "text", .{ .string = "hello <b>board</b>" });
     try a.dispatch("post", null, null, &f);
-    try std.testing.expect(a.user_token.len != 0);
+    try std.testing.expect(a.deps.user_token.len != 0);
     try std.testing.expect(std.mem.startsWith(u8, a.out_cookie, "zfxu="));
-    try std.testing.expectEqualStrings("Anon#1", mm.userName(a.user_token).?);
+    try std.testing.expectEqualStrings("Anon#1", mm.userName(a.deps.user_token).?);
     try a.dispatch("post", null, null, &f);
     try std.testing.expectEqual(@as(usize, 0), a.out_cookie.len);
     try std.testing.expectEqual(@as(usize, 1), mm.users.count());
@@ -1103,10 +1266,10 @@ test "post/comment actions mutate the shared model; reply_to is per-session" {
     var idbuf: [24]u8 = undefined;
     const arg = std.fmt.bufPrint(&idbuf, "{d}", .{c1}) catch unreachable;
     try a.dispatch("reply", arg, null, null);
-    try std.testing.expectEqual(@as(?u64, c1), a.reply_to);
-    try std.testing.expect(b.reply_to == null);
+    try std.testing.expectEqual(@as(?u64, c1), a.deps.reply_to);
+    try std.testing.expect(b.deps.reply_to == null);
     try a.dispatch("cancel_reply", null, null, null);
-    try std.testing.expect(a.reply_to == null);
+    try std.testing.expect(a.deps.reply_to == null);
 
     // Nested reply via the parent field.
     var rf: std.json.ObjectMap = .empty;
@@ -1246,7 +1409,7 @@ test "syncPull re-renders only when global_seq moved" {
     const j = patchJson(s, alloc);
     defer alloc.free(j);
     try std.testing.expect(s.seq.get() > 0);
-    try std.testing.expect(s.seen_seq == mm.global_seq.load(.seq_cst));
+    try std.testing.expect(s.deps.seen_seq == mm.global_seq.load(.seq_cst));
     // The home latest list picked up the new post.
     try std.testing.expect(std.mem.indexOf(u8, j, "post-") != null);
 }
@@ -1300,7 +1463,7 @@ test "identity minted by a failed POST fans out via global_seq" {
     // zfxu identity (a model mutation → global_seq bump) before the
     // action itself is rejected without ping.emit.
     try std.testing.expectError(error.InvalidAction, s.dispatch("hack", null, null, null));
-    try std.testing.expect(s.user_token.len != 0);
+    try std.testing.expect(s.deps.user_token.len != 0);
     const seq1 = mm.global_seq.load(.seq_cst);
     try std.testing.expect(seq1 != 0);
 
@@ -1331,7 +1494,7 @@ test "heal path: cookie token with no users row bumps global_seq on POST" {
     s.seedDom();
 
     // Simulate a stale/forged zfxu cookie: token present, no users row.
-    s.user_token = try alloc.dupe(u8, "tok-forged");
+    s.deps.user_token = try alloc.dupe(u8, "tok-forged");
     const seq0 = mm.global_seq.load(.seq_cst);
     try std.testing.expectError(error.InvalidAction, s.dispatch("hack", null, null, null));
     try std.testing.expectEqualStrings("Anon#1", mm.userName("tok-forged").?);
@@ -1362,8 +1525,8 @@ test "render groups: equal keys share one group; one render per model bump" {
     try serveBoth(alloc, a, b, "/");
 
     // Same (route, reply_to=null, name="anon") → same group, 2 members.
-    const g = a.group.?;
-    try std.testing.expect(a.group.? == b.group.?);
+    const g = a.deps.group.?;
+    try std.testing.expect(a.deps.group.? == b.deps.group.?);
     try std.testing.expectEqual(@as(usize, 2), g.members);
     try std.testing.expectEqual(@as(u64, 0), g.rev); // seeded, nothing published
     try std.testing.expectEqual(@as(usize, 1), board_groups.registryCount());
@@ -1408,8 +1571,8 @@ test "render groups v2: reply_to fork clones the stream; A→B→A still snapsho
     const b = createSession(alloc, std.testing.io);
     defer b.deinit();
     try serveBoth(alloc, a, b, "/t/1");
-    const base = a.group.?;
-    try std.testing.expect(a.group.? == b.group.?);
+    const base = a.deps.group.?;
+    try std.testing.expect(a.deps.group.? == b.deps.group.?);
     const e0 = a.membershipEpoch();
 
     // Give the base group a published batch so its ring is non-empty —
@@ -1421,12 +1584,12 @@ test "render groups v2: reply_to fork clones the stream; A→B→A still snapsho
     // reply_to is a group-key input: setting it + ping migrates `a`.
     // The new key is ABSENT → clone-on-fork: epoch NOT bumped, the forked
     // group continues base's rev/history lineage → patches, no snapshot.
-    a.reply_to = c1.id;
-    a.ping.emit(.{});
+    a.deps.reply_to = c1.id;
+    a.deps.ping.emit(.{});
     try std.testing.expect(a.membershipEpoch() == e0);
-    const forked = a.group.?;
+    const forked = a.deps.group.?;
     try std.testing.expect(forked != base);
-    try std.testing.expect(b.group.? == base);
+    try std.testing.expect(b.deps.group.? == base);
     try std.testing.expectEqual(@as(usize, 2), board_groups.registryCount());
 
     // needs_render forced one diff even though global_seq didn't move
@@ -1442,10 +1605,10 @@ test "render groups v2: reply_to fork clones the stream; A→B→A still snapsho
 
     // A→B→A: the base key EXISTS (b holds it) → join path → epoch bump
     // → snapshot; the single-member fork is destroyed on leave.
-    a.reply_to = null;
-    a.ping.emit(.{});
+    a.deps.reply_to = null;
+    a.deps.ping.emit(.{});
     try std.testing.expect(a.membershipEpoch() == e0 + 1);
-    try std.testing.expect(a.group.? == base);
+    try std.testing.expect(a.deps.group.? == base);
     try std.testing.expectEqual(@as(usize, 1), board_groups.registryCount());
 }
 
@@ -1462,7 +1625,7 @@ test "render groups: minted identity re-keys the session out of the anon group" 
     const d = createSession(alloc, std.testing.io);
     defer d.deinit();
     try serveBoth(alloc, a, d, "/t/1");
-    const anon_group = a.group.?;
+    const anon_group = a.deps.group.?;
     const e0 = d.membershipEpoch();
 
     // First POST mints "Anon#1" — the resolved name is part of the group
@@ -1476,9 +1639,9 @@ test "render groups: minted identity re-keys the session out of the anon group" 
     // Absent key → clone-fork: the stream lineage continues, so the
     // epoch does NOT bump — the open SSE gets patches, not a snapshot.
     try std.testing.expect(d.membershipEpoch() == e0);
-    try std.testing.expect(d.group.? != anon_group);
-    try std.testing.expectEqualStrings("Anon#1", d.group.?.key.name);
-    try std.testing.expect(a.group.? == anon_group); // a unaffected
+    try std.testing.expect(d.deps.group.? != anon_group);
+    try std.testing.expectEqualStrings("Anon#1", d.deps.group.?.key.name);
+    try std.testing.expect(a.deps.group.? == anon_group); // a unaffected
     try std.testing.expectEqual(@as(usize, 2), board_groups.registryCount());
 }
 
@@ -1493,7 +1656,7 @@ test "render groups: last leave destroys the group; recreate gets a new incarnat
     defer aw.deinit();
     const a = createSession(alloc, std.testing.io);
     try std.testing.expect(try a.servePage("/", &aw.writer));
-    const g1 = a.group.?;
+    const g1 = a.deps.group.?;
     const inc1 = g1.incarnation;
     try std.testing.expectEqual(@as(usize, 1), board_groups.registryCount());
     a.deinit(); // manual — no defer, exercises release-on-deinit
@@ -1503,7 +1666,7 @@ test "render groups: last leave destroys the group; recreate gets a new incarnat
     defer b.deinit();
     _ = aw.writer.consumeAll();
     try std.testing.expect(try b.servePage("/", &aw.writer));
-    try std.testing.expect(b.group.?.incarnation != inc1);
+    try std.testing.expect(b.deps.group.?.incarnation != inc1);
     try std.testing.expectEqual(@as(usize, 1), board_groups.registryCount());
 }
 
@@ -1520,8 +1683,8 @@ test "render groups: unattached sessions keep the solo diff path" {
     defer s.deinit();
     s.seedDom();
     alloc.free(patchJson(s, alloc));
-    try std.testing.expect(s.group == null);
-    try std.testing.expect(!s.attached);
+    try std.testing.expect(s.deps.group == null);
+    try std.testing.expect(!s.deps.attached);
 
     var f: std.json.ObjectMap = .empty;
     defer f.deinit(alloc);
@@ -1618,25 +1781,25 @@ test "like/sort actions: per-account votes, sort re-keys the group" {
 
     // Sort action flips the per-session preference and re-keys the
     // render group: absent destination key → clone-fork, NO epoch bump.
-    try std.testing.expect(a.attached);
-    const epoch_before = a.membership_epoch;
+    try std.testing.expect(a.deps.attached);
+    const epoch_before = a.deps.membership_epoch;
     try a.dispatch("sort", "top", null, null);
-    try std.testing.expectEqual(Sort.top, a.sort);
+    try std.testing.expectEqual(Sort.top, a.deps.sort);
     try std.testing.expectError(error.InvalidAction, a.dispatch("sort", "bogus", null, null));
     // syncMembership runs on render; force one via publishPending path
     // is implicit in tests that call render — call it directly.
-    a.syncMembership();
-    try std.testing.expectEqual(epoch_before, a.membership_epoch);
-    try std.testing.expect(a.group != null);
-    try std.testing.expect(std.mem.indexOf(u8, a.group.?.key_string, "top") != null);
+    syncMembership(a);
+    try std.testing.expectEqual(epoch_before, a.deps.membership_epoch);
+    try std.testing.expect(a.deps.group != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.deps.group.?.key_string, "top") != null);
     // The stored Key (not just the string) must carry the sort — the
     // group's viewEnv renders from it.
-    try std.testing.expectEqual(Sort.top, a.group.?.key.sort);
+    try std.testing.expectEqual(Sort.top, a.deps.group.?.key.sort);
     try a.dispatch("sort", "new", null, null);
-    a.syncMembership();
-    try std.testing.expectEqual(Sort.new, a.sort);
-    try std.testing.expectEqual(Sort.new, a.group.?.key.sort);
-    try std.testing.expect(std.mem.indexOf(u8, a.group.?.key_string, "new") != null);
+    syncMembership(a);
+    try std.testing.expectEqual(Sort.new, a.deps.sort);
+    try std.testing.expectEqual(Sort.new, a.deps.group.?.key.sort);
+    try std.testing.expect(std.mem.indexOf(u8, a.deps.group.?.key_string, "new") != null);
 }
 
 test "dirty-only dispatch: unrelated scope mutations skip group renders" {
@@ -1657,8 +1820,8 @@ test "dirty-only dispatch: unrelated scope mutations skip group renders" {
     try std.testing.expect(try a.servePage("/t/1", &aw.writer));
     _ = aw.writer.consumeAll();
     try std.testing.expect(try b.servePage("/t/2", &aw.writer));
-    const ga = a.group.?;
-    const gb = b.group.?;
+    const ga = a.deps.group.?;
+    const gb = b.deps.group.?;
     const rev_a = ga.rev;
     const rev_b = gb.rev;
 
