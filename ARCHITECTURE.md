@@ -1294,3 +1294,43 @@ Deferred: `zcar` migration (the last hand-rolled Session), and any
 future first-class live render mode in the skeleton (would let
 `Deps.render`/`servePage` shrink to nothing — today they exist only
 to bypass the diff pipeline).
+
+## zmeta h: fluent HTML builder over forest.view (done)
+
+`src/zmeta/h.zig` adds an `h` layer to zmeta: per-tag entry fns
+(`h.div(a)` … one per `forest.Tag` member) returning a chainable
+`Builder(tag)` that accumulates attrs/children in the render arena
+and terminates in `.node()` → `forest.Node`. JSX ergonomics
+(`.id().class().on(.click,"x").child(...)`) without leaving Zig —
+tags are comptime `Tag` enum members and `.on` takes an `Event`
+enum mirroring forest's six-event whitelist (comptime-verified both
+directions against a mirrored list, since `assertDomEvent` is
+private).
+
+Builders are values, not nodes — Zig has no implicit conversion, so
+`.node()` is the explicit terminal; `.child()`/`.children()` accept
+builders (any tag, duck-typed via a marker decl), `forest.Node`s,
+strings (auto text node), `each`/`eachOf` `Children`, `[]const Node`,
+or comptime tuples mixing those. `.class()` appends space-joined
+(mixed string/bound operands merge into one lazy `Bound`);
+`.attr(name, v)` is a runtime-name escape hatch `forest.el` can't
+offer; `.for_` dodges the keyword.
+
+Because h builds `Element`s directly (forest's operand pipeline —
+`resolveValue`/`valueFor`/`bindGet`/`attrOf`/`normChildren` — is
+private), h.zig ports those helpers verbatim. ONE deliberate
+divergence: ported `bindGet` leaves `Bound.live = null`
+(`liveFor` is private), so raw `*T.get()` bindings are
+diff-resolved, not live-subscribed; `computed(store, f)` keeps its
+live hooks because forest builds that `Bound` itself. Documented in
+the file header — revisit if a live-mode app adopts h.
+
+Tag gaps (forest-side, unpatched per scope): the `Tag` enum has no
+`h4`/`nav`/`header`/`code`/`small` — h covers exactly the enum's 48
+members; adding tags means extending `forest.Tag` first.
+
+Pilot: all three `zmeta_demo` pages rewritten on `h.*` (SSR verified
+byte-identical markup on `/`, `/item/1`, `/structure`). 9 unit tests
+in h.zig cover el-equivalence, lazy store/computed `.text`,
+data-on/data-arg emission, presence attrs, child-type normalization,
+class append/merge, `eachOf` keyed interop and `.lid` composition.
