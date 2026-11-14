@@ -6,3 +6,4 @@
 //! identity — see zmeta/root.zig).
 pub const Env = @import("../../zmeta/root.zig").Env;
 pub const Session = @import("../../zmeta/root.zig").Session;
+pub const h = @import("../../zmeta/root.zig").h;
