@@ -871,3 +871,38 @@ isCurrent()` gates both `syncPull` (no ping → no flush → no SSE
 traffic) and `render()`; `needs_render` still forces fork renders.
 Scope keys are u64-tagged (home=0, boards=1..N, posts=2^40+id) — no
 string allocs on the hot path.
+
+## zmeta v0 spike: generated Session skeleton (done)
+
+First slice of `docs/meta-framework.md` §5 landed on `feat/zmeta-v0`:
+`src/zmeta/` holds plain source files (NOT a named build module — like
+`server/`, they compile into whichever exe module imports them
+relatively, so `History`/`Dom`/`zefx`/`forest` keep one type identity
+per exe; a named `zmeta` module would fork `History` away from
+`server/http.zig`'s copy).
+
+- `session.zig` — `Session(Deps)` generic implementing the FULL
+  http.zig contract: owns `app`/`seq`/`dom`/`log`/`history`/
+  `render_arena`/`csrf_token`/`incarnation`/`out_cookie`, installs the
+  after-flush `forest.diff` render hook itself, and delegates app
+  specifics to `Deps`: required `init`/`dispatch`/`view`; optional
+  `deinit`/`wire`/`prepare`/`setRoute`/`validPath`/`syncPull`/
+  `readCookies` + `page_title`/`page_class`/`cookie_name` consts
+  (defaults match http.zig's). Deps fns take `s: *Session` and must be
+  `pub` (cross-file calls). Revision model: deps reducers call
+  `s.bumpSeq()`; one batch per flush, `log.revision = seq.get()`.
+- `env.zig` — `Env{ route }`: the v0 slice of §5.2's Env. Typed params,
+  identity helpers and the render cursor are deferred to the routing
+  codegen step; the §4.4 seen-cursor stays unreachable by construction
+  (per-session apps have none — it is a render-group concern).
+- Archetype: `.per_session` only. `.shared_model` hooks
+  (publishPending/streamRev/streamHistory/membershipEpoch) stay
+  undeclared → server keeps per-session defaults; revisit when a
+  second shared-model app exists (§4.1).
+- Pilot: `todo_app.zig` refactored — `TodoDeps` holds model fields +
+  `mutate`/`remaining` handles + dispatch/view; `Session =
+  zmeta.Session(TodoDeps)`. Behavior identical (same routes/actions/
+  DOM; ~290 contract lines removed, view/tests unchanged modulo
+  `s.deps.*` field access).
+- Deferred: file-based routing codegen, typed action tables, typed
+  route params, `/api/*`, soft-nav, islands — all per §5/§7.

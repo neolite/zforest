@@ -1,7 +1,7 @@
 const std = @import("std");
 const zefx = @import("zefx");
 const forest = @import("forest");
-const History = @import("server/history.zig").History;
+const zmeta = @import("zmeta/root.zig");
 
 pub const Filter = enum {
     all,
@@ -50,14 +50,13 @@ pub const max_todos = 1000;
 
 pub const ActionError = error{ InvalidAction, InvalidTitle, TodoNotFound, TooManyTodos };
 
-/// One browser session: an isolated zefx graph + todo model + DOM patch state.
-/// Server is the single owner — all methods assume serialized access.
-///
-/// Session contract for the generic server (see server/http.zig):
-/// `create`, `deinit`, `csrf_token`/`setCsrf`, `history`, `seq.get()`,
-/// `dispatch`, `writeView`, `buildViewNodes`, `setRoute`, `servePage`,
-/// `syncPull`, `out_cookie`, `page_title`, `page_class`, `cookie_name`.
-pub const Session = struct {
+/// Todo app state + graph handles — the zmeta `Deps` (docs/meta-framework.md
+/// §5.2-5.3). The `zmeta.Session` skeleton owns the transport contract
+/// (Dom/log/history/arena/CSRF/seq/render hook); everything domain-
+/// specific — model fields, the mutation event, derived stores, action
+/// validation, the view tree — lives here. Session contract for the
+/// generic server is provided by the skeleton (see zmeta/session.zig).
+pub const TodoDeps = struct {
     /// Page <title> and <main> class rendered by the server's page shell.
     pub const page_title = "zforest todos";
     pub const page_class = "app";
@@ -65,8 +64,6 @@ pub const Session = struct {
     /// this app's session on the same host.
     pub const cookie_name = "zfxs";
 
-    gpa: std.mem.Allocator,
-    app: zefx.App,
     todos: std.ArrayListUnmanaged(Todo) = .empty,
     next_id: u32 = 1,
     filter: Filter = .all,
@@ -74,114 +71,42 @@ pub const Session = struct {
     ui_state: std.AutoHashMapUnmanaged(u32, ItemUi) = .empty,
 
     mutate: *zefx.Event(Mutation),
-    seq: *zefx.Store(u64),
     remaining: *zefx.Store(usize),
 
-    dom: forest.Dom,
-    log: forest.PatchLog,
-    /// Retained patch batches for SSE replay (see server/history.zig).
-    history: History,
-    /// Scratch space for the per-render view tree; reset each render.
-    render_arena: std.heap.ArenaAllocator,
-    /// Per-session CSRF token rendered into the page and verified on POST.
-    /// Owned by the session; set by the server at creation.
-    csrf_token: []u8 = &.{},
-    /// Store-stamped incarnation (see the Session contract in
-    /// server/http.zig): distinguishes this session from a previous one
-    /// evicted+recreated under the same (cookie token, route) key.
-    incarnation: u64 = 0,
-    /// Extra `Set-Cookie` header emitted on /action responses ("" = none).
-    /// Set by dispatch when minting the session user; owned by the server.
-    out_cookie: []const u8 = &.{},
-
-    /// Session contract ctor — `io` is unused (todo mints no user tokens).
-    pub fn create(gpa: std.mem.Allocator, io: std.Io) *Session {
-        _ = io;
-        return createSession(gpa);
-    }
-
-    pub fn deinit(self: *Session) void {
-        if (self.csrf_token.len != 0) self.gpa.free(self.csrf_token);
-        for (self.todos.items) |t| self.gpa.free(t.title);
-        self.todos.deinit(self.gpa);
-        var uiit = self.ui_state.valueIterator();
-        while (uiit.next()) |ui| self.gpa.free(ui.draft);
-        self.ui_state.deinit(self.gpa);
-        self.dom.deinit();
-        self.log.deinit();
-        self.history.deinit();
-        self.render_arena.deinit();
-        self.app.deinit();
-        self.gpa.destroy(self);
-    }
-
-    /// Install the server-minted session token (owned by the session).
-    pub fn setCsrf(self: *Session, token: []u8) void {
-        if (self.csrf_token.len != 0) self.gpa.free(self.csrf_token);
-        self.csrf_token = token;
-    }
-
-    /// Request-route hook: the todo app serves exactly one page.
-    pub fn setRoute(self: *Session, path: []const u8) bool {
-        _ = self;
-        return std.mem.eql(u8, path, "/");
-    }
-
-    /// Full-page render for a navigating client: resolve the route, drop
-    /// tracked DOM state, write the page body, then reseed so subsequent
-    /// diffs emit only real changes.
-    pub fn servePage(self: *Session, path: []const u8, writer: anytype) !bool {
-        if (!self.setRoute(path)) return false;
-        self.dom.reset();
-        try self.writeView(writer);
-        self.seedDom();
-        return true;
-    }
-
-    /// Cross-session model fan-out hook — todo state is per-session, so
-    /// nothing external can change between polls.
-    pub fn syncPull(self: *Session) void {
-        _ = self;
-    }
-
-    fn bumpSeq(self: *Session) void {
-        self.seq.set(self.seq.get() + 1);
-    }
-
-    fn findIdx(self: *Session, id: u32) ?usize {
-        for (self.todos.items, 0..) |t, i| {
-            if (t.id == id) return i;
-        }
-        return null;
-    }
-
-    /// The item's UI entry, or null when idle — presence means editing.
-    fn uiEntry(self: *Session, id: u32) ?*ItemUi {
-        return self.ui_state.getPtr(id);
-    }
-
-    /// Drop a todo's sparse UI entry, freeing its draft. No-op for idle
-    /// items — the common case is a single hash lookup.
-    fn clearUi(self: *Session, id: u32) void {
-        if (self.ui_state.fetchRemove(id)) |kv| self.gpa.free(kv.value.draft);
-    }
-
-    fn visible(self: *Session, t: Todo) bool {
-        return switch (self.filter) {
-            .all => true,
-            .active => !t.done,
-            .completed => t.done,
+    /// `Deps.init` — create the graph handles on the session's engine.
+    /// `seq` already exists; `wire` registers the reducers next.
+    pub fn init(s: *Session) TodoDeps {
+        return .{
+            .mutate = s.app.createEvent(Mutation),
+            .remaining = s.app.createStore(usize, 0),
         };
     }
 
-    /// Whitelisted action entry point — the DOM event protocol: `action`
-    /// is the `data-on-<event>` value, `arg` the `data-arg` payload,
-    /// `value` a change event's new value, and `fields` the named inputs
-    /// of a submitted form. Maps to a Mutation and emits into the graph;
-    /// the flush applies it (pure phase), settles derived stores, and the
-    /// after-flush hook renders DOM patches into `self.log`.
+    /// `Deps.deinit` — free domain allocations. Runs before the
+    /// skeleton tears down dom/log/history/arena/app.
+    pub fn deinit(s: *Session) void {
+        for (s.deps.todos.items) |t| s.gpa.free(t.title);
+        s.deps.todos.deinit(s.gpa);
+        var uiit = s.deps.ui_state.valueIterator();
+        while (uiit.next()) |ui| s.gpa.free(ui.draft);
+        s.deps.ui_state.deinit(s.gpa);
+    }
+
+    /// `Deps.wire` — pure-phase reducers. The skeleton installs the
+    /// render after-flush hook after this returns.
+    pub fn wire(s: *Session) void {
+        s.deps.mutate.onReducer(s, &applyMutation);
+        // Derived store: remaining count recomputes from seq updates and
+        // settles in the pure phase, before any view work.
+        s.seq.updates().onReducer(s, &updateRemaining);
+    }
+
+    /// `Deps.dispatch` — whitelisted action entry point: the DOM event
+    /// protocol maps to a Mutation emitted into the graph; the flush
+    /// applies it (pure phase), settles derived stores, and the
+    /// skeleton's after-flush hook renders DOM patches into `s.log`.
     pub fn dispatch(
-        self: *Session,
+        s: *Session,
         action: []const u8,
         arg: ?[]const u8,
         value: ?[]const u8,
@@ -198,26 +123,26 @@ pub const Session = struct {
             // Empty submit is a silent no-op (TodoMVC); overlong is rejected.
             if (title.len == 0) return;
             if (title.len > max_title_len) return error.InvalidTitle;
-            if (self.todos.items.len >= max_todos) return error.TooManyTodos;
-            self.mutate.emit(.{ .add = title });
+            if (s.deps.todos.items.len >= max_todos) return error.TooManyTodos;
+            s.deps.mutate.emit(.{ .add = title });
         } else if (std.mem.eql(u8, action, "toggle")) {
-            const tid = try self.argId(arg);
-            self.mutate.emit(.{ .toggle = tid });
+            const tid = try argId(s, arg);
+            s.deps.mutate.emit(.{ .toggle = tid });
         } else if (std.mem.eql(u8, action, "set_checked")) {
-            const tid = try self.argId(arg);
+            const tid = try argId(s, arg);
             const v = value orelse return error.InvalidAction;
             const done = if (std.mem.eql(u8, v, "true")) true else if (std.mem.eql(u8, v, "false")) false else return error.InvalidAction;
-            self.mutate.emit(.{ .set_checked = .{ .id = tid, .done = done } });
+            s.deps.mutate.emit(.{ .set_checked = .{ .id = tid, .done = done } });
         } else if (std.mem.eql(u8, action, "delete")) {
-            const tid = try self.argId(arg);
-            self.mutate.emit(.{ .delete = tid });
+            const tid = try argId(s, arg);
+            s.deps.mutate.emit(.{ .delete = tid });
         } else if (std.mem.eql(u8, action, "filter")) {
             const v = arg orelse return error.InvalidAction;
             const f = Filter.parse(v) orelse return error.InvalidAction;
-            self.mutate.emit(.{ .filter = f });
+            s.deps.mutate.emit(.{ .filter = f });
         } else if (std.mem.eql(u8, action, "edit")) {
-            const tid = try self.argId(arg);
-            self.mutate.emit(.{ .edit_start = tid });
+            const tid = try argId(s, arg);
+            s.deps.mutate.emit(.{ .edit_start = tid });
         } else if (std.mem.eql(u8, action, "edit_save")) {
             const f = fields orelse return error.InvalidAction;
             const idv = f.get("id") orelse return error.InvalidAction;
@@ -226,7 +151,7 @@ pub const Session = struct {
                 else => return error.InvalidAction,
             };
             const tid = std.fmt.parseInt(u32, id_raw, 10) catch return error.InvalidAction;
-            if (self.findIdx(tid) == null) return error.TodoNotFound;
+            if (findIdx(s, tid) == null) return error.TodoNotFound;
             const tv = f.get("text") orelse return error.InvalidAction;
             const raw = switch (tv) {
                 .string => |t| t,
@@ -236,142 +161,136 @@ pub const Session = struct {
             // Empty save deletes the todo (TodoMVC behaviour); non-empty
             // text is length-checked like `add`.
             if (text.len > max_title_len) return error.InvalidTitle;
-            self.mutate.emit(.{ .edit_save = .{ .id = tid, .text = text } });
+            s.deps.mutate.emit(.{ .edit_save = .{ .id = tid, .text = text } });
         } else if (std.mem.eql(u8, action, "edit_cancel")) {
-            const tid = try self.argId(arg);
-            self.mutate.emit(.{ .edit_cancel = tid });
+            const tid = try argId(s, arg);
+            s.deps.mutate.emit(.{ .edit_cancel = tid });
         } else {
             return error.InvalidAction;
         }
     }
 
-    /// Parse a `data-arg` todo id: missing/invalid → InvalidAction,
-    /// unknown → TodoNotFound.
-    fn argId(self: *Session, arg: ?[]const u8) ActionError!u32 {
-        const a = arg orelse return error.InvalidAction;
-        const tid = std.fmt.parseInt(u32, a, 10) catch return error.InvalidAction;
-        if (self.findIdx(tid) == null) return error.TodoNotFound;
-        return tid;
-    }
-
-    // ── graph wiring (called once per session) ──────────────────────
-
-    fn wire(self: *Session) void {
-        const eng = &self.app.eng;
-
-        // Pure-phase mutation reducer: model change, then bump seq.
-        self.mutate.onReducer(self, &Session.applyMutation);
-
-        // Derived store: remaining count recomputes from seq updates and
-        // settles in the pure phase, before any view work.
-        self.seq.updates().onReducer(self, &Session.updateRemaining);
-
-        // After every flush the graph is fully settled → render DOM diff.
-        eng.onAfterFlush(.{
-            .ctx = @ptrCast(self),
-            .call = &struct {
-                fn render(raw: *anyopaque) void {
-                    const s: *Session = @ptrCast(@alignCast(raw));
-                    s.render();
-                }
-            }.render,
-        });
-    }
-
-    /// seq.updates reducer — recounts unfinished todos in the pure phase.
-    fn updateRemaining(self: *Session, _: u64) void {
-        var n: usize = 0;
-        for (self.todos.items) |t| {
-            if (!t.done) n += 1;
-        }
-        self.remaining.set(n);
-    }
-
-    fn applyMutation(self: *Session, m: Mutation) void {
-        switch (m) {
-            .add => |title| {
-                const owned = self.gpa.dupe(u8, title) catch @panic("OOM");
-                self.todos.append(self.gpa, .{ .id = self.next_id, .title = owned, .done = false }) catch @panic("OOM");
-                self.next_id += 1;
-            },
-            .toggle => |id| {
-                const i = self.findIdx(id).?;
-                self.todos.items[i].done = !self.todos.items[i].done;
-            },
-            .set_checked => |sc| {
-                const i = self.findIdx(sc.id).?;
-                self.todos.items[i].done = sc.done;
-            },
-            .delete => |id| {
-                self.clearUi(id);
-                const i = self.findIdx(id).?;
-                self.gpa.free(self.todos.items[i].title);
-                _ = self.todos.orderedRemove(i);
-            },
-            .filter => |f| {
-                self.filter = f;
-            },
-            .edit_start => |id| {
-                const i = self.findIdx(id).?;
-                if (self.ui_state.contains(id)) return;
-                const draft = self.gpa.dupe(u8, self.todos.items[i].title) catch @panic("OOM");
-                self.ui_state.put(self.gpa, id, .{ .draft = draft }) catch {
-                    self.gpa.free(draft);
-                    @panic("OOM");
-                };
-            },
-            .edit_save => |es| {
-                self.clearUi(es.id);
-                const i = self.findIdx(es.id) orelse return;
-                const text = std.mem.trim(u8, es.text, " \t\r\n");
-                if (text.len == 0) {
-                    self.gpa.free(self.todos.items[i].title);
-                    _ = self.todos.orderedRemove(i);
-                    return;
-                }
-                const owned = self.gpa.dupe(u8, text) catch @panic("OOM");
-                self.gpa.free(self.todos.items[i].title);
-                self.todos.items[i].title = owned;
-            },
-            .edit_cancel => |id| self.clearUi(id),
-        }
-        self.bumpSeq();
-    }
-
-    // ── rendering ───────────────────────────────────────────────────
-    // One declarative tree drives both SSR (`writeHtml`) and the
-    // post-flush DOM-patch diff (`forest.diff`). The view lives in
-    // `render_arena`, reset at the top of every render.
-
-    /// Diff the view into DOM patches. Runs post-settle (after-flush).
-    fn render(self: *Session) void {
-        _ = self.render_arena.reset(.retain_capacity);
-        const a = self.render_arena.allocator();
-        forest.diff(a, buildView(a, self), &self.dom, &self.log);
-        self.log.revision = self.seq.get();
-    }
-
-    /// Render the `<main>` inner content — used by the initial page.
-    pub fn writeView(self: *Session, writer: anytype) !void {
-        _ = self.render_arena.reset(.retain_capacity);
-        const a = self.render_arena.allocator();
-        try forest.writeHtml(a, buildView(a, self), writer);
-    }
-
-    /// The session's current view nodes, built into `a` — the SSE
-    /// snapshot writer serializes them via `forest.writeSnapshotOps`.
-    pub fn buildViewNodes(self: *Session, a: std.mem.Allocator) []const forest.Node {
-        return buildView(a, self);
-    }
-
-    /// Seed tracked DOM state to match markup already emitted in the page,
-    /// so the first diff renders only real changes.
-    pub fn seedDom(self: *Session) void {
-        self.render();
-        // Keep tracked state, drop the patches — the page ships full HTML.
-        self.log.clear();
+    /// `Deps.view` — the `<main>` body. Single-route app: `env.route` is
+    /// always "/"; the tree is `buildView` below.
+    pub fn view(a: std.mem.Allocator, s: *Session, env: *const zmeta.Env) []const forest.Node {
+        _ = env;
+        return buildView(a, s);
     }
 };
+
+/// One browser session: an isolated zefx graph + todo model + DOM patch
+/// state, provided by the zmeta skeleton (see zmeta/session.zig).
+pub const Session = zmeta.Session(TodoDeps);
+
+/// Wired session constructor for tests — the server mints sessions via
+/// `Session.create(gpa, io)`; todo mints no tokens so `io` is unused.
+pub fn createSession(gpa: std.mem.Allocator) *Session {
+    return Session.create(gpa, std.testing.io);
+}
+
+// ── model helpers ────────────────────────────────────────────────
+
+fn findIdx(s: *Session, id: u32) ?usize {
+    for (s.deps.todos.items, 0..) |t, i| {
+        if (t.id == id) return i;
+    }
+    return null;
+}
+
+/// The item's UI entry, or null when idle — presence means editing.
+fn uiEntry(s: *Session, id: u32) ?*ItemUi {
+    return s.deps.ui_state.getPtr(id);
+}
+
+/// Drop a todo's sparse UI entry, freeing its draft. No-op for idle
+/// items — the common case is a single hash lookup.
+fn clearUi(s: *Session, id: u32) void {
+    if (s.deps.ui_state.fetchRemove(id)) |kv| s.gpa.free(kv.value.draft);
+}
+
+fn visible(s: *Session, t: Todo) bool {
+    return switch (s.deps.filter) {
+        .all => true,
+        .active => !t.done,
+        .completed => t.done,
+    };
+}
+
+/// Parse a `data-arg` todo id: missing/invalid → InvalidAction,
+/// unknown → TodoNotFound.
+fn argId(s: *Session, arg: ?[]const u8) ActionError!u32 {
+    const a = arg orelse return error.InvalidAction;
+    const tid = std.fmt.parseInt(u32, a, 10) catch return error.InvalidAction;
+    if (findIdx(s, tid) == null) return error.TodoNotFound;
+    return tid;
+}
+
+/// seq.updates reducer — recounts unfinished todos in the pure phase.
+fn updateRemaining(s: *Session, _: u64) void {
+    var n: usize = 0;
+    for (s.deps.todos.items) |t| {
+        if (!t.done) n += 1;
+    }
+    s.deps.remaining.set(n);
+}
+
+/// mutate reducer — pure-phase model change, then bump the revision.
+fn applyMutation(s: *Session, m: Mutation) void {
+    switch (m) {
+        .add => |title| {
+            const owned = s.gpa.dupe(u8, title) catch @panic("OOM");
+            s.deps.todos.append(s.gpa, .{ .id = s.deps.next_id, .title = owned, .done = false }) catch @panic("OOM");
+            s.deps.next_id += 1;
+        },
+        .toggle => |id| {
+            const i = findIdx(s, id).?;
+            s.deps.todos.items[i].done = !s.deps.todos.items[i].done;
+        },
+        .set_checked => |sc| {
+            const i = findIdx(s, sc.id).?;
+            s.deps.todos.items[i].done = sc.done;
+        },
+        .delete => |id| {
+            clearUi(s, id);
+            const i = findIdx(s, id).?;
+            s.gpa.free(s.deps.todos.items[i].title);
+            _ = s.deps.todos.orderedRemove(i);
+        },
+        .filter => |f| {
+            s.deps.filter = f;
+        },
+        .edit_start => |id| {
+            const i = findIdx(s, id).?;
+            if (s.deps.ui_state.contains(id)) return;
+            const draft = s.gpa.dupe(u8, s.deps.todos.items[i].title) catch @panic("OOM");
+            s.deps.ui_state.put(s.gpa, id, .{ .draft = draft }) catch {
+                s.gpa.free(draft);
+                @panic("OOM");
+            };
+        },
+        .edit_save => |es| {
+            clearUi(s, es.id);
+            const i = findIdx(s, es.id) orelse return;
+            const text = std.mem.trim(u8, es.text, " \t\r\n");
+            if (text.len == 0) {
+                s.gpa.free(s.deps.todos.items[i].title);
+                _ = s.deps.todos.orderedRemove(i);
+                return;
+            }
+            const owned = s.gpa.dupe(u8, text) catch @panic("OOM");
+            s.gpa.free(s.deps.todos.items[i].title);
+            s.deps.todos.items[i].title = owned;
+        },
+        .edit_cancel => |id| clearUi(s, id),
+    }
+    s.bumpSeq();
+}
+
+// ── rendering ───────────────────────────────────────────────────
+// One declarative tree drives both SSR (`writeHtml`) and the
+// post-flush DOM-patch diff (`forest.diff`) — the skeleton owns both
+// paths; `buildView` is the single description. The view lives in the
+// session's `render_arena`, reset at the top of every render.
 
 fn countText(a: std.mem.Allocator, rem: usize) []const u8 {
     return std.fmt.allocPrint(a, "{d} item{s} left", .{ rem, if (rem == 1) "" else "s" }) catch @panic("OOM");
@@ -408,7 +327,7 @@ fn headerView(a: std.mem.Allocator) forest.Node {
 /// The empty-state note: mounted via the `w-empty` anchor only while the
 /// list has no todos at all — real mount/unmount instead of `hidden`.
 fn emptyView(a: std.mem.Allocator, s: *Session) forest.Node {
-    return forest.when(a, .{ .id = "w-empty" }, s.todos.items.len == 0, forest.el(a, .p, .{ .id = "empty-msg" }, "Nothing yet"));
+    return forest.when(a, .{ .id = "w-empty" }, s.deps.todos.items.len == 0, forest.el(a, .p, .{ .id = "empty-msg" }, "Nothing yet"));
 }
 
 /// The filter button row: mounted via the `w-flt` anchor while the list
@@ -419,25 +338,25 @@ fn filtersView(a: std.mem.Allocator, s: *Session) forest.Node {
     inline for (.{ Filter.all, Filter.active, Filter.completed }) |f| {
         btns.append(a, forest.el(a, .button, .{
             .id = comptime "flt-" ++ f.name(),
-            .@"data-active" = if (s.filter == f) "1" else null,
+            .@"data-active" = if (s.deps.filter == f) "1" else null,
             .on = .{ .click = "filter" },
             .arg = f.name(),
         }, f.name())) catch @panic("OOM");
     }
-    return forest.when(a, .{ .id = "w-flt" }, s.todos.items.len != 0, forest.el(a, .div, .{ .class = "filters" }, btns.toOwnedSlice(a) catch @panic("OOM")));
+    return forest.when(a, .{ .id = "w-flt" }, s.deps.todos.items.len != 0, forest.el(a, .div, .{ .class = "filters" }, btns.toOwnedSlice(a) catch @panic("OOM")));
 }
 
 /// The keyed todo list — `eachOf` renders every todo through rowOrNull.
 fn listView(a: std.mem.Allocator, s: *Session) forest.Node {
-    return forest.el(a, .ul, .{ .id = "list" }, forest.eachOf(a, s.todos.items, s, rowOrNull));
+    return forest.el(a, .ul, .{ .id = "list" }, forest.eachOf(a, s.deps.todos.items, s, rowOrNull));
 }
 
 /// The footer: mounted via the `w-foot` anchor while the list is
 /// non-empty. `count` keeps its absolute id inside the branch and stays
 /// bound via `computed` — `countText` maps the `remaining` store.
 fn footerView(a: std.mem.Allocator, s: *Session) forest.Node {
-    return forest.when(a, .{ .id = "w-foot" }, s.todos.items.len != 0, forest.el(a, .footer, .{}, .{
-        forest.el(a, .span, .{ .id = "count", .text = forest.computed(s.remaining, countText) }, .{}),
+    return forest.when(a, .{ .id = "w-foot" }, s.deps.todos.items.len != 0, forest.el(a, .footer, .{}, .{
+        forest.el(a, .span, .{ .id = "count", .text = forest.computed(s.deps.remaining, countText) }, .{}),
     }));
 }
 
@@ -477,7 +396,7 @@ fn editBranch(a: std.mem.Allocator, draft: []const u8, arg: []const u8) forest.N
 }
 
 fn buildRow(a: std.mem.Allocator, s: *Session, t: Todo) forest.Node {
-    const ui = s.uiEntry(t.id);
+    const ui = uiEntry(s, t.id);
     // The todo id formats once per row and is shared by every `data-arg`
     // / hidden `value` binding — previously each attr ran its own `{d}`.
     var idbuf: [24]u8 = undefined;
@@ -513,7 +432,7 @@ fn buildRow(a: std.mem.Allocator, s: *Session, t: Todo) forest.Node {
 /// `eachOf` render fn: the active filter hides rows by returning null;
 /// every survivor is an element carrying `.id`.
 fn rowOrNull(a: std.mem.Allocator, s: *Session, t: Todo) ?forest.Node {
-    if (!s.visible(t)) return null;
+    if (!visible(s, t)) return null;
     return buildRow(a, s, t);
 }
 
@@ -529,28 +448,6 @@ fn buildView(a: std.mem.Allocator, s: *Session) []const forest.Node {
     nodes[3] = listView(a, s);
     nodes[4] = footerView(a, s);
     return nodes;
-}
-
-/// Wired session constructor (separate so `wire` can reference self).
-pub fn createSession(gpa: std.mem.Allocator) *Session {
-    const s = gpa.create(Session) catch @panic("OOM");
-    s.* = .{
-        .gpa = gpa,
-        .app = zefx.createApp(gpa),
-        .mutate = undefined,
-        .seq = undefined,
-        .remaining = undefined,
-        .dom = forest.Dom.init(gpa),
-        .log = forest.PatchLog.init(gpa),
-        .history = History.init(gpa),
-        .render_arena = std.heap.ArenaAllocator.init(gpa),
-        .filter = .all,
-    };
-    s.mutate = s.app.createEvent(Mutation);
-    s.seq = s.app.createStore(u64, 0);
-    s.remaining = s.app.createStore(usize, 0);
-    s.wire();
-    return s;
 }
 
 // ─────────────────────────────────────────────
@@ -601,11 +498,11 @@ test "session add/toggle/delete/filter produces patches" {
     alloc.free(patchJson(s, alloc));
 
     var idbuf: [16]u8 = undefined;
-    try s.dispatch("toggle", std.fmt.bufPrint(&idbuf, "{d}", .{s.todos.items[0].id}) catch unreachable, null, null);
+    try s.dispatch("toggle", std.fmt.bufPrint(&idbuf, "{d}", .{s.deps.todos.items[0].id}) catch unreachable, null, null);
     const j2 = patchJson(s, alloc);
     defer alloc.free(j2);
-    try std.testing.expectEqual(@as(usize, 1), s.remaining.get());
-    try std.testing.expect(s.todos.items[0].done);
+    try std.testing.expectEqual(@as(usize, 1), s.deps.remaining.get());
+    try std.testing.expect(s.deps.todos.items[0].done);
     // toggle emits authoritative checked + class patches
     try std.testing.expect(std.mem.indexOf(u8, j2, "\"name\":\"checked\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, j2, "\"name\":\"class\",\"value\":\"todo done\"") != null);
@@ -618,10 +515,10 @@ test "session add/toggle/delete/filter produces patches" {
     try std.testing.expect(std.mem.indexOf(u8, j3, "data-active") != null);
 
     // delete visible row
-    try s.dispatch("delete", std.fmt.bufPrint(&idbuf, "{d}", .{s.todos.items[1].id}) catch unreachable, null, null);
+    try s.dispatch("delete", std.fmt.bufPrint(&idbuf, "{d}", .{s.deps.todos.items[1].id}) catch unreachable, null, null);
     const j4 = patchJson(s, alloc);
     defer alloc.free(j4);
-    try std.testing.expectEqual(@as(usize, 1), s.todos.items.len);
+    try std.testing.expectEqual(@as(usize, 1), s.deps.todos.items.len);
 }
 
 test "two sessions are isolated" {
@@ -638,15 +535,15 @@ test "two sessions are isolated" {
     try a.dispatch("add", null, null, &fa);
     alloc.free(patchJson(a, alloc));
 
-    try std.testing.expectEqual(@as(usize, 0), b.todos.items.len);
-    try std.testing.expectEqual(@as(usize, 1), a.todos.items.len);
+    try std.testing.expectEqual(@as(usize, 0), b.deps.todos.items.len);
+    try std.testing.expectEqual(@as(usize, 1), a.deps.todos.items.len);
     // stable ids: both sessions start at 1 but stay independent
     var fb = titleFields(alloc, "only in B");
     defer fb.deinit(alloc);
     try b.dispatch("add", null, null, &fb);
-    try std.testing.expectEqual(@as(usize, 1), b.todos.items.len);
-    try std.testing.expectEqualStrings("only in A", a.todos.items[0].title);
-    try std.testing.expectEqualStrings("only in B", b.todos.items[0].title);
+    try std.testing.expectEqual(@as(usize, 1), b.deps.todos.items.len);
+    try std.testing.expectEqualStrings("only in A", a.deps.todos.items[0].title);
+    try std.testing.expectEqualStrings("only in B", b.deps.todos.items[0].title);
     alloc.free(patchJson(b, alloc));
 }
 
@@ -673,7 +570,7 @@ test "action validation rejects bad input" {
     defer spaces.deinit(alloc);
     // Empty/whitespace submit is a silent no-op, not an error.
     try s.dispatch("add", null, null, &spaces);
-    try std.testing.expectEqual(@as(usize, 0), s.todos.items.len);
+    try std.testing.expectEqual(@as(usize, 0), s.deps.todos.items.len);
 
     try std.testing.expectError(error.InvalidAction, s.dispatch("toggle", "abc", null, null));
     try std.testing.expectError(error.InvalidAction, s.dispatch("toggle", null, null, null));
@@ -690,7 +587,7 @@ test "action validation rejects bad input" {
     try std.testing.expectError(error.InvalidTitle, s.dispatch("add", null, null, &too_long));
 
     // nothing leaked into the model
-    try std.testing.expectEqual(@as(usize, 0), s.todos.items.len);
+    try std.testing.expectEqual(@as(usize, 0), s.deps.todos.items.len);
 }
 
 test "inline edit swaps title for a form and back" {
@@ -704,7 +601,7 @@ test "inline edit swaps title for a form and back" {
     try s.dispatch("add", null, null, &f1);
     alloc.free(patchJson(s, alloc));
 
-    const id = s.todos.items[0].id;
+    const id = s.deps.todos.items[0].id;
     var idbuf: [16]u8 = undefined;
     const arg = std.fmt.bufPrint(&idbuf, "{d}", .{id}) catch unreachable;
 
@@ -712,7 +609,7 @@ test "inline edit swaps title for a form and back" {
     try s.dispatch("edit", arg, null, null);
     const j1 = patchJson(s, alloc);
     defer alloc.free(j1);
-    try std.testing.expect(s.ui_state.contains(id));
+    try std.testing.expect(s.deps.ui_state.contains(id));
     try std.testing.expect(std.mem.indexOf(u8, j1, "\"op\":\"when\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, j1, "edit-form") != null);
     try std.testing.expect(std.mem.indexOf(u8, j1, "edit_save") != null);
@@ -723,19 +620,19 @@ test "inline edit swaps title for a form and back" {
     try s.dispatch("edit_save", null, null, &fields);
     const j2 = patchJson(s, alloc);
     defer alloc.free(j2);
-    try std.testing.expectEqualStrings("edited title", s.todos.items[0].title);
-    try std.testing.expect(!s.ui_state.contains(id));
+    try std.testing.expectEqualStrings("edited title", s.deps.todos.items[0].title);
+    try std.testing.expect(!s.deps.ui_state.contains(id));
     try std.testing.expect(std.mem.indexOf(u8, j2, "\"op\":\"when\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, j2, "data-on-dblclick") != null);
 
     // Re-enter, then cancel: entry gone, title branch restored.
     try s.dispatch("edit", arg, null, null);
-    try std.testing.expect(s.ui_state.contains(id));
+    try std.testing.expect(s.deps.ui_state.contains(id));
     alloc.free(patchJson(s, alloc));
     try s.dispatch("edit_cancel", arg, null, null);
     const j3 = patchJson(s, alloc);
     defer alloc.free(j3);
-    try std.testing.expect(!s.ui_state.contains(id));
+    try std.testing.expect(!s.deps.ui_state.contains(id));
     try std.testing.expect(std.mem.indexOf(u8, j3, "\"op\":\"when\"") != null);
 
     // Edit on unknown id is rejected like any other action.
@@ -753,20 +650,20 @@ test "empty edit save deletes the todo and cleans ui state" {
     try s.dispatch("add", null, null, &f1);
     alloc.free(patchJson(s, alloc));
 
-    const id = s.todos.items[0].id;
+    const id = s.deps.todos.items[0].id;
     var idbuf: [16]u8 = undefined;
     const arg = std.fmt.bufPrint(&idbuf, "{d}", .{id}) catch unreachable;
     try s.dispatch("edit", arg, null, null);
     alloc.free(patchJson(s, alloc));
-    try std.testing.expect(s.ui_state.contains(id));
+    try std.testing.expect(s.deps.ui_state.contains(id));
 
     var fields = editFields(alloc, arg, "   ");
     defer fields.deinit(alloc);
     try s.dispatch("edit_save", null, null, &fields);
     const j = patchJson(s, alloc);
     defer alloc.free(j);
-    try std.testing.expectEqual(@as(usize, 0), s.todos.items.len);
-    try std.testing.expectEqual(@as(usize, 0), s.ui_state.count());
+    try std.testing.expectEqual(@as(usize, 0), s.deps.todos.items.len);
+    try std.testing.expectEqual(@as(usize, 0), s.deps.ui_state.count());
     try std.testing.expect(std.mem.indexOf(u8, j, "\"op\":\"remove\"") != null);
 }
 
@@ -809,8 +706,8 @@ test "chrome mounts and unmounts through when anchors" {
     // final delete's batch carries the three when ops.
     var idbuf: [16]u8 = undefined;
     var last: ?[]u8 = null;
-    while (s.todos.items.len > 0) {
-        const arg = std.fmt.bufPrint(&idbuf, "{d}", .{s.todos.items[0].id}) catch unreachable;
+    while (s.deps.todos.items.len > 0) {
+        const arg = std.fmt.bufPrint(&idbuf, "{d}", .{s.deps.todos.items[0].id}) catch unreachable;
         try s.dispatch("delete", arg, null, null);
         if (last) |l| alloc.free(l);
         last = patchJson(s, alloc);
