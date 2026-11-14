@@ -1578,3 +1578,13 @@ scratch stays on `render_arena`: `PatchLog` dupes every op string at
 emit time, so arena resets can't dangle patch payloads. zboard's
 hand-declared Session gained the two parity fields (its own
 servePage/render overrides never read them).
+
+## Board auth — phased (ADR-0001, proposed)
+
+Auth for zboard is phased: tripcodes first (per-post secret, zero
+auth state, no group-key impact), accounts second (zfxa cookie +
+PBKDF2 + `groupKey += auth class` — required because render groups
+share Dom per route and per-viewer UI diverges grouped sessions).
+Live islands/binders cannot carry per-session UI inside groups —
+their ops go to the session log while groups publish one shared
+batch. Full decision record: docs/adr/0001-board-auth.md.
