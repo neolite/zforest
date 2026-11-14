@@ -1128,3 +1128,84 @@ override yet), catch-all `[...rest]` segments, route groups/layouts,
 islands, and migrating zboard/zcar/zmon (their manual routing stays —
 the generator targets new zmeta apps).
 
+## zboard on the zmeta Session skeleton (done)
+
+`feat/zmeta-board`: zboard is the first real `.shared_model`/grouped
+app on `zmeta.Session(Deps)` — the migration path sketched above,
+landed. `src/board_app.zig` is the only file touched
+(`board_groups.zig`/`board.zig`/`board_main.zig`/`server/http.zig`
+byte-identical).
+
+`pub const BoardDeps` carries every former session field — parsed
+`route: Route`, `reply_to`, `sort`, `user_token` (zfxu),
+`out_cookie_buf` scratch (the skeleton's `out_cookie` slice points
+into it), `seen_seq`, `attached`, `group: ?*RenderGroup`,
+`membership_epoch`, and the `ping` event handle — plus
+`archetype = .shared_model` and the page-metadata consts
+(`page_title`/`page_class`/`cookie_name`). `board_app.model` and the
+`board_groups` registry stay module-global, app-owned.
+
+One deliberate deviation from the pilots' one-liner: `Session` is
+HAND-DECLARED rather than `pub const Session =
+zmeta.Session(BoardDeps)`. `board_groups.zig` — board-owned and
+frozen for this migration — calls `Session.scopeForRoute(route)` and
+`Session.scopeVersion(key)` as STATIC decls, and Zig cannot extend a
+type alias's namespace (the skeleton's SessionGrouped has a fixed
+decl list). So `Session` replicates SessionGrouped's exact field
+list and aliases every contract method (`deinit`/`setCsrf`/`setRoute`/
+`validPath`/`readCookies`/`servePage`/`syncPull`/`bumpSeq`/`dispatch`/
+`writeView`/`buildViewNodes`/`seedDom` + the four stream hooks) from
+`Skel = zmeta.Session(BoardDeps)` — the method bodies still live once
+in `SessionMethods` as `self: anytype` generics, so nothing is
+duplicated semantically. `create` mirrors `createSessionImpl`
+(contract fields → `Deps.init`/`Deps.wire` → the after-flush render
+hook LAST). The two scope statics are the only board-owned additions;
+`viewEnv`/`render` pub shims exist solely so no aliased default branch
+can resolve the skeleton's private decls on this foreign self type.
+
+Deps surface used:
+
+- Required: `init` (creates `ping`), `wire` (registers ONLY
+  `ping.onReducer` → `bumpSeq`; the skeleton installs the after-flush
+  hook itself — no duplicate render registration), `dispatch`
+  (verbatim action table: post/comment/reply/cancel_reply/sort/like),
+  `view` (contract wrapper — every path that would call it is
+  overridden, so it exists for completeness).
+- Lifecycle/route: `deinit` (group leave → free user_token, original
+  ordering), `setRoute` (parseRoute + dangling-id 404 gate),
+  `validPath`, `readCookies` (zfxu pick-up).
+- Fan-out: `syncPull` (group `isCurrent()` gate → ping; else
+  `seen_seq` vs `global_seq`), and all four stream hooks
+  (`publishPending`/`streamRev`/`streamHistory`/`membershipEpoch`)
+  verbatim — declaring the complete set is what selects
+  SessionGrouped and flips http.zig's `@hasDecl` probes.
+- Render-path overrides (all five): `servePage` (setRoute →
+  `attached` → `syncMembership` → `ensureGroupCurrent` → `writeView`,
+  NO `dom.reset`/`seedDom`), `render` (attached → re-key →
+  `g.render()`+`g.publish()`; unattached → original per-session
+  diff), `writeView`, `buildViewNodes`, `seedDom` (solo-only helper).
+
+The §4.4 seen-cursor split is preserved exactly: session-side builds
+(`writeView`/`buildViewNodes`/solo render) stamp `s.deps.seen_seq`
+through the file-scope `viewEnv(s)`; `board_groups.RenderGroup`
+keeps calling the board-owned `buildView` shim with the GROUP's
+`ViewEnv` (`seen = &g.last_rendered_seq`) — the open question above
+resolved as "shim stays". Grouped `servePage`/`render` route through
+`syncMembership`+`ensureGroupCurrent`, never the default
+`dom.reset`+`seedDom` path.
+
+Tests: the extensive board test suite now drives `s.deps.*` fields;
+`zig build test` 17/17 green, `zig build` all 5 exes green. Live
+smoke on `zboard 8899`: GET `/`, `/b/emp`, `/t/1` → 200,
+`/bogus`/`/t/999` → 404; POST comment → `{"rev":1}`, POST like →
+`{"rev":2}`, `zfxu` minted on first POST; SSE `/events?r=/t/1`
+delivers a group-local `snapshot` (rev 2) then `patch` rev 3 with
+the new comment's create op — grouped publish/fetch end to end.
+
+Deferred: `src/apps/` codegen adoption (board keeps its manual
+routing — the generator targets new zmeta apps), `zcar`/`zmon`
+migrations, and any future move of the scope statics into the
+skeleton (would need a Deps-declared hook or a board_groups-facing
+API change — neither is warranted while board_groups stays
+board-owned).
+
