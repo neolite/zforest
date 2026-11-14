@@ -1,6 +1,6 @@
 const std = @import("std");
 const forest = @import("forest");
-const todo = @import("../todo_app.zig");
+const todo = @import("../apps/todo/app.zig");
 
 /// Serialize the full-state snapshot event payload: {"rev":N,"ops":[…]}.
 /// `ops` is the declarative view emitted as an idempotent state dump —

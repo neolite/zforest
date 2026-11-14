@@ -1,6 +1,6 @@
 const std = @import("std");
 const server = @import("server/http.zig");
-const todo = @import("todo_app.zig");
+const todo = @import("apps/todo/app.zig");
 
 /// Parse the optional `bind-ip` arg: a dotted IPv4 literal, or loopback
 /// for anything unparsable (safe default for a demo server).
@@ -25,7 +25,7 @@ test {
     // pull test decls). db.zig/board.zig pull the sqlite amalgamation —
     // compiled into this test binary only, never the zforest exe.
     _ = @import("server/http.zig");
-    _ = @import("todo_app.zig");
+    _ = @import("apps/todo/app.zig");
     _ = @import("db.zig");
     _ = @import("board.zig");
     _ = @import("board_app.zig");

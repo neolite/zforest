@@ -531,15 +531,24 @@ fn emitRoutes(arena: Allocator, zmeta_path: []const u8, pages: []const Page) ![]
     );
 
     // href constructors
+    var any_dynamic = false;
+    for (pages) |p| {
+        for (p.segs) |s| {
+            if (s == .dynamic) any_dynamic = true;
+        }
+    }
     try w.writeAll(
         \\
         \\/// Type-safe href: `href(a, .{ .item = .{ .id = 3 } })` allocates
         \\/// the path in `a` (the render arena in views). Static routes
         \\/// return comptime literals.
         \\pub fn href(a: std.mem.Allocator, r: Route) []const u8 {
-        \\    return switch (r) {
         \\
     );
+    // All-static route tables never touch the arena — discard `a` so the
+    // parameter isn't an unused-parameter error.
+    if (!any_dynamic) try w.writeAll("    _ = a;\n");
+    try w.writeAll("    return switch (r) {\n");
     for (pages) |p| {
         try emitHrefCase(arena, w, p);
     }

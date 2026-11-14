@@ -1,7 +1,17 @@
+//! todo — the TodoMVC demo on the zmeta `Session(Deps)` skeleton
+//! (docs/meta-framework.md §5): file-based routing (single "/" page),
+//! comptime action table, per-session model. The view lives in
+//! `pages/index.zig`; this file holds the domain model, the mutation
+//! graph, action handlers, and the session tests.
 const std = @import("std");
 const zefx = @import("zefx");
 const forest = @import("forest");
-const zmeta = @import("zmeta/root.zig");
+const zmeta = @import("zmeta.zig");
+const routes = @import("gen/routes.zig");
+const actions = @import("gen/actions.zig");
+
+pub const Route = routes.Route;
+pub const act = actions.act;
 
 pub const Filter = enum {
     all,
@@ -30,7 +40,7 @@ pub const Todo = struct { id: u32, title: []u8, done: bool };
 /// an interactive mode (inline editing). Presence in `ui_state` IS the
 /// mode flag — a missing key means all defaults, so idle rows cost zero
 /// allocations. `draft` owns its bytes and is freed with the entry.
-const ItemUi = struct {
+pub const ItemUi = struct {
     draft: []u8,
 };
 
@@ -54,8 +64,8 @@ pub const ActionError = error{ InvalidAction, InvalidTitle, TodoNotFound, TooMan
 /// §5.2-5.3). The `zmeta.Session` skeleton owns the transport contract
 /// (Dom/log/history/arena/CSRF/seq/render hook); everything domain-
 /// specific — model fields, the mutation event, derived stores, action
-/// validation, the view tree — lives here. Session contract for the
-/// generic server is provided by the skeleton (see zmeta/session.zig).
+/// validation — lives here. Session contract for the generic server is
+/// provided by the skeleton (see zmeta/session.zig).
 pub const TodoDeps = struct {
     /// Page <title> and <main> class rendered by the server's page shell.
     pub const page_title = "zforest todos";
@@ -63,6 +73,10 @@ pub const TodoDeps = struct {
     /// Session cookie name — "zfxb" on the board app to avoid clobbering
     /// this app's session on the same host.
     pub const cookie_name = "zfxs";
+
+    /// Current typed route — written by the generated `routes.setRoute`
+    /// glue; read by `routes.prepare`/`routes.viewNodes` dispatch.
+    route: routes.Route = .{ .index = .{} },
 
     todos: std.ArrayListUnmanaged(Todo) = .empty,
     next_id: u32 = 1,
@@ -101,80 +115,166 @@ pub const TodoDeps = struct {
         s.seq.updates().onReducer(s, &updateRemaining);
     }
 
-    /// `Deps.dispatch` — whitelisted action entry point: the DOM event
-    /// protocol maps to a Mutation emitted into the graph; the flush
-    /// applies it (pure phase), settles derived stores, and the
-    /// skeleton's after-flush hook renders DOM patches into `s.log`.
+    /// Route validation + typed-route storage — generated glue.
+    pub fn setRoute(s: *Session, path: []const u8) bool {
+        return routes.setRoute(s, path);
+    }
+
+    /// Pure route pre-check — generated glue.
+    pub fn validPath(path: []const u8) bool {
+        return routes.validPath(path);
+    }
+
+    /// Route-param gate — generated dispatch to page `prepare`s.
+    pub fn prepare(s: *Session, env: *const zmeta.Env) !void {
+        try routes.prepare(s, env);
+    }
+
+    /// The `<main>` body — generated dispatch to the active page's view.
+    pub fn view(a: std.mem.Allocator, s: *Session, env: *const zmeta.Env) []const forest.Node {
+        return routes.viewNodes(a, s, env);
+    }
+
+    /// Whitelisted action entry — generated dispatch to `on_<name>`.
     pub fn dispatch(
         s: *Session,
         action: []const u8,
         arg: ?[]const u8,
         value: ?[]const u8,
         fields: ?*const std.json.ObjectMap,
-    ) ActionError!void {
-        if (std.mem.eql(u8, action, "add")) {
-            const m = fields orelse return error.InvalidAction;
-            const fv = m.get("title") orelse return error.InvalidAction;
-            const raw = switch (fv) {
-                .string => |t| t,
-                else => return error.InvalidAction,
-            };
-            const title = std.mem.trim(u8, raw, " \t\r\n");
-            // Empty submit is a silent no-op (TodoMVC); overlong is rejected.
-            if (title.len == 0) return;
-            if (title.len > max_title_len) return error.InvalidTitle;
-            if (s.deps.todos.items.len >= max_todos) return error.TooManyTodos;
-            s.deps.mutate.emit(.{ .add = title });
-        } else if (std.mem.eql(u8, action, "toggle")) {
-            const tid = try argId(s, arg);
-            s.deps.mutate.emit(.{ .toggle = tid });
-        } else if (std.mem.eql(u8, action, "set_checked")) {
-            const tid = try argId(s, arg);
-            const v = value orelse return error.InvalidAction;
-            const done = if (std.mem.eql(u8, v, "true")) true else if (std.mem.eql(u8, v, "false")) false else return error.InvalidAction;
-            s.deps.mutate.emit(.{ .set_checked = .{ .id = tid, .done = done } });
-        } else if (std.mem.eql(u8, action, "delete")) {
-            const tid = try argId(s, arg);
-            s.deps.mutate.emit(.{ .delete = tid });
-        } else if (std.mem.eql(u8, action, "filter")) {
-            const v = arg orelse return error.InvalidAction;
-            const f = Filter.parse(v) orelse return error.InvalidAction;
-            s.deps.mutate.emit(.{ .filter = f });
-        } else if (std.mem.eql(u8, action, "edit")) {
-            const tid = try argId(s, arg);
-            s.deps.mutate.emit(.{ .edit_start = tid });
-        } else if (std.mem.eql(u8, action, "edit_save")) {
-            const f = fields orelse return error.InvalidAction;
-            const idv = f.get("id") orelse return error.InvalidAction;
-            const id_raw = switch (idv) {
-                .string => |x| x,
-                else => return error.InvalidAction,
-            };
-            const tid = std.fmt.parseInt(u32, id_raw, 10) catch return error.InvalidAction;
-            if (findIdx(s, tid) == null) return error.TodoNotFound;
-            const tv = f.get("text") orelse return error.InvalidAction;
-            const raw = switch (tv) {
-                .string => |t| t,
-                else => return error.InvalidAction,
-            };
-            const text = std.mem.trim(u8, raw, " \t\r\n");
-            // Empty save deletes the todo (TodoMVC behaviour); non-empty
-            // text is length-checked like `add`.
-            if (text.len > max_title_len) return error.InvalidTitle;
-            s.deps.mutate.emit(.{ .edit_save = .{ .id = tid, .text = text } });
-        } else if (std.mem.eql(u8, action, "edit_cancel")) {
-            const tid = try argId(s, arg);
-            s.deps.mutate.emit(.{ .edit_cancel = tid });
-        } else {
-            return error.InvalidAction;
-        }
+    ) !void {
+        return actions.dispatch(s, action, arg, value, fields);
     }
 
-    /// `Deps.view` — the `<main>` body. Single-route app: `env.route` is
-    /// always "/"; the tree is `buildView` below.
-    pub fn view(a: std.mem.Allocator, s: *Session, env: *const zmeta.Env) []const forest.Node {
-        _ = env;
-        return buildView(a, s);
+    /// act.add — new todo; `fields.title` required, trimmed, length- and
+    /// count-capped. Empty/whitespace submit is a silent no-op (TodoMVC).
+    pub fn on_add(
+        s: *Session,
+        arg: ?[]const u8,
+        value: ?[]const u8,
+        fields: ?*const std.json.ObjectMap,
+    ) ActionError!void {
+        _ = arg;
+        _ = value;
+        const m = fields orelse return error.InvalidAction;
+        const fv = m.get("title") orelse return error.InvalidAction;
+        const raw = switch (fv) {
+            .string => |t| t,
+            else => return error.InvalidAction,
+        };
+        const title = std.mem.trim(u8, raw, " \t\r\n");
+        if (title.len == 0) return;
+        if (title.len > max_title_len) return error.InvalidTitle;
+        if (s.deps.todos.items.len >= max_todos) return error.TooManyTodos;
+        s.deps.mutate.emit(.{ .add = title });
+    }
+
+    /// act.toggle — flip done on the `arg` todo id.
+    pub fn on_toggle(
+        s: *Session,
+        arg: ?[]const u8,
+        value: ?[]const u8,
+        fields: ?*const std.json.ObjectMap,
+    ) ActionError!void {
+        _ = value;
+        _ = fields;
+        const tid = try argId(s, arg);
+        s.deps.mutate.emit(.{ .toggle = tid });
+    }
+
+    /// act.set_checked — checkbox change; `arg` id + `value` true/false.
+    pub fn on_set_checked(
+        s: *Session,
+        arg: ?[]const u8,
+        value: ?[]const u8,
+        fields: ?*const std.json.ObjectMap,
+    ) ActionError!void {
+        _ = fields;
+        const tid = try argId(s, arg);
+        const v = value orelse return error.InvalidAction;
+        const done = if (std.mem.eql(u8, v, "true")) true else if (std.mem.eql(u8, v, "false")) false else return error.InvalidAction;
+        s.deps.mutate.emit(.{ .set_checked = .{ .id = tid, .done = done } });
+    }
+
+    /// act.delete — remove the `arg` todo.
+    pub fn on_delete(
+        s: *Session,
+        arg: ?[]const u8,
+        value: ?[]const u8,
+        fields: ?*const std.json.ObjectMap,
+    ) ActionError!void {
+        _ = value;
+        _ = fields;
+        const tid = try argId(s, arg);
+        s.deps.mutate.emit(.{ .delete = tid });
+    }
+
+    /// act.filter — `arg` is the filter name (all/active/completed).
+    pub fn on_filter(
+        s: *Session,
+        arg: ?[]const u8,
+        value: ?[]const u8,
+        fields: ?*const std.json.ObjectMap,
+    ) ActionError!void {
+        _ = value;
+        _ = fields;
+        const v = arg orelse return error.InvalidAction;
+        const f = Filter.parse(v) orelse return error.InvalidAction;
+        s.deps.mutate.emit(.{ .filter = f });
+    }
+
+    /// act.edit — enter inline-edit mode for the `arg` todo.
+    pub fn on_edit(
+        s: *Session,
+        arg: ?[]const u8,
+        value: ?[]const u8,
+        fields: ?*const std.json.ObjectMap,
+    ) ActionError!void {
+        _ = value;
+        _ = fields;
+        const tid = try argId(s, arg);
+        s.deps.mutate.emit(.{ .edit_start = tid });
+    }
+
+    /// act.edit_save — `fields.id` + `fields.text`; empty text deletes
+    /// the todo (TodoMVC behaviour), non-empty is length-checked.
+    pub fn on_edit_save(
+        s: *Session,
+        arg: ?[]const u8,
+        value: ?[]const u8,
+        fields: ?*const std.json.ObjectMap,
+    ) ActionError!void {
+        _ = arg;
+        _ = value;
+        const f = fields orelse return error.InvalidAction;
+        const idv = f.get("id") orelse return error.InvalidAction;
+        const id_raw = switch (idv) {
+            .string => |x| x,
+            else => return error.InvalidAction,
+        };
+        const tid = std.fmt.parseInt(u32, id_raw, 10) catch return error.InvalidAction;
+        if (findIdx(s, tid) == null) return error.TodoNotFound;
+        const tv = f.get("text") orelse return error.InvalidAction;
+        const raw = switch (tv) {
+            .string => |t| t,
+            else => return error.InvalidAction,
+        };
+        const text = std.mem.trim(u8, raw, " \t\r\n");
+        if (text.len > max_title_len) return error.InvalidTitle;
+        s.deps.mutate.emit(.{ .edit_save = .{ .id = tid, .text = text } });
+    }
+
+    /// act.edit_cancel — leave inline-edit mode, keep the title.
+    pub fn on_edit_cancel(
+        s: *Session,
+        arg: ?[]const u8,
+        value: ?[]const u8,
+        fields: ?*const std.json.ObjectMap,
+    ) ActionError!void {
+        _ = value;
+        _ = fields;
+        const tid = try argId(s, arg);
+        s.deps.mutate.emit(.{ .edit_cancel = tid });
     }
 };
 
@@ -198,7 +298,7 @@ fn findIdx(s: *Session, id: u32) ?usize {
 }
 
 /// The item's UI entry, or null when idle — presence means editing.
-fn uiEntry(s: *Session, id: u32) ?*ItemUi {
+pub fn uiEntry(s: *Session, id: u32) ?*ItemUi {
     return s.deps.ui_state.getPtr(id);
 }
 
@@ -208,7 +308,8 @@ fn clearUi(s: *Session, id: u32) void {
     if (s.deps.ui_state.fetchRemove(id)) |kv| s.gpa.free(kv.value.draft);
 }
 
-fn visible(s: *Session, t: Todo) bool {
+/// Filter predicate shared by the list view and row rendering.
+pub fn visible(s: *Session, t: Todo) bool {
     return switch (s.deps.filter) {
         .all => true,
         .active => !t.done,
@@ -286,172 +387,13 @@ fn applyMutation(s: *Session, m: Mutation) void {
     s.bumpSeq();
 }
 
-// ── rendering ───────────────────────────────────────────────────
-// One declarative tree drives both SSR (`writeHtml`) and the
-// post-flush DOM-patch diff (`forest.diff`) — the skeleton owns both
-// paths; `buildView` is the single description. The view lives in the
-// session's `render_arena`, reset at the top of every render.
-
-fn countText(a: std.mem.Allocator, rem: usize) []const u8 {
+/// Footer counter text — `computed` binding target for the `count` span.
+pub fn countText(a: std.mem.Allocator, rem: usize) []const u8 {
     return std.fmt.allocPrint(a, "{d} item{s} left", .{ rem, if (rem == 1) "" else "s" }) catch @panic("OOM");
 }
 
-// ── view components ─────────────────────────────────────────────
-// A component is a plain fn returning a forest.Node. `buildView`
-// composes them; `forest.fragment` groups several roots into one Node
-// without emitting wrapper markup.
-
-/// Static chrome: the title and the add form — no bound state.
-fn headerView(a: std.mem.Allocator) forest.Node {
-    return forest.fragment(a, .{
-        forest.el(a, .h1, .{}, .{
-            forest.text("zforest "),
-            forest.el(a, .span, .{}, "todos"),
-        }),
-        forest.el(a, .form, .{
-            .id = "add-form",
-            .autocomplete = "off",
-            .on = .{ .submit = "add" },
-        }, .{
-            forest.el(a, .input, .{
-                .name = "title",
-                .placeholder = "What needs to be done?",
-                .maxlength = max_title_len,
-                .autofocus = true,
-            }, .{}),
-            forest.el(a, .button, .{ .type = "submit" }, "Add"),
-        }),
-    });
-}
-
-/// The empty-state note: mounted via the `w-empty` anchor only while the
-/// list has no todos at all — real mount/unmount instead of `hidden`.
-fn emptyView(a: std.mem.Allocator, s: *Session) forest.Node {
-    return forest.when(a, .{ .id = "w-empty" }, s.deps.todos.items.len == 0, forest.el(a, .p, .{ .id = "empty-msg" }, "Nothing yet"));
-}
-
-/// The filter button row: mounted via the `w-flt` anchor while the list
-/// is non-empty. The div itself is static branch markup; the `flt-*`
-/// buttons keep absolute ids so `data-active` still diffs in place.
-fn filtersView(a: std.mem.Allocator, s: *Session) forest.Node {
-    var btns: std.ArrayListUnmanaged(forest.Node) = .empty;
-    inline for (.{ Filter.all, Filter.active, Filter.completed }) |f| {
-        btns.append(a, forest.el(a, .button, .{
-            .id = comptime "flt-" ++ f.name(),
-            .@"data-active" = if (s.deps.filter == f) "1" else null,
-            .on = .{ .click = "filter" },
-            .arg = f.name(),
-        }, f.name())) catch @panic("OOM");
-    }
-    return forest.when(a, .{ .id = "w-flt" }, s.deps.todos.items.len != 0, forest.el(a, .div, .{ .class = "filters" }, btns.toOwnedSlice(a) catch @panic("OOM")));
-}
-
-/// The keyed todo list — `eachOf` renders every todo through rowOrNull.
-fn listView(a: std.mem.Allocator, s: *Session) forest.Node {
-    return forest.el(a, .ul, .{ .id = "list" }, forest.eachOf(a, s.deps.todos.items, s, rowOrNull));
-}
-
-/// The footer: mounted via the `w-foot` anchor while the list is
-/// non-empty. `count` keeps its absolute id inside the branch and stays
-/// bound via `computed` — `countText` maps the `remaining` store.
-fn footerView(a: std.mem.Allocator, s: *Session) forest.Node {
-    return forest.when(a, .{ .id = "w-foot" }, s.deps.todos.items.len != 0, forest.el(a, .footer, .{}, .{
-        forest.el(a, .span, .{ .id = "count", .text = forest.computed(s.deps.remaining, countText) }, .{}),
-    }));
-}
-
-/// Idle row branch: the title, which enters edit mode on double-click.
-fn viewBranch(a: std.mem.Allocator, t: Todo, arg: []const u8) forest.Node {
-    return forest.el(a, .span, .{
-        .class = "title",
-        .on = .{ .dblclick = "edit" },
-        .arg = arg,
-    }, t.title);
-}
-
-/// Editing row branch: an inline form swapped in through the `row-N/we`
-/// anchor. The hidden `id` input carries the todo id — form submits
-/// serialize named fields only, never `data-arg`.
-fn editBranch(a: std.mem.Allocator, draft: []const u8, arg: []const u8) forest.Node {
-    return forest.el(a, .form, .{
-        .class = "edit-form",
-        .autocomplete = "off",
-        .on = .{ .submit = "edit_save" },
-    }, .{
-        forest.el(a, .input, .{ .type = "hidden", .name = "id", .value = arg }, .{}),
-        forest.el(a, .input, .{
-            .name = "text",
-            .value = draft,
-            .maxlength = max_title_len,
-            .autofocus = true,
-        }, .{}),
-        forest.el(a, .button, .{ .type = "submit" }, "Save"),
-        forest.el(a, .button, .{
-            .type = "button",
-            .class = "edit-cancel",
-            .on = .{ .click = "edit_cancel" },
-            .arg = arg,
-        }, "×"),
-    });
-}
-
-fn buildRow(a: std.mem.Allocator, s: *Session, t: Todo) forest.Node {
-    const ui = uiEntry(s, t.id);
-    // The todo id formats once per row and is shared by every `data-arg`
-    // / hidden `value` binding — previously each attr ran its own `{d}`.
-    var idbuf: [24]u8 = undefined;
-    const arg = a.dupe(u8, std.fmt.bufPrint(&idbuf, "{d}", .{t.id}) catch unreachable) catch @panic("OOM");
-    const base = if (t.done) "todo done" else "todo";
-    const suffix: []const u8 = if (ui != null) " editing" else "";
-    const class = a.alloc(u8, base.len + suffix.len) catch @panic("OOM");
-    @memcpy(class[0..base.len], base);
-    @memcpy(class[base.len..], suffix);
-    return forest.el(a, .li, .{
-        .id = std.fmt.allocPrint(a, "row-{d}", .{t.id}) catch @panic("OOM"),
-        .class = class,
-    }, .{
-        forest.el(a, .input, .{
-            .lid = "cb",
-            .type = "checkbox",
-            .checked = t.done,
-            .on = .{ .change = "set_checked" },
-            .arg = arg,
-        }, .{}),
-        // One `when` op swaps the whole title/form branch; inside a
-        // branch the diff recurses into bound descendants as usual.
-        forest.variant(a, .{ .lid = "we" }, if (ui != null) "edit" else "view", if (ui) |u| editBranch(a, u.draft, arg) else viewBranch(a, t, arg)),
-        forest.el(a, .button, .{
-            .class = "del",
-            .@"aria-label" = "delete",
-            .on = .{ .click = "delete" },
-            .arg = arg,
-        }, "×"),
-    });
-}
-
-/// `eachOf` render fn: the active filter hides rows by returning null;
-/// every survivor is an element carrying `.id`.
-fn rowOrNull(a: std.mem.Allocator, s: *Session, t: Todo) ?forest.Node {
-    if (!visible(s, t)) return null;
-    return buildRow(a, s, t);
-}
-
-/// The `<main>` inner content: static chrome (h1, form), the `w-empty` /
-/// `w-flt` / `w-foot` conditional anchors around the empty-state note,
-/// filter buttons (`flt-*` / `data-active`), and bound `count`, plus the
-/// permanently mounted keyed todo list.
-fn buildView(a: std.mem.Allocator, s: *Session) []const forest.Node {
-    const nodes = a.alloc(forest.Node, 5) catch @panic("OOM");
-    nodes[0] = headerView(a);
-    nodes[1] = emptyView(a, s);
-    nodes[2] = filtersView(a, s);
-    nodes[3] = listView(a, s);
-    nodes[4] = footerView(a, s);
-    return nodes;
-}
-
 // ─────────────────────────────────────────────
-// Session tests
+// tests
 // ─────────────────────────────────────────────
 
 fn patchJson(s: *Session, alloc: std.mem.Allocator) []u8 {
@@ -474,6 +416,28 @@ fn editFields(alloc: std.mem.Allocator, id: []const u8, text: []const u8) std.js
     m.put(alloc, "id", .{ .string = id }) catch @panic("OOM");
     m.put(alloc, "text", .{ .string = text }) catch @panic("OOM");
     return m;
+}
+
+test "generated routes: parse, href, servePage, act dispatch" {
+    const alloc = std.testing.allocator;
+
+    // Single static route: "/" parses, everything else 404s.
+    try std.testing.expect(std.meta.activeTag(routes.parseRoute("/").?) == .index);
+    try std.testing.expect(routes.parseRoute("/foo") == null);
+    try std.testing.expect(Session.validPath("/"));
+    try std.testing.expect(!Session.validPath("/foo"));
+    try std.testing.expectEqualStrings("/", routes.href(alloc, .{ .index = .{} }));
+
+    // servePage accepts "/" and rejects bogus paths.
+    const s = createSession(alloc);
+    defer s.deinit();
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    try std.testing.expect(try s.servePage("/", &aw.writer));
+    try std.testing.expect(std.mem.indexOf(u8, aw.writer.buffered(), "add-form") != null);
+    var bw: std.Io.Writer.Allocating = .init(alloc);
+    defer bw.deinit();
+    try std.testing.expect(!try s.servePage("/foo", &bw.writer));
 }
 
 test "session add/toggle/delete/filter produces patches" {
