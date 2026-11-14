@@ -56,7 +56,7 @@ pub fn parseRoute(path: []const u8) ?Route {
             break :result Route{ .item = .{ .id = id } };
         }
         if (n == 1 and std.mem.eql(u8, segs[0], "structure")) {
-            break :result Route{ .structure = .{  } };
+            break :result Route{ .structure = .{} };
         }
         if (n == 2 and std.mem.eql(u8, segs[0], "tag")) {
             const tag = segs[1];

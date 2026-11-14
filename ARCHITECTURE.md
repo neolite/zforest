@@ -1453,3 +1453,48 @@ throwaway `helloz` app (served "/", 404'd "/nope") before removal.
 Generator fix along the way: an empty `actions = .{}` manifest used
 to emit a dispatch with five unused parameters — `emitActions` now
 discards them explicitly when the manifest is empty.
+
+## zboard → `src/apps/` migration (file-based routing + render groups)
+
+zboard was the last flat app (`src/board*.zig`); it now lives in
+`src/apps/board/` like every other app. The interesting part is how
+the generated routing convention meets render groups, which key on a
+DOMAIN route (`home`/`board`/`thread`/`comment`), not the generated
+wire route (`index`/`b`/`t`/`t_c`).
+
+**Two-layer route.** `Deps.route` holds the generated `routes.Route`
+— the generated `prepare`/`viewNodes` dispatch switches on it, so
+page `prepare(s, params, env)` gates (dangling post/comment ids →
+404) work unchanged. `Deps.page` holds the domain `view.Route` that
+`viewEnv`, `groupKey`, `scopeForRoute` and the view layer consume.
+`pageOf` in `app.zig` maps wire → domain (`/b/:slug` resolves to a
+board index, unknown slug → null → 404 at `setRoute`). Consequence:
+dangling-id rejection moved OUT of `setRoute` INTO the page
+`prepare` gate, and `servePage` calls `routes.prepare` explicitly
+because the grouped `servePage` override bypasses the skeleton's
+prepare call.
+
+**Session stays hand-declared.** `groups.zig` calls
+`Session.scopeForRoute`/`Session.scopeVersion` as statics and Zig
+can't extend a type's namespace, so `Session` replicates the
+skeleton's field list and aliases every `SessionMethods` body —
+same trick documented in the render-groups section, now applied to
+the grouped skeleton variant (`SessionGrouped` via `Skel`).
+
+**Module layout.** `model.zig` = shared `BoardModel` + module-global
+`shared`/`get()` (was `board.zig` + `board_app.model`); `view.zig` =
+domain types + all components + `buildView` (extracted verbatim from
+the old app file); `groups.zig` = render-group registry; `app.zig` =
+`BoardDeps` + `Session` + `on_<action>` handlers + tests;
+`pages/` = the four file routes; `seed.zig` unchanged.
+
+Dispatch went through the generated `actions.dispatch` like the
+other apps: `BoardDeps.dispatch` keeps the two shared preamble steps
+(`out_cookie` reset + `ensureUser` identity mint) then delegates to
+the generated table → `on_post`/`on_comment`/`on_reply`/
+`on_cancel_reply`/`on_sort`/`on_like`.
+
+All board tests ported 1:1 (route-parse test rewritten for the
+ two-layer split; dangling-id assertions moved from `setRoute` to
+`servePage`). Verified: `zig build test`, `zig build`, live smoke on
+all four routes + 404 cases against a seeded db.

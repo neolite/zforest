@@ -1,5 +1,6 @@
-//! zboard — anonymous board app on the generic server: static boards,
-//! threads, and nested tree comments over the shared BoardModel.
+//! zboard — anonymous board app on the zmeta `Session(Deps)` skeleton:
+//! static boards, threads, and nested tree comments over the shared
+//! BoardModel, with file-based routing (`pages/`) and render groups.
 //!
 //! Fan-out design: every session has its own zefx graph + DOM state, but
 //! the model is global. Mutations bump `model.global_seq`; each session's
@@ -7,92 +8,27 @@
 //! for sessions whose route doesn't show the change), then publishes the
 //! batch to that session's history — so one POST reaches every open tab.
 //!
-//! zmeta migration: `Session` is the `.shared_model` archetype on the
-//! `zmeta.Session(Deps)` skeleton — `BoardDeps` carries the per-session
-//! state (parsed route, reply target, sort, `zfxu` identity, seen
-//! cursor, render-group membership, the `ping` event) while the skeleton
-//! owns the transport contract (app/seq/dom/log/history/arena/CSRF).
-//! `board_groups.zig` stays board-owned and calls
-//! `board_app.Session.scopeForRoute`/`scopeVersion` as statics, so
-//! `Session` is hand-declared with the skeleton's exact field list and
-//! aliases the skeleton's generic method bodies rather than being
-//! `pub const Session = zmeta.Session(BoardDeps)` verbatim — see the
-//! comment above `Session` below and ARCHITECTURE.md.
+//! zmeta app dir: `app.zig` holds `BoardDeps` (the Deps contract) + the
+//! hand-declared `Session` (groups.zig needs `scopeForRoute`/
+//! `scopeVersion` as statics — see the comment above `Session`),
+//! `model.zig` the shared BoardModel, `boardview.zig` the domain Route/
+//! ViewEnv + components, `groups.zig` the render-group registry,
+//! `pages/` the file routes, `actions.zig` the manifest, `gen/` the
+//! checked-in codegen.
+//!
+//! Routing split: `gen/routes.zig` owns path parsing + typed params;
+//! `pageOf` maps the generated `routes.Route` onto the domain
+//! `boardview.Route` the view/group layers key on (slug → board index).
 const std = @import("std");
 const zefx = @import("zefx");
 const forest = @import("forest");
-const zmeta = @import("zmeta/root.zig");
-const board = @import("board.zig");
-const board_groups = @import("board_groups.zig");
-const History = @import("server/history.zig").History;
-
-/// The shared model, installed by board_main before serve(). All access
-/// is serialized by the server's session mutex.
-pub var model: ?*board.BoardModel = null;
-
-fn m() *board.BoardModel {
-    return model orelse @panic("board model not initialized");
-}
-
-/// Shared-model mutation counter — the render groups' dedup cursor.
-pub fn globalSeq() u64 {
-    return m().global_seq.load(.seq_cst);
-}
-
-/// Request routes: "/" home, "/b/<slug>", "/t/<post>", "/t/<post>/c/<comment>".
-pub const Route = union(enum) {
-    home,
-    board: usize,
-    thread: u64,
-    comment: u64,
-};
-
-/// Top-level comment ordering on thread pages — a per-session
-/// preference that is part of the render-group key (like reply_to):
-/// sessions only share a view when their sort matches.
-pub const Sort = enum { new, top };
-
-/// Everything the view tree reads from session/group state: route,
-/// inline-reply target, the resolved `#who` display name, and the cursor
-/// `buildView` marks caught-up — the session's `seen_seq` or the render
-/// group's `last_rendered_seq`. Group members share one env's worth of
-/// inputs; that identity IS the render-group key (see board_groups.zig).
-pub const ViewEnv = struct {
-    route: Route,
-    reply_to: ?u64 = null,
-    /// Top-level comment order — `.new` newest-first (default),
-    /// `.top` by like count. Mirrors the session's `sort`.
-    sort: Sort = .new,
-    /// Resolved display name for the `#who` chip ("Anon#N" / "anon") —
-    /// post/comment authors still resolve their own tokens via `nameOf`.
-    name: []const u8 = "anon",
-    /// Cursor `buildView` stamps with `global_seq` — written only by view
-    /// builds that actually sync tracked Dom state (diff/seed), never by
-    /// incidental SSR/snapshot serialization of an already-current group.
-    seen: ?*u64 = null,
-};
-
-pub fn parseRoute(path: []const u8) ?Route {
-    if (std.mem.eql(u8, path, "/")) return .home;
-    if (std.mem.startsWith(u8, path, "/b/")) {
-        const idx = board.boardIndex(path[3..]) orelse return null;
-        return .{ .board = idx };
-    }
-    if (std.mem.startsWith(u8, path, "/t/")) {
-        const rest = path[3..];
-        if (std.mem.indexOfScalar(u8, rest, '/')) |slash| {
-            const mid = rest[slash + 1 ..];
-            if (!std.mem.startsWith(u8, mid, "c/")) return null;
-            const post_id = std.fmt.parseInt(u64, rest[0..slash], 10) catch return null;
-            const cid = std.fmt.parseInt(u64, mid[2..], 10) catch return null;
-            _ = post_id; // the comment id is authoritative; post is derived
-            return .{ .comment = cid };
-        }
-        const id = std.fmt.parseInt(u64, rest, 10) catch return null;
-        return .{ .thread = id };
-    }
-    return null;
-}
+const zmeta = @import("zmeta.zig");
+const model = @import("model.zig");
+const groups = @import("groups.zig");
+const boardview = @import("view.zig");
+const routes = @import("gen/routes.zig");
+const actions = @import("gen/actions.zig");
+const History = @import("../../server/history.zig").History;
 
 /// Flush-trigger payload — every mutation emits it; the `onPing`
 /// reducer (registered by `BoardDeps.wire`) bumps the patch revision in
@@ -103,14 +39,27 @@ const Ping = struct {};
 /// and minted into `Session.out_cookie` on first POST.
 pub const user_cookie_name = "zfxu";
 
+/// Generated route → domain route: `/b/:slug` resolves to the board
+/// index (unknown slug → null → 404); post/comment ids pass through —
+/// existence is the page `prepare` gate. The comment permalink keeps
+/// only the comment id (it is authoritative; `post` derives from it).
+fn pageOf(r: routes.Route) ?boardview.Route {
+    return switch (r) {
+        .index => .home,
+        .b => |p| if (model.boardIndex(p.slug)) |i| .{ .board = i } else null,
+        .t => |p| .{ .thread = p.post },
+        .t_c => |p| .{ .comment = p.comment },
+    };
+}
+
 /// Board domain state + graph handles — the zmeta `Deps` for the
 /// `.shared_model` archetype (docs/meta-framework.md §4.1/§5.3). The
 /// `Session` skeleton owns the transport contract (app/seq/dom/log/
 /// history/arena/CSRF/route path); everything domain-specific — the
 /// parsed route, inline-reply target, sort preference, `zfxu` identity,
 /// seen cursor, render-group membership, and the `ping` event — lives
-/// here on `s.deps`. The shared `BoardModel` and the `board_groups`
-/// registry stay module-global (app-owned), exactly as before.
+/// here on `s.deps`. The shared `BoardModel` (model.zig) and the
+/// `groups.zig` registry stay module-global (app-owned).
 pub const BoardDeps = struct {
     /// §4.1 archetype — module-global model + per-session view state.
     pub const archetype: zmeta.Archetype = .shared_model;
@@ -120,14 +69,19 @@ pub const BoardDeps = struct {
     pub const page_class = "app app-board";
     pub const cookie_name = "zfxb";
 
-    /// Parsed route — written by `Deps.setRoute`; read by the view and
-    /// the render-group key. The raw path string lives on
-    /// `Session.route` (skeleton-owned, feeds `Env.route`).
-    route: Route = .home,
+    /// Wire route — the generated `routes.Route` written by
+    /// `Deps.setRoute`; the generated `prepare`/`viewNodes` dispatch
+    /// switches on it. The raw path string lives on `Session.route`
+    /// (skeleton-owned, feeds `Env.route`).
+    route: routes.Route = .{ .index = .{} },
+    /// Domain route — `pageOf`'s mapping of `route` onto the
+    /// `boardview.Route` the view/render-group layers key on
+    /// (slug → board index, comment permalink → comment id).
+    page: boardview.Route = .home,
     /// Comment id the inline reply form is mounted under (per-session).
     reply_to: ?u64 = null,
     /// Top-level comment sort preference (per-session, group-key input).
-    sort: Sort = .new,
+    sort: boardview.Sort = .new,
     /// zfxu cookie value — the anonymous poster identity ("" = anonymous).
     user_token: []u8 = &.{},
     /// Scratch for the Set-Cookie value emitted on the minting POST —
@@ -140,9 +94,9 @@ pub const BoardDeps = struct {
     /// Set by the first successful servePage — gates render grouping so
     /// sessions that never served a page keep the solo diff path.
     attached: bool = false,
-    /// Render-group membership (board_groups.zig): sessions with equal
+    /// Render-group membership (groups.zig): sessions with equal
     /// (route, reply_to, resolved name, sort) share one Dom/history/rev.
-    group: ?*board_groups.RenderGroup = null,
+    group: ?*groups.RenderGroup = null,
     /// Bumped on every stream-INCOMPATIBLE group transition — join of a
     /// foreign namespace, first attach, group recreation — the SSE
     /// stream compares it per poll; ANY change forces a snapshot +
@@ -169,7 +123,7 @@ pub const BoardDeps = struct {
     pub fn deinit(s: *Session) void {
         // Release group membership first — the last leaver destroys the
         // group; eviction must not corrupt shared group state.
-        if (s.deps.group) |g| board_groups.leave(s.gpa, g);
+        if (s.deps.group) |g| groups.leave(s.gpa, g);
         s.deps.group = null;
         if (s.deps.user_token.len != 0) s.gpa.free(s.deps.user_token);
     }
@@ -181,27 +135,27 @@ pub const BoardDeps = struct {
         s.deps.ping.onReducer(s, &onPing);
     }
 
-    /// `Deps.setRoute` — parse + dangling-id gate, then store the parsed
-    /// route and clear the inline-reply target. The skeleton stores the
-    /// raw path for `Env.route` itself on success.
+    /// `Deps.setRoute` — parse via the generated table, map to the
+    /// domain route (slug → board index), store it and clear the
+    /// inline-reply target. Dangling-id checks live in the page
+    /// `prepare` gate (servePage), not here. The skeleton stores the
+    /// raw path for `Env.route` itself.
     pub fn setRoute(s: *Session, path: []const u8) bool {
-        const r = parseRoute(path) orelse return false;
-        // Well-formed but dangling ids get a real 404, not an empty page.
-        switch (r) {
-            .thread => |pid| if (m().post(pid) == null) return false,
-            .comment => |cid| if (m().comment(cid) == null) return false,
-            else => {},
-        }
+        const r = routes.parseRoute(path) orelse return false;
+        const page = pageOf(r) orelse return false;
         s.deps.route = r;
+        s.deps.page = page;
         s.deps.reply_to = null;
         return true;
     }
 
     /// `Deps.validPath` — static route pre-check run before a session is
-    /// minted (parseable shape only; dangling ids still 404 inside
-    /// servePage's setRoute).
+    /// minted: parseable shape AND resolvable slug (model boards are a
+    /// static list, so `/b/nope` fails here without minting a session).
+    /// Dangling post/comment ids still 404 inside servePage's prepare.
     pub fn validPath(path: []const u8) bool {
-        return parseRoute(path) != null;
+        const r = routes.parseRoute(path) orelse return false;
+        return pageOf(r) != null;
     }
 
     /// `Deps.readCookies` — pick up the `zfxu` user cookie before
@@ -224,12 +178,15 @@ pub const BoardDeps = struct {
     }
 
     /// `Deps.servePage` — the grouped page pipeline: setRoute →
-    /// render-group membership sync → ensure-group-current → writeView.
-    /// NO dom.reset/seedDom — the shared Dom lives in the render group;
+    /// page `prepare` gate (dangling ids → 404) → render-group
+    /// membership sync → ensure-group-current → writeView. NO
+    /// dom.reset/seedDom — the shared Dom lives in the render group;
     /// a fresh group was seeded privately at join and an existing
     /// group's Dom already matches the view this page ships.
     pub fn servePage(s: *Session, path: []const u8, writer: anytype) !bool {
         if (!s.setRoute(path)) return false;
+        const env = zmeta.Env{ .route = s.route };
+        routes.prepare(s, &env) catch return false;
         s.deps.attached = true;
         syncMembership(s);
         ensureGroupCurrent(s);
@@ -251,7 +208,7 @@ pub const BoardDeps = struct {
             return;
         }
         const rendered = s.deps.seen_seq;
-        if (m().global_seq.load(.seq_cst) == rendered) return;
+        if (model.get().global_seq.load(.seq_cst) == rendered) return;
         s.deps.ping.emit(.{});
     }
 
@@ -300,8 +257,12 @@ pub const BoardDeps = struct {
     }
 
     /// `Deps.dispatch` — whitelisted action entry point: the DOM event
-    /// protocol (`action`, `arg`, `value`, `fields`), verbatim port of
-    /// the hand-rolled Session.dispatch.
+    /// protocol (`action`, `arg`, `value`, `fields`). The generated
+    /// `actions.dispatch` fans out to the `on_<name>` handlers below;
+    /// this wrapper owns the two pieces EVERY action shares — the
+    /// one-shot `out_cookie` reset and first-contact identity minting
+    /// (even a rejected action establishes `zfxu`, matching the old
+    /// inline dispatch).
     pub fn dispatch(
         s: *Session,
         action: []const u8,
@@ -309,58 +270,86 @@ pub const BoardDeps = struct {
         value: ?[]const u8,
         fields: ?*const std.json.ObjectMap,
     ) !void {
-        _ = value;
         // `out_cookie` is a one-shot: the server emits it on this response
         // only — later POSTs must not re-send the Set-Cookie header.
         s.out_cookie = "";
         // Every POST establishes identity on first contact.
         try ensureUser(s);
+        return actions.dispatch(s, action, arg, value, fields);
+    }
 
-        if (std.mem.eql(u8, action, "post")) {
-            const f = fields orelse return error.InvalidAction;
-            const slug = fieldStr(f, "board") orelse return error.InvalidAction;
-            const text = fieldStr(f, "text") orelse return error.InvalidAction;
-            _ = try m().addPost(slug, s.deps.user_token, text);
-            s.deps.ping.emit(.{});
-        } else if (std.mem.eql(u8, action, "comment")) {
-            const f = fields orelse return error.InvalidAction;
-            const post_id = fieldU64(f, "post") orelse return error.InvalidAction;
-            const parent = fieldU64(f, "parent");
-            const text = fieldStr(f, "text") orelse return error.InvalidAction;
-            _ = try m().addComment(post_id, parent, s.deps.user_token, text);
-            s.deps.reply_to = null;
-            s.deps.ping.emit(.{});
-        } else if (std.mem.eql(u8, action, "reply")) {
-            const a = arg orelse return error.InvalidAction;
-            const cid = std.fmt.parseInt(u64, a, 10) catch return error.InvalidAction;
-            if (m().comment(cid) == null) return error.CommentNotFound;
-            s.deps.reply_to = cid;
-            s.deps.ping.emit(.{});
-        } else if (std.mem.eql(u8, action, "cancel_reply")) {
-            s.deps.reply_to = null;
-            s.deps.ping.emit(.{});
-        } else if (std.mem.eql(u8, action, "sort")) {
-            const a = arg orelse return error.InvalidAction;
-            if (std.mem.eql(u8, a, "top")) {
-                s.deps.sort = .top;
-            } else if (std.mem.eql(u8, a, "new")) {
-                s.deps.sort = .new;
-            } else return error.InvalidAction;
-            s.deps.ping.emit(.{});
-        } else if (std.mem.eql(u8, action, "like")) {
-            const a = arg orelse return error.InvalidAction;
-            if (a.len < 2) return error.InvalidAction;
-            const kind: board.LikeKind = switch (a[0]) {
-                'p' => .post,
-                'c' => .comment,
-                else => return error.InvalidAction,
-            };
-            const target = std.fmt.parseInt(u64, a[1..], 10) catch return error.InvalidAction;
-            _ = try m().toggleLike(kind, target, s.deps.user_token);
-            s.deps.ping.emit(.{});
-        } else {
-            return error.InvalidAction;
-        }
+    /// `post` — fields {board, text} → addPost on the shared model.
+    pub fn on_post(s: *Session, arg: ?[]const u8, value: ?[]const u8, fields: ?*const std.json.ObjectMap) !void {
+        _ = arg;
+        _ = value;
+        const f = fields orelse return error.InvalidAction;
+        const slug = fieldStr(f, "board") orelse return error.InvalidAction;
+        const text = fieldStr(f, "text") orelse return error.InvalidAction;
+        _ = try model.get().addPost(slug, s.deps.user_token, text);
+        s.deps.ping.emit(.{});
+    }
+
+    /// `comment` — fields {post, parent?, text} → addComment; clears
+    /// the inline-reply target.
+    pub fn on_comment(s: *Session, arg: ?[]const u8, value: ?[]const u8, fields: ?*const std.json.ObjectMap) !void {
+        _ = arg;
+        _ = value;
+        const f = fields orelse return error.InvalidAction;
+        const post_id = fieldU64(f, "post") orelse return error.InvalidAction;
+        const parent = fieldU64(f, "parent");
+        const text = fieldStr(f, "text") orelse return error.InvalidAction;
+        _ = try model.get().addComment(post_id, parent, s.deps.user_token, text);
+        s.deps.reply_to = null;
+        s.deps.ping.emit(.{});
+    }
+
+    /// `reply` — arg = comment id → mount the inline reply form under it.
+    pub fn on_reply(s: *Session, arg: ?[]const u8, value: ?[]const u8, fields: ?*const std.json.ObjectMap) !void {
+        _ = value;
+        _ = fields;
+        const a = arg orelse return error.InvalidAction;
+        const cid = std.fmt.parseInt(u64, a, 10) catch return error.InvalidAction;
+        if (model.get().comment(cid) == null) return error.CommentNotFound;
+        s.deps.reply_to = cid;
+        s.deps.ping.emit(.{});
+    }
+
+    /// `cancel_reply` — unmount the inline reply form.
+    pub fn on_cancel_reply(s: *Session, arg: ?[]const u8, value: ?[]const u8, fields: ?*const std.json.ObjectMap) !void {
+        _ = arg;
+        _ = value;
+        _ = fields;
+        s.deps.reply_to = null;
+        s.deps.ping.emit(.{});
+    }
+
+    /// `sort` — arg "new"|"top" → top-level comment ordering.
+    pub fn on_sort(s: *Session, arg: ?[]const u8, value: ?[]const u8, fields: ?*const std.json.ObjectMap) !void {
+        _ = value;
+        _ = fields;
+        const a = arg orelse return error.InvalidAction;
+        if (std.mem.eql(u8, a, "top")) {
+            s.deps.sort = .top;
+        } else if (std.mem.eql(u8, a, "new")) {
+            s.deps.sort = .new;
+        } else return error.InvalidAction;
+        s.deps.ping.emit(.{});
+    }
+
+    /// `like` — arg "p<id>"|"c<id>" → toggleLike for this user.
+    pub fn on_like(s: *Session, arg: ?[]const u8, value: ?[]const u8, fields: ?*const std.json.ObjectMap) !void {
+        _ = value;
+        _ = fields;
+        const a = arg orelse return error.InvalidAction;
+        if (a.len < 2) return error.InvalidAction;
+        const kind: model.LikeKind = switch (a[0]) {
+            'p' => .post,
+            'c' => .comment,
+            else => return error.InvalidAction,
+        };
+        const target = std.fmt.parseInt(u64, a[1..], 10) catch return error.InvalidAction;
+        _ = try model.get().toggleLike(kind, target, s.deps.user_token);
+        s.deps.ping.emit(.{});
     }
 
     // ── render-path overrides ────────────────────────────────────
@@ -388,7 +377,7 @@ pub const BoardDeps = struct {
         }
         _ = s.render_arena.reset(.retain_capacity);
         const a = s.render_arena.allocator();
-        forest.diff(a, buildView(a, viewEnv(s)), &s.dom, &s.log);
+        forest.diff(a, boardview.buildView(a, viewEnv(s)), &s.dom, &s.log);
         s.log.revision = s.seq.get();
     }
 
@@ -397,7 +386,7 @@ pub const BoardDeps = struct {
     pub fn writeView(s: *Session, writer: anytype) !void {
         _ = s.render_arena.reset(.retain_capacity);
         const a = s.render_arena.allocator();
-        try forest.writeHtml(a, buildView(a, viewEnv(s)), writer);
+        try forest.writeHtml(a, boardview.buildView(a, viewEnv(s)), writer);
     }
 
     /// `Deps.buildViewNodes` — the session's current view nodes for the
@@ -406,11 +395,11 @@ pub const BoardDeps = struct {
     /// hand-rolled version — the §4.4 cursor split is preserved:
     /// session-side builds write the SESSION cursor, and only the
     /// render group's own seed/render builds (which call
-    /// `board_app.buildView` with the GROUP's ViewEnv,
+    /// `boardview.buildView` with the GROUP's ViewEnv,
     /// `seen = &g.last_rendered_seq`) write the group cursor. Session
     /// builds never touch `last_rendered_seq`.
     pub fn buildViewNodes(s: *Session, a: std.mem.Allocator) []const forest.Node {
-        return buildView(a, viewEnv(s));
+        return boardview.buildView(a, viewEnv(s));
     }
 
     /// `Deps.seedDom` — solo-path helper: render + drop the patch log.
@@ -429,7 +418,7 @@ pub const BoardDeps = struct {
     /// the thin `{route}` v0 slice and is ignored here.
     pub fn view(a: std.mem.Allocator, s: *Session, env: *const zmeta.Env) []const forest.Node {
         _ = env;
-        return buildView(a, viewEnv(s));
+        return boardview.buildView(a, viewEnv(s));
     }
 };
 
@@ -441,21 +430,20 @@ const Skel = zmeta.Session(BoardDeps);
 /// One browser session — the full `server/http.zig` contract.
 ///
 /// Why hand-declared instead of `pub const Session =
-/// zmeta.Session(BoardDeps)`: `board_groups.zig` (board-owned,
-/// unchanged by the migration) calls `Session.scopeForRoute`/
-/// `Session.scopeVersion` as STATIC decls on this type, and Zig cannot
-/// extend a type's namespace — the skeleton's SessionGrouped has a
-/// fixed decl list. So `Session` replicates the skeleton's exact field
-/// list and aliases every contract method from `Skel`: the method
-/// bodies live ONCE in `zmeta/session.zig`'s `SessionMethods` as
-/// generic `self: anytype` fns, so `pub const dispatch = Skel.dispatch`
-/// etc. instantiate against `*Session` exactly like they do against
-/// `*SessionGrouped`. The only additions are the two board-owned
-/// statics `board_groups` needs and the `viewEnv`/`render` compat decls
-/// (the skeleton keeps those private — provided here so no aliased
-/// default branch can resolve a missing decl). `create` mirrors the
-/// skeleton's `createSessionImpl`: contract fields → `Deps.init`/
-/// `Deps.wire` → the render after-flush hook LAST.
+/// zmeta.Session(BoardDeps)`: `groups.zig` (board-owned) calls
+/// `Session.scopeForRoute`/`Session.scopeVersion` as STATIC decls on
+/// this type, and Zig cannot extend a type's namespace — the skeleton's
+/// SessionGrouped has a fixed decl list. So `Session` replicates the
+/// skeleton's exact field list and aliases every contract method from
+/// `Skel`: the method bodies live ONCE in `zmeta/session.zig`'s
+/// `SessionMethods` as generic `self: anytype` fns, so
+/// `pub const dispatch = Skel.dispatch` etc. instantiate against
+/// `*Session` exactly like they do against `*SessionGrouped`. The only
+/// additions are the two board-owned statics `groups` needs and the
+/// `viewEnv`/`render` compat decls (the skeleton keeps those private —
+/// provided here so no aliased default branch can resolve a missing
+/// decl). `create` mirrors the skeleton's `createSessionImpl`: contract
+/// fields → `Deps.init`/`Deps.wire` → the render after-flush hook LAST.
 pub const Session = struct {
     // ── contract fields owned by the skeleton ─────────────────
     // IDENTICAL to SessionGrouped's field list — the aliased
@@ -537,15 +525,15 @@ pub const Session = struct {
     /// buildView+diff on this version (dirty-only dispatch). Comment
     /// permalinks read their whole post's scope: a reply anywhere in
     /// the thread re-renders them (over-broad but correct).
-    /// Static: `board_groups.zig` calls it as `Session.scopeForRoute`.
-    pub fn scopeForRoute(route: Route) u64 {
+    /// Static: `groups.zig` calls it as `Session.scopeForRoute`.
+    pub fn scopeForRoute(route: boardview.Route) u64 {
         return switch (route) {
-            .home => board.SCOPE_HOME,
-            .board => |i| board.scopeBoard(i),
-            .thread => |pid| board.scopePost(pid),
+            .home => model.SCOPE_HOME,
+            .board => |i| model.scopeBoard(i),
+            .thread => |pid| model.scopePost(pid),
             .comment => |cid| blk: {
-                const c = m().comment(cid) orelse break :blk board.scopePost(0);
-                break :blk board.scopePost(c.post);
+                const c = model.get().comment(cid) orelse break :blk model.scopePost(0);
+                break :blk model.scopePost(c.post);
             },
         };
     }
@@ -553,7 +541,7 @@ pub const Session = struct {
     /// Current version of a scope key — groups compare it against
     /// their `scope_seen` cursor. Static like `scopeForRoute`.
     pub fn scopeVersion(key: u64) u64 {
-        return m().scopeVersion(key);
+        return model.get().scopeVersion(key);
     }
 
     /// Skeleton-compat decls — the skeleton's SessionMethods bodies
@@ -606,21 +594,21 @@ fn ensureUser(s: *Session) !void {
         s.io.random(&rb);
         const tok = std.fmt.allocPrint(s.gpa, "{x}", .{std.mem.readInt(u64, rb[0..8], .little)}) catch @panic("OOM");
         errdefer s.gpa.free(tok);
-        _ = try m().ensureUser(tok);
+        _ = try model.get().ensureUser(tok);
         s.out_cookie = std.fmt.bufPrint(&s.deps.out_cookie_buf, "{s}={s}; Path=/; SameSite=Lax", .{ user_cookie_name, tok }) catch @panic("cookie buf too small");
         s.deps.user_token = tok;
         return;
     }
-    if (m().userName(s.deps.user_token) == null) {
-        _ = try m().ensureUser(s.deps.user_token);
+    if (model.get().userName(s.deps.user_token) == null) {
+        _ = try model.get().ensureUser(s.deps.user_token);
     }
 }
 
 /// The session's current group-key inputs — recomputed on every render
 /// so an identity minted by a (possibly failed) dispatch is picked up
 /// BEFORE the group is chosen/rendered.
-fn groupKey(s: *Session) board_groups.Key {
-    return .{ .route = s.deps.route, .reply_to = s.deps.reply_to, .name = nameOf(s.deps.user_token), .sort = s.deps.sort };
+fn groupKey(s: *Session) groups.Key {
+    return .{ .route = s.deps.page, .reply_to = s.deps.reply_to, .name = boardview.nameOf(s.deps.user_token), .sort = s.deps.sort };
 }
 
 /// Join/migrate the render group when the key changed. Bumps
@@ -634,21 +622,21 @@ fn syncMembership(s: *Session) void {
     if (!s.deps.attached) return;
     const key = groupKey(s);
     var kbuf: [256]u8 = undefined;
-    const ks = board_groups.keyStringInto(&kbuf, key.route, key.reply_to, key.name, key.sort);
+    const ks = groups.keyStringInto(&kbuf, key.route, key.reply_to, key.name, key.sort);
     if (s.deps.group) |g| {
         if (std.mem.eql(u8, g.key_string, ks)) return;
-        if (!board_groups.contains(key)) {
+        if (!groups.contains(key)) {
             // Absent key → clone-fork: new group inherits g's stream
             // lineage (rev + history + tracked Dom). Epoch stays —
             // the client's cursor remains valid on the new group.
-            s.deps.group = board_groups.fork(s.gpa, g, key);
-            board_groups.leave(s.gpa, g);
+            s.deps.group = groups.fork(s.gpa, g, key);
+            groups.leave(s.gpa, g);
             return;
         }
-        board_groups.leave(s.gpa, g);
+        groups.leave(s.gpa, g);
         s.deps.group = null;
     }
-    s.deps.group = board_groups.join(s.gpa, key);
+    s.deps.group = groups.join(s.gpa, key);
     s.deps.membership_epoch +%= 1;
 }
 
@@ -664,15 +652,15 @@ fn ensureGroupCurrent(s: *Session) void {
 /// The board `ViewEnv` for session-side builds — `seen` is the
 /// session's own `seen_seq` cursor. The §4.4 split: only Dom-syncing
 /// builds stamp a cursor, and the render group's own seed/render builds
-/// go through `board_app.buildView` with the GROUP's ViewEnv
+/// go through `boardview.buildView` with the GROUP's ViewEnv
 /// (`seen = &g.last_rendered_seq`) instead — session builds never touch
-/// the group cursor.
-fn viewEnv(s: *Session) ViewEnv {
+/// the group cursor. `pub`: page files delegate their `view` here.
+pub fn viewEnv(s: *Session) boardview.ViewEnv {
     return .{
-        .route = s.deps.route,
+        .route = s.deps.page,
         .reply_to = s.deps.reply_to,
         .sort = s.deps.sort,
-        .name = nameOf(s.deps.user_token),
+        .name = boardview.nameOf(s.deps.user_token),
         .seen = &s.deps.seen_seq,
     };
 }
@@ -702,442 +690,18 @@ fn fieldU64(f: *const std.json.ObjectMap, name: []const u8) ?u64 {
     };
 }
 
-// ── view helpers ──────────────────────────────────────────────────
-
-fn nameOf(token: []const u8) []const u8 {
-    if (token.len == 0) return "anon";
-    return m().userName(token) orelse "anon";
-}
-
-fn fmtTs(a: std.mem.Allocator, ts: i64) []const u8 {
-    const secs = std.time.epoch.EpochSeconds{ .secs = @intCast(ts) };
-    const day = secs.getEpochDay();
-    const yd = day.calculateYearDay();
-    const md = yd.calculateMonthDay();
-    const ds = secs.getDaySeconds();
-    return std.fmt.allocPrint(a, "{d:0>2}.{d:0>2} {d:0>2}:{d:0>2}", .{
-        md.day_index + 1, md.month.numeric(), ds.getHoursIntoDay(), ds.getMinutesIntoHour(),
-    }) catch @panic("OOM");
-}
-
-fn boardHref(a: std.mem.Allocator, slug: []const u8) []const u8 {
-    return std.fmt.allocPrint(a, "/b/{s}", .{slug}) catch @panic("OOM");
-}
-
-fn threadHref(a: std.mem.Allocator, post_id: u64) []const u8 {
-    return std.fmt.allocPrint(a, "/t/{d}", .{post_id}) catch @panic("OOM");
-}
-
-fn commentHref(a: std.mem.Allocator, post_id: u64, cid: u64) []const u8 {
-    return std.fmt.allocPrint(a, "/t/{d}/c/{d}", .{ post_id, cid }) catch @panic("OOM");
-}
-
-// ── view components ───────────────────────────────────────────────
-
-/// Sidebar: real links (full navigation) + the poster identity chip.
-fn navView(a: std.mem.Allocator, env: ViewEnv) forest.Node {
-    var links: std.ArrayListUnmanaged(forest.Node) = .empty;
-    const home_on = env.route == .home;
-    links.append(a, forest.el(a, .a, .{ .href = "/", .class = if (home_on) "on" else null }, "⌂")) catch @panic("OOM");
-    for (board.boards, 0..) |b, i| {
-        const on = switch (env.route) {
-            .board => |bi| bi == i,
-            else => false,
-        };
-        links.append(a, forest.el(a, .a, .{
-            .href = boardHref(a, b.slug),
-            .class = if (on) "on" else null,
-        }, b.title)) catch @panic("OOM");
-    }
-    // Identity chip is bound (`#who` + .text) so the first POST's minted
-    // "Anon#N" name patches in live. `env.name` is the RESOLVED display
-    // name — identical for every member of a render group.
-    links.append(a, forest.el(a, .span, .{ .id = "who", .class = "who", .text = env.name }, .{})) catch @panic("OOM");
-    return forest.el(a, .div, .{ .class = "bnav" }, links.toOwnedSlice(a) catch @panic("OOM"));
-}
-
-/// Post card: #id, board, Anon, time, pre-wrap text, thread link with a
-/// live comment count (diffed in place via `lid`).
-/// `"c<id>"`/`"p<id>"` — the `data-arg` payload of like buttons.
-fn likeArg(a: std.mem.Allocator, prefix: u8, id: u64) []const u8 {
-    return std.fmt.allocPrint(a, "{c}{d}", .{ prefix, id }) catch @panic("OOM");
-}
-
-fn likeLabel(a: std.mem.Allocator, count: u32) []const u8 {
-    return std.fmt.allocPrint(a, "\u{25B2} {d}", .{count}) catch @panic("OOM");
-}
-
-fn postCard(a: std.mem.Allocator, p: *const board.Post, show_link: bool) forest.Node {
-    const mm = m();
-    const count = mm.commentCount(p.id);
-    const lcount = mm.likeCount(p.id);
-    var kids: std.ArrayListUnmanaged(forest.Node) = .empty;
-    kids.append(a, forest.el(a, .div, .{ .class = "meta" }, .{
-        forest.el(a, .span, .{ .class = "pid" }, std.fmt.allocPrint(a, "#{d}", .{p.id}) catch @panic("OOM")),
-        forest.text(" · "),
-        forest.el(a, .a, .{ .href = boardHref(a, p.board), .class = "bref" }, p.board),
-        forest.text(" · "),
-        forest.el(a, .span, .{ .class = "who" }, nameOf(p.user)),
-        forest.text(" · "),
-        forest.el(a, .span, .{ .class = "ts" }, fmtTs(a, p.ts)),
-    })) catch @panic("OOM");
-    kids.append(a, forest.el(a, .div, .{ .class = "ptext" }, p.text)) catch @panic("OOM");
-    if (show_link) {
-        kids.append(a, forest.el(a, .div, .{ .class = "actions" }, .{
-            forest.el(a, .a, .{
-                .lid = "go",
-                .href = threadHref(a, p.id),
-                .text = std.fmt.allocPrint(a, "→ тред ({d})", .{count}) catch @panic("OOM"),
-            }, .{}),
-            forest.text(" "),
-            forest.el(a, .button, .{
-                .id = std.fmt.allocPrint(a, "like-p{d}", .{p.id}) catch @panic("OOM"),
-                .class = "like-btn",
-                .on = .{ .click = "like" },
-                .arg = likeArg(a, 'p', p.id),
-                .text = likeLabel(a, lcount),
-            }, .{}),
-        })) catch @panic("OOM");
-    }
-    return forest.el(a, .div, .{
-        .id = std.fmt.allocPrint(a, "post-{d}", .{p.id}) catch @panic("OOM"),
-        .class = "post",
-    }, kids.toOwnedSlice(a) catch @panic("OOM"));
-}
-
-/// New-post form: hidden `board` field + textarea; `post` action.
-fn postForm(a: std.mem.Allocator, slug: []const u8) forest.Node {
-    return forest.el(a, .form, .{
-        .id = "post-form",
-        .class = "post-form",
-        .autocomplete = "off",
-        .on = .{ .submit = "post" },
-    }, .{
-        forest.el(a, .input, .{ .type = "hidden", .name = "board", .value = slug }, .{}),
-        forest.el(a, .textarea, .{
-            .name = "text",
-            .placeholder = "Текст поста…",
-            .rows = "4",
-            .maxlength = board.max_text_len,
-            .autofocus = true,
-        }, .{}),
-        forest.el(a, .button, .{ .type = "submit" }, "Запостить"),
-    });
-}
-
-/// Format a u64 id once per use site — shared by `data-arg`, hidden
-/// `value`s and `#N` labels instead of a `{d}` fmt per binding per render.
-fn u64str(a: std.mem.Allocator, v: u64) []const u8 {
-    var buf: [24]u8 = undefined;
-    return a.dupe(u8, std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable) catch @panic("OOM");
-}
-
-/// Comment form: hidden `post` (+ optional `parent`) + text input.
-fn commentFormNodes(a: std.mem.Allocator, post_str: []const u8, parent_str: ?[]const u8, is_inline: bool) []const forest.Node {
-    var kids: std.ArrayListUnmanaged(forest.Node) = .empty;
-    kids.append(a, forest.el(a, .input, .{ .type = "hidden", .name = "post", .value = post_str }, .{})) catch @panic("OOM");
-    if (parent_str) |ps| {
-        kids.append(a, forest.el(a, .input, .{ .type = "hidden", .name = "parent", .value = ps }, .{})) catch @panic("OOM");
-    }
-    if (is_inline) {
-        kids.append(a, forest.el(a, .input, .{
-            .name = "text",
-            .placeholder = "Ответить…",
-            .maxlength = board.max_text_len,
-            .autofocus = true,
-        }, .{})) catch @panic("OOM");
-        kids.append(a, forest.el(a, .button, .{ .type = "submit", .class = "mini" }, "→")) catch @panic("OOM");
-        kids.append(a, forest.el(a, .button, .{
-            .type = "button",
-            .class = "mini cancel",
-            .on = .{ .click = "cancel_reply" },
-        }, "×")) catch @panic("OOM");
-    } else {
-        kids.append(a, forest.el(a, .textarea, .{
-            .name = "text",
-            .placeholder = "Комментарий…",
-            .rows = "3",
-            .maxlength = board.max_text_len,
-            .autofocus = true,
-        }, .{})) catch @panic("OOM");
-        kids.append(a, forest.el(a, .button, .{ .type = "submit" }, "Комментировать")) catch @panic("OOM");
-    }
-    return kids.toOwnedSlice(a) catch @panic("OOM");
-}
-
-fn commentForm(a: std.mem.Allocator, post_id: u64, parent_id: ?u64) forest.Node {
-    const post_str = u64str(a, post_id);
-    const parent_str = if (parent_id) |pid| u64str(a, pid) else null;
-    return forest.el(a, .form, .{
-        .class = "comment-form",
-        .autocomplete = "off",
-        .on = .{ .submit = "comment" },
-    }, commentFormNodes(a, post_str, parent_str, false));
-}
-
-/// Inline reply form mounted under comment `c` via the `w-rep-N` anchor.
-fn replyForm(a: std.mem.Allocator, post_str: []const u8, parent_str: []const u8) forest.Node {
-    return forest.el(a, .form, .{
-        .class = "reply-form",
-        .autocomplete = "off",
-        .on = .{ .submit = "comment" },
-    }, commentFormNodes(a, post_str, parent_str, true));
-}
-
-/// One comment node: meta (id, Anon, time, «ответить»), text, the inline
-/// reply `when` anchor, and a nested keyed `<ul>` of children.
-/// `post_str` is the thread's post id pre-formatted once per view.
-fn commentNode(a: std.mem.Allocator, env: ViewEnv, c: *const board.Comment, post_str: []const u8) forest.Node {
-    const mm = m();
-    const id_str = std.fmt.allocPrint(a, "cm-{d}", .{c.id}) catch @panic("OOM");
-    const rep_id = std.fmt.allocPrint(a, "w-rep-{d}", .{c.id}) catch @panic("OOM");
-    const replying = env.reply_to != null and env.reply_to.? == c.id;
-    const num = u64str(a, c.id);
-    const hash = std.fmt.allocPrint(a, "#{d}", .{c.id}) catch @panic("OOM");
-
-    var kids: std.ArrayListUnmanaged(forest.Node) = .empty;
-    kids.append(a, forest.el(a, .div, .{ .class = "cmeta" }, .{
-        // #id doubles as the permalink to the comment page.
-        forest.el(a, .a, .{
-            .class = "plink",
-            .href = commentHref(a, c.post, c.id),
-        }, hash),
-        forest.text(" · "),
-        forest.el(a, .span, .{ .class = "who" }, nameOf(c.user)),
-        forest.text(" · "),
-        forest.el(a, .span, .{ .class = "ts" }, fmtTs(a, c.ts)),
-        forest.text(" "),
-        forest.el(a, .button, .{
-            .class = "reply-btn",
-            .on = .{ .click = "reply" },
-            .arg = num,
-        }, "ответить"),
-        forest.text(" "),
-        forest.el(a, .button, .{
-            .id = std.fmt.allocPrint(a, "like-c{d}", .{c.id}) catch @panic("OOM"),
-            .class = "like-btn",
-            .on = .{ .click = "like" },
-            .arg = likeArg(a, 'c', c.id),
-            .text = likeLabel(a, mm.likeCount(c.id)),
-        }, .{}),
-    })) catch @panic("OOM");
-    kids.append(a, forest.el(a, .div, .{ .class = "ctext" }, c.text)) catch @panic("OOM");
-    // Inline reply form mounts between the text and the children list.
-    kids.append(a, forest.when(a, .{ .id = rep_id }, replying, replyForm(a, post_str, num))) catch @panic("OOM");
-
-    const kid_idx = mm.childIdx(a, c.id) catch @panic("OOM");
-    var ck: std.ArrayListUnmanaged(forest.Node) = .empty;
-    for (kid_idx) |ci| {
-        ck.append(a, commentNode(a, env, &mm.comments.items[ci], post_str)) catch @panic("OOM");
-    }
-    kids.append(a, forest.el(a, .ul, .{ .lid = "kids", .class = "kids" }, forest.each(ck.toOwnedSlice(a) catch @panic("OOM")))) catch @panic("OOM");
-
-    return forest.el(a, .li, .{ .id = id_str, .class = "comment" }, kids.toOwnedSlice(a) catch @panic("OOM"));
-}
-
-fn crumbsView(a: std.mem.Allocator, post: *const board.Post, chain: []const u64) forest.Node {
-    var kids: std.ArrayListUnmanaged(forest.Node) = .empty;
-    kids.append(a, forest.el(a, .a, .{ .href = boardHref(a, post.board), .class = "bref" }, post.board)) catch @panic("OOM");
-    kids.append(a, forest.text(" › ")) catch @panic("OOM");
-    kids.append(a, forest.el(a, .a, .{ .href = threadHref(a, post.id) }, std.fmt.allocPrint(a, "#{d}", .{post.id}) catch @panic("OOM"))) catch @panic("OOM");
-    for (chain, 0..) |cid, i| {
-        kids.append(a, forest.text(" › ")) catch @panic("OOM");
-        const is_last = i + 1 == chain.len;
-        const label = std.fmt.allocPrint(a, "#{d}", .{cid}) catch @panic("OOM");
-        if (is_last) {
-            kids.append(a, forest.el(a, .span, .{ .class = "cid" }, label)) catch @panic("OOM");
-        } else {
-            kids.append(a, forest.el(a, .a, .{ .href = commentHref(a, post.id, cid) }, label)) catch @panic("OOM");
-        }
-    }
-    return forest.el(a, .div, .{ .class = "crumbs" }, kids.toOwnedSlice(a) catch @panic("OOM"));
-}
-
-fn notFoundView(a: std.mem.Allocator, what: []const u8) forest.Node {
-    return forest.el(a, .p, .{ .class = "empty", .id = "not-found" }, what);
-}
-
-// ── routes ────────────────────────────────────────────────────────
-
-fn homeView(a: std.mem.Allocator) forest.Node {
-    const mm = m();
-    var kids: std.ArrayListUnmanaged(forest.Node) = .empty;
-    kids.append(a, forest.el(a, .h1, .{}, .{
-        forest.text("z"),
-        forest.el(a, .span, .{}, "board"),
-    })) catch @panic("OOM");
-    kids.append(a, forest.el(a, .p, .{ .class = "boards-label" }, "Доски:")) catch @panic("OOM");
-    var bl: std.ArrayListUnmanaged(forest.Node) = .empty;
-    for (board.boards) |b| {
-        bl.append(a, forest.el(a, .li, .{}, forest.el(a, .a, .{ .href = boardHref(a, b.slug) }, b.title))) catch @panic("OOM");
-    }
-    kids.append(a, forest.el(a, .ul, .{ .class = "board-list" }, bl.toOwnedSlice(a) catch @panic("OOM"))) catch @panic("OOM");
-    kids.append(a, forest.el(a, .h2, .{}, "Последнее:")) catch @panic("OOM");
-
-    const latest_idx = mm.latestPostIdx(a, board.latest_home_count) catch @panic("OOM");
-    var lp: std.ArrayListUnmanaged(forest.Node) = .empty;
-    for (latest_idx) |pi| {
-        lp.append(a, postCard(a, &mm.posts.items[pi], true)) catch @panic("OOM");
-    }
-    kids.append(a, forest.el(a, .div, .{ .id = "latest", .class = "posts" }, forest.each(lp.toOwnedSlice(a) catch @panic("OOM")))) catch @panic("OOM");
-    kids.append(a, forest.when(a, .{ .id = "w-latest-empty" }, latest_idx.len == 0, forest.el(a, .p, .{ .class = "empty" }, "Пока пусто — напиши первым пост."))) catch @panic("OOM");
-    return forest.fragment(a, kids.toOwnedSlice(a) catch @panic("OOM"));
-}
-
-fn boardView(a: std.mem.Allocator, idx: usize) forest.Node {
-    const b = board.boards[idx];
-    const mm = m();
-    var kids: std.ArrayListUnmanaged(forest.Node) = .empty;
-    kids.append(a, forest.el(a, .h1, .{}, b.title)) catch @panic("OOM");
-    kids.append(a, postForm(a, b.slug)) catch @panic("OOM");
-
-    const pidx = mm.boardPostIdx(a, b.slug) catch @panic("OOM");
-    var pk: std.ArrayListUnmanaged(forest.Node) = .empty;
-    for (pidx) |pi| {
-        pk.append(a, postCard(a, &mm.posts.items[pi], true)) catch @panic("OOM");
-    }
-    kids.append(a, forest.el(a, .div, .{ .id = "posts", .class = "posts" }, forest.each(pk.toOwnedSlice(a) catch @panic("OOM")))) catch @panic("OOM");
-    kids.append(a, forest.when(a, .{ .id = "w-board-empty" }, pidx.len == 0, forest.el(a, .p, .{ .class = "empty", .id = "empty-posts" }, "Пока пусто — напиши первым пост."))) catch @panic("OOM");
-    return forest.fragment(a, kids.toOwnedSlice(a) catch @panic("OOM"));
-}
-
-/// Order top-level comment indices per the session's sort: `.new` =
-/// newest first (id desc — tops arrive ascending), `.top` = likes desc
-/// then newer first. Children stay chronological — sorting applies to
-/// the top level only.
-fn sortTops(a: std.mem.Allocator, mm: *board.BoardModel, tops: []const usize, sort: Sort) []const usize {
-    const out = a.alloc(usize, tops.len) catch @panic("OOM");
-    switch (sort) {
-        .new => {
-            var j: usize = 0;
-            var i = tops.len;
-            while (i > 0) : (i -= 1) {
-                out[j] = tops[i - 1];
-                j += 1;
-            }
-        },
-        .top => {
-            @memcpy(out, tops);
-            std.sort.block(usize, out, mm, struct {
-                fn less(mm2: *board.BoardModel, x: usize, y: usize) bool {
-                    const cx = mm2.likeCount(mm2.comments.items[x].id);
-                    const cy = mm2.likeCount(mm2.comments.items[y].id);
-                    if (cx != cy) return cx > cy;
-                    return mm2.comments.items[x].id > mm2.comments.items[y].id;
-                }
-            }.less);
-        },
-    }
-    return out;
-}
-
-/// "сортировка: новые | топ" — per-session preference via the `sort`
-/// action; the active mode gets the `sort-on` class.
-fn sortBar(a: std.mem.Allocator, sort: Sort) forest.Node {
-    return forest.el(a, .div, .{ .class = "sort-bar" }, .{
-        forest.text("сортировка: "),
-        forest.el(a, .button, .{
-            .id = "sort-new",
-            .class = if (sort == .new) "mini sort-on" else "mini",
-            .on = .{ .click = "sort" },
-            .arg = "new",
-        }, "новые"),
-        forest.text(" "),
-        forest.el(a, .button, .{
-            .id = "sort-top",
-            .class = if (sort == .top) "mini sort-on" else "mini",
-            .on = .{ .click = "sort" },
-            .arg = "top",
-        }, "топ"),
-    });
-}
-
-fn threadView(a: std.mem.Allocator, env: ViewEnv, post_id: u64) forest.Node {
-    const mm = m();
-    const p = mm.post(post_id) orelse {
-        return notFoundView(a, "Тред не найден.");
-    };
-    var kids: std.ArrayListUnmanaged(forest.Node) = .empty;
-    kids.append(a, crumbsView(a, p, &[_]u64{})) catch @panic("OOM");
-    kids.append(a, postCard(a, p, false)) catch @panic("OOM");
-    kids.append(a, commentForm(a, post_id, null)) catch @panic("OOM");
-
-    const tops = mm.topCommentIdx(a, post_id) catch @panic("OOM");
-    const ordered = sortTops(a, mm, tops, env.sort);
-    const post_str = u64str(a, post_id);
-    var ck: std.ArrayListUnmanaged(forest.Node) = .empty;
-    for (ordered) |ci| {
-        ck.append(a, commentNode(a, env, &mm.comments.items[ci], post_str)) catch @panic("OOM");
-    }
-    kids.append(a, sortBar(a, env.sort)) catch @panic("OOM");
-    kids.append(a, forest.el(a, .ul, .{ .id = "comments", .class = "comments" }, forest.each(ck.toOwnedSlice(a) catch @panic("OOM")))) catch @panic("OOM");
-    kids.append(a, forest.when(a, .{ .id = "w-comments-empty" }, tops.len == 0, forest.el(a, .p, .{ .class = "empty" }, "Нет комментариев — будь первым."))) catch @panic("OOM");
-    return forest.fragment(a, kids.toOwnedSlice(a) catch @panic("OOM"));
-}
-
-fn commentView(a: std.mem.Allocator, env: ViewEnv, cid: u64) forest.Node {
-    const mm = m();
-    const c = mm.comment(cid) orelse {
-        return notFoundView(a, "Комментарий не найден.");
-    };
-    const p = mm.post(c.post) orelse {
-        return notFoundView(a, "Тред не найден.");
-    };
-    // Ancestor chain root→…→c (excluding c itself — it renders as root).
-    var chain_rev: std.ArrayListUnmanaged(u64) = .empty;
-    var cur: ?u64 = c.parent;
-    while (cur) |pid| {
-        const pc = mm.comment(pid) orelse break;
-        chain_rev.append(a, pid) catch @panic("OOM");
-        cur = pc.parent;
-    }
-    std.mem.reverse(u64, chain_rev.items);
-    // The focused comment closes the crumb trail as a plain label.
-    chain_rev.append(a, cid) catch @panic("OOM");
-
-    var kids: std.ArrayListUnmanaged(forest.Node) = .empty;
-    kids.append(a, crumbsView(a, p, chain_rev.items)) catch @panic("OOM");
-    kids.append(a, commentForm(a, p.id, null)) catch @panic("OOM");
-    // Arena-allocate the single-row slice — a `&.{…}` temporary would
-    // dangle once the statement ends (the keyed list outlives it).
-    const only = a.alloc(forest.Node, 1) catch @panic("OOM");
-    only[0] = commentNode(a, env, c, u64str(a, p.id));
-    kids.append(a, forest.el(a, .ul, .{ .id = "comments", .class = "comments" }, forest.each(only))) catch @panic("OOM");
-    return forest.fragment(a, kids.toOwnedSlice(a) catch @panic("OOM"));
-}
-
-/// The `<main>` inner content: sidebar + the active route's page.
-/// `env.seen` is the caught-up cursor — every shipped view marks it
-/// synced to the shared model's mutation counter (the session's
-/// `seen_seq`, or a render group's `last_rendered_seq` on group
-/// seed/render builds only).
-pub fn buildView(a: std.mem.Allocator, env: ViewEnv) []const forest.Node {
-    if (env.seen) |p| p.* = m().global_seq.load(.seq_cst);
-    const content = switch (env.route) {
-        .home => homeView(a),
-        .board => |i| boardView(a, i),
-        .thread => |pid| threadView(a, env, pid),
-        .comment => |cid| commentView(a, env, cid),
-    };
-    const nodes = a.alloc(forest.Node, 2) catch @panic("OOM");
-    nodes[0] = navView(a, env);
-    nodes[1] = forest.el(a, .div, .{ .class = "bmain" }, content);
-    return nodes;
-}
-
 /// Wired session constructor — test/server entry point (the real
 /// wiring lives in `Session.create`, mirroring the skeleton's
 /// `createSessionImpl`).
 pub fn createSession(gpa: std.mem.Allocator, io: std.Io) *Session {
     return Session.create(gpa, io);
 }
-
 // ─────────────────────────────────────────────
 // tests
 // ─────────────────────────────────────────────
 
-fn testModel(alloc: std.mem.Allocator) *board.BoardModel {
-    const mm = board.BoardModel.init(alloc, ":memory:") catch @panic("model init failed");
+fn testModel(alloc: std.mem.Allocator) *model.BoardModel {
+    const mm = model.BoardModel.init(alloc, ":memory:") catch @panic("model init failed");
     return mm;
 }
 
@@ -1163,44 +727,61 @@ fn viewStr(s: *Session, alloc: std.mem.Allocator) []u8 {
 }
 
 test "route parsing covers home/board/thread/comment and rejects junk" {
-    const home = parseRoute("/") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(home == .home);
+    // Generated layer: path → typed params.
+    const home = routes.parseRoute("/") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(home == .index);
 
-    const bd = parseRoute("/b/b") orelse return error.TestUnexpectedResult;
-    switch (bd) {
+    const bd = routes.parseRoute("/b/b") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("b", bd.b.slug);
+    const tt = routes.parseRoute("/b/tech") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("tech", tt.b.slug);
+    const th = routes.parseRoute("/t/7") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 7), th.t.post);
+    const cm = routes.parseRoute("/t/7/c/9") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 7), cm.t_c.post);
+    try std.testing.expectEqual(@as(u64, 9), cm.t_c.comment);
+
+    // Domain layer: generated → boardview.Route (slug → board index).
+    const home_d = pageOf(home).?;
+    try std.testing.expect(home_d == .home);
+    const bd_d = pageOf(bd).?;
+    switch (bd_d) {
         .board => |i| try std.testing.expectEqual(@as(usize, 0), i),
         else => return error.TestUnexpectedResult,
     }
-    const tt = parseRoute("/b/tech") orelse return error.TestUnexpectedResult;
-    switch (tt) {
-        .board => |i| try std.testing.expectEqual(board.boardIndex("tech").?, i),
+    const tech_d = pageOf(tt).?;
+    switch (tech_d) {
+        .board => |i| try std.testing.expectEqual(model.boardIndex("tech").?, i),
         else => return error.TestUnexpectedResult,
     }
-    const th = parseRoute("/t/7") orelse return error.TestUnexpectedResult;
-    switch (th) {
+    const th_d = pageOf(th).?;
+    switch (th_d) {
         .thread => |id| try std.testing.expectEqual(@as(u64, 7), id),
         else => return error.TestUnexpectedResult,
     }
-    const cm = parseRoute("/t/7/c/9") orelse return error.TestUnexpectedResult;
-    switch (cm) {
+    const cm_d = pageOf(cm).?;
+    switch (cm_d) {
         .comment => |id| try std.testing.expectEqual(@as(u64, 9), id),
         else => return error.TestUnexpectedResult,
     }
 
-    try std.testing.expect(parseRoute("/b/nope") == null);
-    try std.testing.expect(parseRoute("/t/abc") == null);
-    try std.testing.expect(parseRoute("/t/1/x/2") == null);
-    try std.testing.expect(parseRoute("/nope") == null);
-    try std.testing.expect(parseRoute("/t/") == null);
-    try std.testing.expect(parseRoute("") == null);
+    // Junk rejected at the generated layer; a well-formed but unknown
+    // slug parses fine and fails at pageOf instead.
+    const nope = routes.parseRoute("/b/nope") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(pageOf(nope) == null);
+    try std.testing.expect(routes.parseRoute("/t/abc") == null);
+    try std.testing.expect(routes.parseRoute("/t/1/x/2") == null);
+    try std.testing.expect(routes.parseRoute("/nope") == null);
+    try std.testing.expect(routes.parseRoute("/t/") == null);
+    try std.testing.expect(routes.parseRoute("") == null);
 }
 
 test "setRoute/servePage reset dom, SSR per route, and 404 dangling ids" {
     const alloc = std.testing.allocator;
     const mm = testModel(alloc);
     defer mm.deinit();
-    model = mm;
-    defer model = null;
+    model.shared = mm;
+    defer model.shared = null;
     _ = try mm.addPost("b", "tok1", "a post");
 
     const s = createSession(alloc, std.testing.io);
@@ -1215,11 +796,17 @@ test "setRoute/servePage reset dom, SSR per route, and 404 dangling ids" {
     try std.testing.expect(std.mem.indexOf(u8, page, "/b/tech") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "id=\"post-1\"") != null);
 
-    // Unknown path and dangling thread id both rejected.
+    // Unknown path and unknown slug rejected at setRoute; dangling
+    // ids are well-formed routes — they 404 at servePage's prepare.
     try std.testing.expect(!s.setRoute("/bogus"));
-    try std.testing.expect(!s.setRoute("/t/999"));
-    try std.testing.expect(!s.setRoute("/t/1/c/999"));
+    try std.testing.expect(!s.setRoute("/b/nope"));
+    try std.testing.expect(s.setRoute("/t/999"));
+    try std.testing.expect(s.setRoute("/t/1/c/999"));
     try std.testing.expect(s.setRoute("/t/1"));
+    var dead: std.Io.Writer.Allocating = .init(alloc);
+    defer dead.deinit();
+    try std.testing.expect(!try s.servePage("/t/999", &dead.writer));
+    try std.testing.expect(!try s.servePage("/t/1/c/999", &dead.writer));
 
     // servePage on the board route ships the post form.
     _ = aw.writer.consumeAll();
@@ -1233,8 +820,8 @@ test "post/comment actions mutate the shared model; reply_to is per-session" {
     const alloc = std.testing.allocator;
     const mm = testModel(alloc);
     defer mm.deinit();
-    model = mm;
-    defer model = null;
+    model.shared = mm;
+    defer model.shared = null;
 
     const a = createSession(alloc, std.testing.io);
     defer a.deinit();
@@ -1300,8 +887,8 @@ test "thread SSR emits nested keyed comment trees and reply anchors" {
     const alloc = std.testing.allocator;
     const mm = testModel(alloc);
     defer mm.deinit();
-    model = mm;
-    defer model = null;
+    model.shared = mm;
+    defer model.shared = null;
 
     _ = try mm.addPost("b", "tok1", "root post");
     const c1 = try mm.addComment(1, null, "tok1", "first");
@@ -1347,8 +934,8 @@ test "comment page breadcrumbs walk the parent chain; focused subtree only" {
     const alloc = std.testing.allocator;
     const mm = testModel(alloc);
     defer mm.deinit();
-    model = mm;
-    defer model = null;
+    model.shared = mm;
+    defer model.shared = null;
 
     _ = try mm.addPost("tech", "tok1", "p");
     const c1 = try mm.addComment(1, null, "tok1", "root c");
@@ -1383,8 +970,8 @@ test "syncPull re-renders only when global_seq moved" {
     const alloc = std.testing.allocator;
     const mm = testModel(alloc);
     defer mm.deinit();
-    model = mm;
-    defer model = null;
+    model.shared = mm;
+    defer model.shared = null;
 
     const s = createSession(alloc, std.testing.io);
     defer s.deinit();
@@ -1418,8 +1005,8 @@ test "comment on another session patches the board counter live" {
     const alloc = std.testing.allocator;
     const mm = testModel(alloc);
     defer mm.deinit();
-    model = mm;
-    defer model = null;
+    model.shared = mm;
+    defer model.shared = null;
 
     _ = try mm.addPost("b", "tok1", "thread post");
     // Board-index session already rendered (SSR-equivalent seed).
@@ -1452,8 +1039,8 @@ test "identity minted by a failed POST fans out via global_seq" {
     const alloc = std.testing.allocator;
     const mm = testModel(alloc);
     defer mm.deinit();
-    model = mm;
-    defer model = null;
+    model.shared = mm;
+    defer model.shared = null;
 
     const s = createSession(alloc, std.testing.io);
     defer s.deinit();
@@ -1486,8 +1073,8 @@ test "heal path: cookie token with no users row bumps global_seq on POST" {
     const alloc = std.testing.allocator;
     const mm = testModel(alloc);
     defer mm.deinit();
-    model = mm;
-    defer model = null;
+    model.shared = mm;
+    defer model.shared = null;
 
     const s = createSession(alloc, std.testing.io);
     defer s.deinit();
@@ -1515,8 +1102,8 @@ test "render groups: equal keys share one group; one render per model bump" {
     const alloc = std.testing.allocator;
     const mm = testModel(alloc);
     defer mm.deinit();
-    model = mm;
-    defer model = null;
+    model.shared = mm;
+    defer model.shared = null;
 
     const a = createSession(alloc, std.testing.io);
     defer a.deinit();
@@ -1529,7 +1116,7 @@ test "render groups: equal keys share one group; one render per model bump" {
     try std.testing.expect(a.deps.group.? == b.deps.group.?);
     try std.testing.expectEqual(@as(usize, 2), g.members);
     try std.testing.expectEqual(@as(u64, 0), g.rev); // seeded, nothing published
-    try std.testing.expectEqual(@as(usize, 1), board_groups.registryCount());
+    try std.testing.expectEqual(@as(usize, 1), groups.registryCount());
 
     // Model bump → the FIRST member's syncPull renders+publishes once;
     // the second sees last_rendered_seq already current — dedup proof:
@@ -1560,8 +1147,8 @@ test "render groups v2: reply_to fork clones the stream; A→B→A still snapsho
     const alloc = std.testing.allocator;
     const mm = testModel(alloc);
     defer mm.deinit();
-    model = mm;
-    defer model = null;
+    model.shared = mm;
+    defer model.shared = null;
 
     _ = try mm.addPost("b", "tok1", "p");
     const c1 = try mm.addComment(1, null, "tok1", "c");
@@ -1590,7 +1177,7 @@ test "render groups v2: reply_to fork clones the stream; A→B→A still snapsho
     const forked = a.deps.group.?;
     try std.testing.expect(forked != base);
     try std.testing.expect(b.deps.group.? == base);
-    try std.testing.expectEqual(@as(usize, 2), board_groups.registryCount());
+    try std.testing.expectEqual(@as(usize, 2), groups.registryCount());
 
     // needs_render forced one diff even though global_seq didn't move
     // for the re-key itself: rev continues base's numbering, and the
@@ -1609,15 +1196,15 @@ test "render groups v2: reply_to fork clones the stream; A→B→A still snapsho
     a.deps.ping.emit(.{});
     try std.testing.expect(a.membershipEpoch() == e0 + 1);
     try std.testing.expect(a.deps.group.? == base);
-    try std.testing.expectEqual(@as(usize, 1), board_groups.registryCount());
+    try std.testing.expectEqual(@as(usize, 1), groups.registryCount());
 }
 
 test "render groups: minted identity re-keys the session out of the anon group" {
     const alloc = std.testing.allocator;
     const mm = testModel(alloc);
     defer mm.deinit();
-    model = mm;
-    defer model = null;
+    model.shared = mm;
+    defer model.shared = null;
 
     _ = try mm.addPost("b", "tok1", "p");
     const a = createSession(alloc, std.testing.io);
@@ -1642,15 +1229,15 @@ test "render groups: minted identity re-keys the session out of the anon group" 
     try std.testing.expect(d.deps.group.? != anon_group);
     try std.testing.expectEqualStrings("Anon#1", d.deps.group.?.key.name);
     try std.testing.expect(a.deps.group.? == anon_group); // a unaffected
-    try std.testing.expectEqual(@as(usize, 2), board_groups.registryCount());
+    try std.testing.expectEqual(@as(usize, 2), groups.registryCount());
 }
 
 test "render groups: last leave destroys the group; recreate gets a new incarnation" {
     const alloc = std.testing.allocator;
     const mm = testModel(alloc);
     defer mm.deinit();
-    model = mm;
-    defer model = null;
+    model.shared = mm;
+    defer model.shared = null;
 
     var aw: std.Io.Writer.Allocating = .init(alloc);
     defer aw.deinit();
@@ -1658,24 +1245,24 @@ test "render groups: last leave destroys the group; recreate gets a new incarnat
     try std.testing.expect(try a.servePage("/", &aw.writer));
     const g1 = a.deps.group.?;
     const inc1 = g1.incarnation;
-    try std.testing.expectEqual(@as(usize, 1), board_groups.registryCount());
+    try std.testing.expectEqual(@as(usize, 1), groups.registryCount());
     a.deinit(); // manual — no defer, exercises release-on-deinit
-    try std.testing.expectEqual(@as(usize, 0), board_groups.registryCount());
+    try std.testing.expectEqual(@as(usize, 0), groups.registryCount());
 
     const b = createSession(alloc, std.testing.io);
     defer b.deinit();
     _ = aw.writer.consumeAll();
     try std.testing.expect(try b.servePage("/", &aw.writer));
     try std.testing.expect(b.deps.group.?.incarnation != inc1);
-    try std.testing.expectEqual(@as(usize, 1), board_groups.registryCount());
+    try std.testing.expectEqual(@as(usize, 1), groups.registryCount());
 }
 
 test "render groups: unattached sessions keep the solo diff path" {
     const alloc = std.testing.allocator;
     const mm = testModel(alloc);
     defer mm.deinit();
-    model = mm;
-    defer model = null;
+    model.shared = mm;
+    defer model.shared = null;
 
     // Never served a page → no group → dispatch renders into the
     // session's own log exactly like before grouping existed.
@@ -1694,15 +1281,15 @@ test "render groups: unattached sessions keep the solo diff path" {
     const j = patchJson(s, alloc);
     defer alloc.free(j);
     try std.testing.expect(std.mem.indexOf(u8, j, "\"op\":") != null);
-    try std.testing.expectEqual(@as(usize, 0), board_groups.registryCount());
+    try std.testing.expectEqual(@as(usize, 0), groups.registryCount());
 }
 
 test "sortTops: newest-first default, top orders by likes then recency" {
     const alloc = std.testing.allocator;
     const mm = testModel(alloc);
     defer mm.deinit();
-    model = mm;
-    defer model = null;
+    model.shared = mm;
+    defer model.shared = null;
     _ = try mm.addPost("b", "tok", "post");
     _ = try mm.addComment(1, null, "tok", "oldest");
     _ = try mm.addComment(1, null, "tok", "middle");
@@ -1716,7 +1303,7 @@ test "sortTops: newest-first default, top orders by likes then recency" {
     try std.testing.expectEqual(@as(usize, 3), tops.len);
 
     // .new reverses the ascending index order → newest id first.
-    const newest = sortTops(alloc, mm, tops, .new);
+    const newest = boardview.sortTops(alloc, mm, tops, .new);
     defer alloc.free(newest);
     try std.testing.expectEqual(@as(usize, 3), newest.len);
     try std.testing.expectEqual(c_new, mm.comments.items[newest[0]].id);
@@ -1727,7 +1314,7 @@ test "sortTops: newest-first default, top orders by likes then recency" {
     // keep newest-first order.
     _ = try mm.toggleLike(.comment, c_old, "u1");
     _ = try mm.toggleLike(.comment, c_old, "u2");
-    const top = sortTops(alloc, mm, tops, .top);
+    const top = boardview.sortTops(alloc, mm, tops, .top);
     defer alloc.free(top);
     try std.testing.expectEqual(c_old, mm.comments.items[top[0]].id);
     try std.testing.expectEqual(c_new, mm.comments.items[top[1]].id);
@@ -1738,8 +1325,8 @@ test "like/sort actions: per-account votes, sort re-keys the group" {
     const alloc = std.testing.allocator;
     const mm = testModel(alloc);
     defer mm.deinit();
-    model = mm;
-    defer model = null;
+    model.shared = mm;
+    defer model.shared = null;
 
     const a = createSession(alloc, std.testing.io);
     defer a.deinit();
@@ -1784,7 +1371,7 @@ test "like/sort actions: per-account votes, sort re-keys the group" {
     try std.testing.expect(a.deps.attached);
     const epoch_before = a.deps.membership_epoch;
     try a.dispatch("sort", "top", null, null);
-    try std.testing.expectEqual(Sort.top, a.deps.sort);
+    try std.testing.expectEqual(boardview.Sort.top, a.deps.sort);
     try std.testing.expectError(error.InvalidAction, a.dispatch("sort", "bogus", null, null));
     // syncMembership runs on render; force one via publishPending path
     // is implicit in tests that call render — call it directly.
@@ -1794,11 +1381,11 @@ test "like/sort actions: per-account votes, sort re-keys the group" {
     try std.testing.expect(std.mem.indexOf(u8, a.deps.group.?.key_string, "top") != null);
     // The stored Key (not just the string) must carry the sort — the
     // group's viewEnv renders from it.
-    try std.testing.expectEqual(Sort.top, a.deps.group.?.key.sort);
+    try std.testing.expectEqual(boardview.Sort.top, a.deps.group.?.key.sort);
     try a.dispatch("sort", "new", null, null);
     syncMembership(a);
-    try std.testing.expectEqual(Sort.new, a.deps.sort);
-    try std.testing.expectEqual(Sort.new, a.deps.group.?.key.sort);
+    try std.testing.expectEqual(boardview.Sort.new, a.deps.sort);
+    try std.testing.expectEqual(boardview.Sort.new, a.deps.group.?.key.sort);
     try std.testing.expect(std.mem.indexOf(u8, a.deps.group.?.key_string, "new") != null);
 }
 
@@ -1806,8 +1393,8 @@ test "dirty-only dispatch: unrelated scope mutations skip group renders" {
     const alloc = std.testing.allocator;
     const mm = testModel(alloc);
     defer mm.deinit();
-    model = mm;
-    defer model = null;
+    model.shared = mm;
+    defer model.shared = null;
     _ = try mm.addPost("b", "tok", "post one");
     _ = try mm.addPost("b", "tok", "post two");
 

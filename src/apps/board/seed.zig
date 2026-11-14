@@ -3,7 +3,7 @@
 //! Users are `seed-*` tokens (display names still derive Anon#xx — the
 //! anonymity IS the joke); the theme lives in the text.
 const std = @import("std");
-const board = @import("board.zig");
+const model = @import("model.zig");
 
 /// `parent` indexes into this post's own comment list (0-based),
 /// `null` = top-level comment.
@@ -165,7 +165,7 @@ pub const comment_count = blk: {
 
 /// Apply all seed content to `m`. Returns error.NonEmpty when the model
 /// already has posts — re-seeding would only duplicate them.
-pub fn apply(m: *board.BoardModel) !struct { posts: usize, comments: usize } {
+pub fn apply(m: *model.BoardModel) !struct { posts: usize, comments: usize } {
     if (m.posts.items.len != 0) return error.NonEmpty;
     for (posts) |sp| {
         _ = try m.ensureUser(sp.user);
@@ -184,7 +184,7 @@ pub fn apply(m: *board.BoardModel) !struct { posts: usize, comments: usize } {
 
 test "seed applies nested comments and refuses a second run" {
     const alloc = std.testing.allocator;
-    var m = try board.BoardModel.init(alloc, ":memory:");
+    var m = try model.BoardModel.init(alloc, ":memory:");
     defer m.deinit();
 
     const r = try apply(m);

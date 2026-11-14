@@ -157,7 +157,7 @@ pub fn build(b: *std.Build) void {
     const forest_tests = b.addTest(.{ .root_module = forest_mod });
     const run_forest_tests = b.addRunArtifact(forest_tests);
 
-    // exe tests pull db.zig/board.zig via main.zig's test block — the
+    // exe tests pull db.zig/model.zig via main.zig's test block — the
     // amalgamation is compiled into this test binary only, never into the
     // zforest exe artifact.
     const exe_test_mod = b.createModule(.{

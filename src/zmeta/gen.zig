@@ -822,6 +822,10 @@ fn emitRouteMatch(arena: Allocator, w: *std.Io.Writer, p: Page) !void {
         , .{ prefix, name, name });
     }
     // Construct the payload in params-declaration order.
+    if (p.params.len == 0) {
+        try w.print("            break :result Route{{ .{s} = .{{}} }};\n        }}\n", .{p.tag});
+        return;
+    }
     try w.print("            break :result Route{{ .{s} = .{{ ", .{p.tag});
     for (p.params, 0..) |param, i| {
         if (i != 0) try w.writeAll(", ");

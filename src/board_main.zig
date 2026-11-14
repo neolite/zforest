@@ -1,8 +1,8 @@
 const std = @import("std");
 const server = @import("server/http.zig");
-const board = @import("board.zig");
-const board_app = @import("board_app.zig");
-const board_seed = @import("board_seed.zig");
+const board_model = @import("apps/board/model.zig");
+const board_app = @import("apps/board/app.zig");
+const board_seed = @import("apps/board/seed.zig");
 
 /// Parse the optional `bind-ip` arg: a dotted IPv4 literal, or loopback
 /// for anything unparsable (safe default for a demo server).
@@ -14,7 +14,7 @@ fn bindIp(arg: ?[]const u8) std.Io.net.Ip4Address {
 /// `zboard seed <db-path>` — populate an empty db with the themed seed
 /// content (androids on an anonymous board). Refuses when posts exist.
 fn runSeed(init: std.process.Init, db_path: []const u8) !void {
-    const m = try board.BoardModel.init(init.gpa, db_path);
+    const m = try board_model.BoardModel.init(init.gpa, db_path);
     defer m.deinit();
     const r = board_seed.apply(m) catch |e| {
         std.debug.print("seed: {s}\n", .{@errorName(e)});
@@ -36,8 +36,8 @@ pub fn main(init: std.process.Init) !void {
     bind.port = port;
     const db_path: []const u8 = if (argv.len < 4) ":memory:" else std.mem.span(argv[3]);
 
-    const m = try board.BoardModel.init(init.gpa, db_path);
-    board_app.model = m;
+    const m = try board_model.BoardModel.init(init.gpa, db_path);
+    board_model.shared = m;
     std.debug.print("zboard: {d} posts, {d} comments, {d} users (db={s})\n", .{
         m.posts.items.len, m.comments.items.len, m.users.count(), db_path,
     });
@@ -47,7 +47,7 @@ pub fn main(init: std.process.Init) !void {
 
 test {
     _ = @import("db.zig");
-    _ = @import("board.zig");
-    _ = @import("board_app.zig");
-    _ = @import("board_seed.zig");
+    _ = @import("apps/board/model.zig");
+    _ = @import("apps/board/app.zig");
+    _ = @import("apps/board/seed.zig");
 }

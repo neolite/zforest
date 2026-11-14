@@ -17,7 +17,7 @@ pub const Snapshot = struct {
 };
 
 /// Wall-clock seconds since the unix epoch — libc `time(3)` (zmon links
-/// libc; the Io clock API would also work but this matches board.zig).
+/// libc; the Io clock API would also work but this matches model.zig).
 extern "c" fn time(t: ?*i64) i64;
 
 const Timespec = extern struct { sec: i64, nsec: i64 };

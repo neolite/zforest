@@ -49,14 +49,17 @@ post list), `/t/<post>` (post card + comment form + nested comment tree),
 `/t/<post>/c/<comment>` (breadcrumbs + focused comment subtree). Unknown
 paths and dangling ids return 404.
 
-- `src/board.zig` — `BoardModel`: static board whitelist, in-memory
-  post/comment/user arrays, write-through SQLite inserts, one shared
-  `next_id` across posts and comments (display `#N`), and
+- `src/apps/board/model.zig` — `BoardModel`: static board whitelist,
+  in-memory post/comment/user arrays, write-through SQLite inserts, one
+  shared `next_id` across posts and comments (display `#N`), and
   `global_seq`, an atomic bumped on every mutation.
 - `src/db.zig` + `vendor/sqlite3/` — the official SQLite 3.54.1
   amalgamation, compiled only into `zboard` and its test target.
-- `src/board_app.zig` — the session/view layer. Every browser session
-  still owns an isolated zefx graph + DOM state, but all sessions share
+- `src/apps/board/` — the zmeta app dir: `app.zig` (session/deps +
+  action handlers), `view.zig` + `groups.zig` (view layer + render
+  groups), `pages/` file routes (`/`, `/b/<slug>`, `/t/<post>`,
+  `/t/<post>/c/<comment>`). Every browser session still owns an
+  isolated zefx graph + DOM state, but all sessions share
   the one model: each SSE worker calls `syncPull()` every 50 ms, which
   re-renders when `global_seq` moved and publishes the resulting patch
   batch — so a post in one tab appears live in every other tab (and a

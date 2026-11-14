@@ -20,20 +20,21 @@
 //!     storage when it empties so tests/servers never leak it.
 const std = @import("std");
 const forest = @import("forest");
-const History = @import("server/history.zig").History;
-const board_app = @import("board_app.zig");
+const History = @import("../../server/history.zig").History;
+const app = @import("app.zig");
+const view = @import("view.zig");
 
 /// Immutable group-key inputs. `name` is borrowed only for the duration
 /// of `join`/`keyStringInto`; the group stores its own copy as a suffix
 /// of `key_string`.
 pub const Key = struct {
-    route: board_app.Route,
+    route: view.Route,
     reply_to: ?u64,
     /// Resolved display name ("Anon#N" / "anon") — NOT the user token:
     /// two tokens resolving to the same name render identically.
     name: []const u8,
     /// Top-level comment sort — per-session view input like reply_to.
-    sort: board_app.Sort = .new,
+    sort: view.Sort = .new,
 };
 
 /// One render group: shared tracked DOM state, patch log, revisioned
@@ -73,7 +74,7 @@ pub const RenderGroup = struct {
     /// Scope version the Dom last diffed against.
     scope_seen: u64 = 0,
 
-    fn viewEnv(self: *RenderGroup) board_app.ViewEnv {
+    fn viewEnv(self: *RenderGroup) view.ViewEnv {
         return .{
             .route = self.key.route,
             .reply_to = self.key.reply_to,
@@ -88,7 +89,7 @@ pub const RenderGroup = struct {
     /// A mutation on an unrelated route leaves this true — no ping, no
     /// buildView, no rev bump, no SSE traffic.
     pub fn isCurrent(self: *const RenderGroup) bool {
-        return !self.needs_render and self.scope_seen == board_app.Session.scopeVersion(self.scope);
+        return !self.needs_render and self.scope_seen == app.Session.scopeVersion(self.scope);
     }
 
     /// Seed a fresh group's Dom to the current view WITHOUT publishing:
@@ -97,9 +98,9 @@ pub const RenderGroup = struct {
     fn seed(self: *RenderGroup) void {
         _ = self.arena.reset(.retain_capacity);
         const a = self.arena.allocator();
-        forest.diff(a, board_app.buildView(a, self.viewEnv()), &self.dom, &self.log);
+        forest.diff(a, view.buildView(a, self.viewEnv()), &self.dom, &self.log);
         self.log.clear();
-        self.scope_seen = board_app.Session.scopeVersion(self.scope);
+        self.scope_seen = app.Session.scopeVersion(self.scope);
     }
 
     /// Reconcile Dom against the shared model when a scope this group's
@@ -109,10 +110,10 @@ pub const RenderGroup = struct {
     pub fn render(self: *RenderGroup) void {
         if (self.isCurrent()) return;
         self.needs_render = false;
-        const seen = board_app.Session.scopeVersion(self.scope);
+        const seen = app.Session.scopeVersion(self.scope);
         _ = self.arena.reset(.retain_capacity);
         const a = self.arena.allocator();
-        forest.diff(a, board_app.buildView(a, self.viewEnv()), &self.dom, &self.log);
+        forest.diff(a, view.buildView(a, self.viewEnv()), &self.dom, &self.log);
         self.rev += 1;
         self.log.revision = self.rev;
         self.scope_seen = seen;
@@ -134,7 +135,7 @@ pub const RenderGroup = struct {
 };
 
 // ── registry ──────────────────────────────────────────────────────
-// Module-global like `board_app.model`: all access is serialized by the
+// Module-global like `model.shared`: all access is serialized by the
 // server's session mutex, and groups never outlive their members (the
 // last `leave` destroys the group; the map frees its storage at empty).
 
@@ -146,7 +147,7 @@ var next_incarnation: u64 = 1;
 /// u64 ids, "Anon#<base36>"/"anon" names) so the separator cannot appear
 /// inside a field — the encoding is injective for every reachable key.
 /// `buf` must hold ~192 bytes; the result borrows `buf`.
-pub fn keyStringInto(buf: []u8, route: board_app.Route, reply_to: ?u64, name: []const u8, sort: board_app.Sort) []const u8 {
+pub fn keyStringInto(buf: []u8, route: view.Route, reply_to: ?u64, name: []const u8, sort: view.Sort) []const u8 {
     var rbuf: [48]u8 = undefined;
     const rpart = switch (route) {
         .home => "home",
@@ -185,7 +186,7 @@ fn createGroup(gpa: std.mem.Allocator, ks: []const u8, key: Key) *RenderGroup {
         .gpa = gpa,
         .key_string = undefined,
         .key = .{ .route = key.route, .reply_to = key.reply_to, .name = &.{}, .sort = key.sort },
-        .scope = board_app.Session.scopeForRoute(key.route),
+        .scope = app.Session.scopeForRoute(key.route),
         .incarnation = next_incarnation,
         .dom = forest.Dom.init(gpa),
         .log = forest.PatchLog.init(gpa),

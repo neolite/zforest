@@ -29,12 +29,13 @@ zforest is server-authoritative UI in Zig 0.17.1:
   `data-on-*` event → action POST plumbing. No app knowledge, no
   hydration, no router.
 - Apps: `src/apps/todo/` + `src/apps/car/` (per-session models, diff
-  path, file-based routing), `board.zig`+`board_app.zig`+
-  `board_groups.zig` (shared SQLite-backed `BoardModel`, `global_seq`
-  fan-out, render groups sharing one Dom/History/revision across N
-  sessions), `src/apps/mon/` (shared model + per-session live-bound
+  path, file-based routing), `src/apps/board/` (shared SQLite-backed
+  `BoardModel` in `model.zig`, `global_seq` fan-out, render groups
+  sharing one Dom/History/revision across N sessions, file routes for
+  `/`, `/b/<slug>`, `/t/<post>`, `/t/<post>/c/<comment>`),
+  `src/apps/mon/` (shared model + per-session live-bound
   stores, `.live_shared`). All four apps run on the `zmeta.Session`
-  skeleton; todo/car/mon use the `src/apps/<name>/` file-based
+  skeleton and the `src/apps/<name>/` file-based
   routing convention (`pages/` + `actions.zig` + checked-in `gen/`).
 
 The transport invariants a meta-framework must preserve: sessions are
@@ -64,7 +65,18 @@ snapshot, ARCHITECTURE.md "Render groups v2").
 
 ### 2.1 File-based routing
 
-Today each app hand-rolls routing. zboard is the fullest example:
+> **Update:** zboard has since migrated to this convention
+> (`src/apps/board/`). Its routing is now two-layer: the generated
+> `routes.Route` (wire params) lives in `Deps.route` for the
+> generated `prepare`/`viewNodes` dispatch, while `Deps.page` holds
+> the domain `view.Route` (`home`/`board`/`thread`/`comment`) that
+> views and render-group keys use — `pageOf` in `app.zig` maps one
+> to the other (slug → board index; dangling-id 404s moved from
+> `setRoute` into the page `prepare` gate). The analysis below
+> describes the pre-migration hand-rolled version.
+
+Before the migration each app hand-rolled routing. zboard was the
+fullest example:
 `Route` union (`board_app.zig:30-35`), `parseRoute` (:62-82),
 `Session.setRoute` (:207-219) which also rejects dangling ids for a
 real 404, and `validPath` (:203-205) so bogus paths never mint a

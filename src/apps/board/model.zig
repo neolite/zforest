@@ -3,7 +3,7 @@
 //! mutation happens under the server's session mutex; `global_seq` is the
 //! atomic fan-out counter sessions poll via `syncPull`.
 const std = @import("std");
-const db = @import("db.zig");
+const db = @import("../../db.zig");
 
 pub const max_text_len = 2000;
 pub const latest_home_count = 10;
@@ -86,6 +86,17 @@ pub fn scopeBoard(idx: usize) u64 {
 
 pub fn scopePost(id: u64) u64 {
     return SCOPE_POST_BASE + id;
+}
+
+/// The shared model instance, installed by `board_main` before
+/// `serve()` (and by tests). All access is serialized by the server's
+/// session mutex.
+pub var shared: ?*BoardModel = null;
+
+/// The shared model or a loud panic — every view/session path assumes
+/// `board_main` (or a test) installed it first.
+pub fn get() *BoardModel {
+    return shared orelse @panic("board model not initialized");
 }
 
 /// Wall-clock seconds since the unix epoch — libc `time(3)`, already
