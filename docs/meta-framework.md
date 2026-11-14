@@ -63,7 +63,7 @@ snapshot, ARCHITECTURE.md "Render groups v2").
 
 Today each app hand-rolls routing. zboard is the fullest example:
 `Route` union (`board_app.zig:30-35`), `parseRoute` (:62-82),
-`Session.setRoute` (:207-218) which also rejects dangling ids for a
+`Session.setRoute` (:207-219) which also rejects dangling ids for a
 real 404, and `validPath` (:203-205) so bogus paths never mint a
 session. Sessions are already keyed `(cookie token, route)` — one
 browser gets an independent graph/Dom/history/CSRF per route it
@@ -84,7 +84,7 @@ What codegen adds:
   board_app.zig:75) — typed params keep both and let the page decide.
 - **Type-safe hrefs.** Generated `routes.href(.{ .thread = .{ .post =
   7 } })` replaces stringly helpers like `boardHref`/`threadHref`/
-  `commentHref` (board_app.zig:518-528). Links in views become
+  `commentHref` (board_app.zig:547-557). Links in views become
   comptime-checked; a renamed route breaks the build, not the link.
 - **`validPath`/`setRoute`/`servePage` dispatch** generated from the
   same table — the three functions can never disagree about what a
@@ -182,7 +182,7 @@ islands.
 
 Today layout composition is plain function calls. zboard's
 `buildView` returns `{navView(a, env), el(.div.bmain, content)}`
-(board_app.zig:909-921); todo splits `headerView`/`emptyView`/
+(board_app.zig:938-952); todo splits `headerView`/`emptyView`/
 `filtersView`/`listView`/`footerView` (todo_app.zig:385-442);
 `forest.fragment` (view.zig:185-189) lets a component cover several
 roots without wrapper markup. There is no layout *mechanism* — just
@@ -214,13 +214,13 @@ Dom subtrees — would require new op scoping for zero benefit.
 There is no loader layer today because there is no async data source
 in the render path: `buildView` reads the shared `BoardModel`
 synchronously under the server mutex (`m()`, board_app.zig:20-22,
-909+); `dispatch` validates and mutates inline. Request-scoped inputs
+938+); `dispatch` validates and mutates inline. Request-scoped inputs
 arrive via the `readCookies` hook and land in session/env fields.
 
 What "loader" maps to, concretely:
 
 - **Route-param validation → `prepare`.** Formalizes what
-  `setRoute`'s switch does today (board_app.zig:207-218):
+  `setRoute`'s switch does today (board_app.zig:207-219):
   `pub fn prepare(p: params, env: *Env) !void` returning
   `error.NotFound` → 404 before any view work.
 - **Request data → Env fields.** Cookies (via `readCookies`), and
@@ -288,10 +288,10 @@ established.
 
 `servePage` renders the whole `<main>` into an arena-buffered body,
 then `req.respond` sends it whole (http.zig:400-413, 587-591) — no
-HTTP streaming today, and none is worth adding: body render is synchronous and fast
-under the mutex; flushing `<head>` early buys nothing when the body
-is ready moments later. (`writeChunk`, http.zig:419, exists for the
-SSE stream only.)
+HTTP streaming today, and none is worth adding: body render is
+synchronous and fast under the mutex; flushing `<head>` early buys
+nothing when the body is ready moments later. (`writeChunk`,
+http.zig:419, exists for the SSE stream only.)
 
 The Suspense analogue already exists in two pieces:
 
@@ -344,7 +344,7 @@ and revisioned fan-out to every subscriber.
 The formalization gap is **typing, not transport**: `action` is a
 string matched by if-chains; `fields` is untyped
 `std.json.ObjectMap` dug per handler (`fieldStr`/`fieldU64`,
-board_app.zig:483-498). Two levels:
+board_app.zig:512-528). Two levels:
 
 - **v0 — comptime name table.** The app manifest declares action
   names once; codegen emits `pub const act = struct { pub const like
@@ -405,10 +405,11 @@ app declare which without copy-paste:
 - **Per-session state** — todo/car: model fields live on `Session`,
   `syncPull` is a no-op (todo_app.zig:143, car_app.zig:110).
 - **Shared model + per-session view state** — board: module-global
-  `board_app.model`, `syncPull` re-renders on `global_seq`,
-  `ViewEnv` carries per-session inputs (reply_to, sort, resolved
-  name), optional render-group hooks (`publishPending`/`streamRev`/
-  `streamHistory`/`membershipEpoch`, http.zig:47-59).
+  `board_app.model`, `syncPull` re-renders when a scope its route
+  reads moved (`scope_seq` counters + `RenderGroup.isCurrent()`,
+  §4.4), `ViewEnv` carries per-session inputs (reply_to, sort,
+  resolved name), optional render-group hooks (`publishPending`/
+  `streamRev`/`streamHistory`/`membershipEpoch`, http.zig:47-59).
 - **Shared model + per-session live stores** — zmon: `MonModel`
   global, per-session stores refreshed under `batch`, `bindTree`
   subscriptions (mon_app.zig:206-281).
@@ -446,7 +447,7 @@ JSON `fields` are strings end-to-end. Realistic levels:
 `forest.el` is verbose: `ArrayListUnmanaged(Node)` append-per-child,
 `allocPrint` per dynamic id, tuple children help but dynamic lists
 need manual lists. zboard's view code is roughly half of
-`board_app.zig`'s 1611 lines. Options weighed:
+`board_app.zig`'s 1685 lines. Options weighed:
 
 - **Status quo + helpers:** `eachOf` already maps items→nodes;
   adding a varargs `kids(...)` collector and id-format helpers shaves
@@ -462,21 +463,42 @@ need manual lists. zboard's view code is roughly half of
   helper layer cuts ~30-40% of view boilerplate; the rest is the
   price of explicitness.
 
-### 4.4 Dependency: dirty-only dispatch
+### 4.4 Dirty-only dispatch — landed, and a framework lesson
 
-Every `ping` currently costs a full `buildView` + `diff` per session
-(or per render group). The dirty-only dispatch work in progress
-(per-scope version counters) will let the engine skip scopes whose
-inputs didn't change — compounding with render-group dedup. Framework
-implications:
+zboard just shipped scope-level dirty tracking (ARCHITECTURE.md
+"zboard: dirty-only dispatch (done)"): `BoardModel.scope_seq` keeps
+per-scope u64 counters (`SCOPE_HOME`, `scopeBoard(i)`,
+`scopePost(id)` — board.zig:80-88,182), mutations declare their
+footprint via `scopeBump`, `Session.scopeForRoute` (board_app.zig:255)
+maps a route to the single scope its view reads, and
+`RenderGroup.isCurrent()` (board_groups.zig:90) gates both
+`syncPull` (board_app.zig:242) and `render` — a comment on /t/6 no
+longer re-renders home or other boards: zero pings, zero diffs, zero
+SSE events. This is the "dep-regions" idea from the render-groups
+review realized one level up: **the route declares its data
+footprint**, not the view tree.
 
-- Page views must stay **pure functions of (params, env, model)** —
-  the `seen_seq`/`last_rendered_seq` cursor write inside
-  `buildView` (board_app.zig:910) is a side effect that already bit
-  render groups once; the generated skeleton should own the cursor
-  internally so page code can't accidentally read or write it.
-- Don't design v0 around "render is free"; it isn't yet, and
-  per-scope dispatch is a dependency, not a guarantee.
+What it does NOT cover: per-session apps (todo/car) still pay a full
+buildView+diff per ping — there is no shared scope to skip against;
+zmon pays per refresh. The landed version is app-owned bookkeeping,
+not engine-level per-scope dispatch — that remains future work.
+
+Framework implications:
+
+- **Footprint declaration is a routing concern.** A meta-framework
+  route should declare which model scopes it reads — the generated
+  `scopeForRoute` equivalent. zboard hand-wrote it; codegen could
+  derive it from a per-page `reads` decl or a route→scope
+  convention. This is the strongest argument for keeping "what data
+  does this page touch" explicit in the page contract.
+- Page views must stay **pure functions of (params, env,
+  model@scope)** — the `seen` cursor write inside `buildView`
+  (board_app.zig:939) is a side effect that already bit render groups
+  once; the generated skeleton should own the cursor internally so
+  page code can't accidentally read or write it.
+- Don't design v0 around "render is free". For shared-model apps the
+  scope gate makes unrelated mutations nearly free; for per-session
+  apps every ping still rebuilds and diffs the whole view.
 
 Related known limits to respect (from the Astra reviews, unchanged):
 live mode covers leaf bindings + boolean `when` keys only — keyed
@@ -573,7 +595,7 @@ pub const app = zmeta.App(.{
 `seedDom`/`syncPull` stubs — so app code declares only: model fields,
 action handlers, page/layout fns, and optional group/live hooks.
 This kills the ~150 lines of contract boilerplate every current app
-repeats (compare `todo_app.zig:60-160` vs `board_app.zig:86-160`).
+repeats (compare `todo_app.zig:60-160` vs `board_app.zig:86-200`).
 It is the single biggest DX win and the lowest-risk piece: the
 contract is already stable and compile-enforced.
 
