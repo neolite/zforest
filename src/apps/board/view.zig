@@ -45,9 +45,20 @@ pub const ViewEnv = struct {
 // ── view helpers ──────────────────────────────────────────────────
 
 /// Resolved display name for a user token ("Anon#N" / "anon").
+/// Post/comment AUTHORS go through `authorName` instead — the trip
+/// suffix is per-post content, so it must not leak into the `#who`
+/// chip or the render-group key (both stay trip-free).
 pub fn nameOf(token: []const u8) []const u8 {
     if (token.len == 0) return "anon";
     return model.get().userName(token) orelse "anon";
+}
+
+/// Post/comment author label: "Anon#N" plus "!code" when the row
+/// carries a trip hash (4chan-style per-post identity, ADR-0001).
+fn authorName(a: std.mem.Allocator, token: []const u8, trip: ?[]const u8) []const u8 {
+    const base = nameOf(token);
+    const code = model.tripCode(a, trip) orelse return base;
+    return std.fmt.allocPrint(a, "{s}!{s}", .{ base, code }) catch @panic("OOM");
 }
 
 fn fmtTs(a: std.mem.Allocator, ts: i64) []const u8 {
@@ -123,7 +134,7 @@ fn postCard(a: std.mem.Allocator, p: *const model.Post, show_link: bool) forest.
         forest.text(" · "),
         forest.el(a, .a, .{ .href = boardHref(a, p.board), .class = "bref" }, p.board),
         forest.text(" · "),
-        forest.el(a, .span, .{ .class = "who" }, nameOf(p.user)),
+        forest.el(a, .span, .{ .class = "who" }, authorName(a, p.user, p.trip)),
         forest.text(" · "),
         forest.el(a, .span, .{ .class = "ts" }, fmtTs(a, p.ts)),
     })) catch @panic("OOM");
@@ -151,7 +162,8 @@ fn postCard(a: std.mem.Allocator, p: *const model.Post, show_link: bool) forest.
     }, kids.toOwnedSlice(a) catch @panic("OOM"));
 }
 
-/// New-post form: hidden `board` field + textarea; `post` action.
+/// New-post form: hidden `board` field + textarea + optional `trip`
+/// input; `post` action.
 fn postForm(a: std.mem.Allocator, slug: []const u8) forest.Node {
     return forest.el(a, .form, .{
         .id = "post-form",
@@ -167,6 +179,15 @@ fn postForm(a: std.mem.Allocator, slug: []const u8) forest.Node {
             .maxlength = model.max_text_len,
             .autofocus = true,
         }, .{}),
+        // Tripcode stays AFTER the text field: client.js's draft
+        // stash/clear picks the first editable named input.
+        forest.el(a, .input, .{
+            .name = "trip",
+            .class = "trip",
+            .type = "text",
+            .placeholder = "tripcode (optional)",
+            .maxlength = model.max_trip_len,
+        }, .{}),
         forest.el(a, .button, .{ .type = "submit" }, "Запостить"),
     });
 }
@@ -178,7 +199,8 @@ fn u64str(a: std.mem.Allocator, v: u64) []const u8 {
     return a.dupe(u8, std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable) catch @panic("OOM");
 }
 
-/// Comment form: hidden `post` (+ optional `parent`) + text input.
+/// Comment form: hidden `post` (+ optional `parent`) + text input +
+/// optional `trip` input.
 fn commentFormNodes(a: std.mem.Allocator, post_str: []const u8, parent_str: ?[]const u8, is_inline: bool) []const forest.Node {
     var kids: std.ArrayListUnmanaged(forest.Node) = .empty;
     kids.append(a, forest.el(a, .input, .{ .type = "hidden", .name = "post", .value = post_str }, .{})) catch @panic("OOM");
@@ -191,6 +213,13 @@ fn commentFormNodes(a: std.mem.Allocator, post_str: []const u8, parent_str: ?[]c
             .placeholder = "Ответить…",
             .maxlength = model.max_text_len,
             .autofocus = true,
+        }, .{})) catch @panic("OOM");
+        kids.append(a, forest.el(a, .input, .{
+            .name = "trip",
+            .class = "trip",
+            .type = "text",
+            .placeholder = "tripcode (optional)",
+            .maxlength = model.max_trip_len,
         }, .{})) catch @panic("OOM");
         kids.append(a, forest.el(a, .button, .{ .type = "submit", .class = "mini" }, "→")) catch @panic("OOM");
         kids.append(a, forest.el(a, .button, .{
@@ -205,6 +234,13 @@ fn commentFormNodes(a: std.mem.Allocator, post_str: []const u8, parent_str: ?[]c
             .rows = "3",
             .maxlength = model.max_text_len,
             .autofocus = true,
+        }, .{})) catch @panic("OOM");
+        kids.append(a, forest.el(a, .input, .{
+            .name = "trip",
+            .class = "trip",
+            .type = "text",
+            .placeholder = "tripcode (optional)",
+            .maxlength = model.max_trip_len,
         }, .{})) catch @panic("OOM");
         kids.append(a, forest.el(a, .button, .{ .type = "submit" }, "Комментировать")) catch @panic("OOM");
     }
@@ -249,7 +285,7 @@ fn commentNode(a: std.mem.Allocator, env: ViewEnv, c: *const model.Comment, post
             .href = commentHref(a, c.post, c.id),
         }, hash),
         forest.text(" · "),
-        forest.el(a, .span, .{ .class = "who" }, nameOf(c.user)),
+        forest.el(a, .span, .{ .class = "who" }, authorName(a, c.user, c.trip)),
         forest.text(" · "),
         forest.el(a, .span, .{ .class = "ts" }, fmtTs(a, c.ts)),
         forest.text(" "),

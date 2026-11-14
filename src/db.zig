@@ -95,10 +95,11 @@ pub const Stmt = struct {
         return self.h orelse error.Closed;
     }
 
-    /// `i` is 1-based (sqlite convention).
-    pub fn bindText(self: *Stmt, i: c_int, s: []const u8) Error!void {
+    /// `i` is 1-based (sqlite convention); `s == null` binds NULL —
+    /// needed for nullable columns like the board's `trip` hash.
+    pub fn bindText(self: *Stmt, i: c_int, s: ?[]const u8) Error!void {
         const st = try self.raw();
-        const rc = sqlite3_bind_text(st, i, s.ptr, @intCast(s.len), SQLITE_TRANSIENT);
+        const rc = if (s) |t| sqlite3_bind_text(st, i, t.ptr, @intCast(t.len), SQLITE_TRANSIENT) else sqlite3_bind_null(st, i);
         if (rc != SQLITE_OK) return sqliteErr(sqlite3_db_handle(st), "bind_text");
     }
 

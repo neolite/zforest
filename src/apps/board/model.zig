@@ -7,6 +7,9 @@ const db = @import("../../db.zig");
 
 pub const max_text_len = 2000;
 pub const latest_home_count = 10;
+/// Tripcode input cap (chars, after trimming) — 4chan-style `!code`
+/// suffixes are short; the cap keeps the HMAC input bounded.
+pub const max_trip_len = 64;
 
 pub const Board = struct { slug: []const u8, title: []const u8 };
 
@@ -28,13 +31,17 @@ pub fn boardIndex(slug: []const u8) ?usize {
 }
 
 /// `user` fields hold the zfxu token; display names resolve via
-/// `userName`/`ensureUser` ("Anon#<base36(rownum)>").
+/// `userName`/`ensureUser` ("Anon#<base36(rownum)>"). `trip` holds the
+/// stored HMAC hash of an optional tripcode (hex, NULL = none) — the
+/// plaintext tripcode is never persisted; the public `!code` is
+/// derived from the hash by `tripCode`.
 pub const Post = struct {
     id: u64,
     board: []u8,
     user: []u8,
     text: []u8,
     ts: i64,
+    trip: ?[]u8 = null,
 };
 
 pub const Comment = struct {
@@ -44,10 +51,12 @@ pub const Comment = struct {
     user: []u8,
     text: []u8,
     ts: i64,
+    trip: ?[]u8 = null,
 };
 
 pub const ModelError = error{
     InvalidText,
+    InvalidTrip,
     UnknownBoard,
     PostNotFound,
     CommentNotFound,
@@ -88,6 +97,61 @@ pub fn scopePost(id: u64) u64 {
     return SCOPE_POST_BASE + id;
 }
 
+/// HMAC key for tripcode hashes — DEMO-GRADE static secret
+/// (ADR-0001 phase 1): it only keeps stored trip hashes from being
+/// brute-forced offline; the display `!code` never needs it.
+/// Per-deployment config if zboard ever holds real identities.
+pub const trip_secret = "zboard-demo-trip-secret";
+
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+
+/// Normalize a raw `trip` form field: trim, empty → null (no
+/// trip), over `max_trip_len` → `error.InvalidTrip`.
+fn normalizeTrip(trip_in: ?[]const u8) ModelError!?[]const u8 {
+    const t = trip_in orelse return null;
+    const trimmed = std.mem.trim(u8, t, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    if (trimmed.len > max_trip_len) return error.InvalidTrip;
+    return trimmed;
+}
+
+/// HMAC-SHA256(secret, "<user_token>:<tripcode>") as lowercase hex —
+/// what the `trip` column stores. Binding the token makes the same
+/// tripcode render a different `!code` for different posters.
+fn tripHashHex(a: std.mem.Allocator, user_token: []const u8, tripcode: []const u8) error{OutOfMemory}![]u8 {
+    var mac = HmacSha256.init(trip_secret);
+    mac.update(user_token);
+    mac.update(":");
+    mac.update(tripcode);
+    const digest = mac.finalResult();
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return a.dupe(u8, &hex) catch error.OutOfMemory;
+}
+
+/// The public `!code` suffix for a stored trip hash — deterministic
+/// and secret-free: first 8 hash bytes → base64 → alphanumerics →
+/// up to 8 chars ("aB3xK9mQ" style). Returns null for absent or
+/// malformed stored values; `a` is the caller's render arena.
+pub fn tripCode(a: std.mem.Allocator, stored: ?[]const u8) ?[]const u8 {
+    const h = stored orelse return null;
+    if (h.len < 16) return null;
+    var raw: [8]u8 = undefined;
+    _ = std.fmt.hexToBytes(raw[0..], h[0..16]) catch return null;
+    var enc_buf: [16]u8 = undefined;
+    const enc = std.base64.standard_no_pad.Encoder.encode(&enc_buf, &raw);
+    var out: [8]u8 = undefined;
+    var n: usize = 0;
+    for (enc) |ch| {
+        if (n == out.len) break;
+        if (std.ascii.isAlphanumeric(ch)) {
+            out[n] = ch;
+            n += 1;
+        }
+    }
+    if (n == 0) return null;
+    return a.dupe(u8, out[0..n]) catch @panic("OOM");
+}
+
 /// The shared model instance, installed by `board_main` before
 /// `serve()` (and by tests). All access is serialized by the server's
 /// session mutex.
@@ -120,7 +184,8 @@ const schema =
     \\    board TEXT NOT NULL,
     \\    user TEXT NOT NULL,
     \\    text TEXT NOT NULL,
-    \\    ts INTEGER NOT NULL
+    \\    ts INTEGER NOT NULL,
+    \\    trip TEXT
     \\);
     \\CREATE TABLE IF NOT EXISTS comments (
     \\    id INTEGER PRIMARY KEY,
@@ -128,7 +193,8 @@ const schema =
     \\    parent INTEGER,
     \\    user TEXT NOT NULL,
     \\    text TEXT NOT NULL,
-    \\    ts INTEGER NOT NULL
+    \\    ts INTEGER NOT NULL,
+    \\    trip TEXT
     \\);
     \\CREATE TABLE IF NOT EXISTS likes (
     \\    kind TEXT NOT NULL,
@@ -206,6 +272,7 @@ pub const BoardModel = struct {
         m.db = try db.Db.open(gpa, db_path);
         errdefer m.db.close();
         try m.db.exec(gpa, schema);
+        try m.migrate();
         try m.load();
         return m;
     }
@@ -229,11 +296,13 @@ pub const BoardModel = struct {
             self.gpa.free(p.board);
             self.gpa.free(p.user);
             self.gpa.free(p.text);
+            if (p.trip) |t| self.gpa.free(t);
         }
         self.posts.deinit(self.gpa);
         for (self.comments.items) |c| {
             self.gpa.free(c.user);
             self.gpa.free(c.text);
+            if (c.trip) |t| self.gpa.free(t);
         }
         self.comments.deinit(self.gpa);
         var it = self.users.iterator();
@@ -278,6 +347,34 @@ pub const BoardModel = struct {
         return std.fmt.allocPrint(self.gpa, "Anon#{s}", .{n}) catch @panic("OOM");
     }
 
+    /// Column probe for the forward-migration below — `PRAGMA
+    /// table_info` names are the only portable way to ask sqlite
+    /// whether `ALTER TABLE ... ADD COLUMN` is needed (the schema is
+    /// CREATE TABLE IF NOT EXISTS only; db.Error carries no errcode).
+    fn hasColumn(self: *BoardModel, table: []const u8, col: []const u8) !bool {
+        var sql_buf: [96]u8 = undefined;
+        const sql = std.fmt.bufPrint(&sql_buf, "PRAGMA table_info({s})", .{table}) catch unreachable;
+        var st = try self.db.prepare(self.gpa, sql);
+        defer st.finalize();
+        while (try st.step()) {
+            if (std.mem.eql(u8, st.columnText(1), col)) return true;
+        }
+        return false;
+    }
+
+    /// Minimal forward-migration for pre-trip databases: add the
+    /// `trip` column to posts/comments when missing. Fresh databases
+    /// already have it from `schema` — the pragma probe makes this a
+    /// no-op there.
+    fn migrate(self: *BoardModel) !void {
+        for ([_][]const u8{ "posts", "comments" }) |table| {
+            if (try self.hasColumn(table, "trip")) continue;
+            var sql_buf: [96]u8 = undefined;
+            const sql = std.fmt.bufPrint(&sql_buf, "ALTER TABLE {s} ADD COLUMN trip TEXT", .{table}) catch unreachable;
+            try self.db.exec(self.gpa, sql);
+        }
+    }
+
     /// Load all rows; names are assigned by user row order so they are
     /// stable across restarts (Anon#1, Anon#2, ...).
     fn load(self: *BoardModel) !void {
@@ -293,20 +390,23 @@ pub const BoardModel = struct {
             }
         }
         {
-            var st = try self.db.prepare(self.gpa, "SELECT id, board, user, text, ts FROM posts ORDER BY id");
+            var st = try self.db.prepare(self.gpa, "SELECT id, board, user, text, ts, trip FROM posts ORDER BY id");
             defer st.finalize();
             while (try st.step()) {
+                const trip_col = st.columnText(5);
                 const p = Post{
                     .id = @intCast(st.columnInt(0)),
                     .board = try self.gpa.dupe(u8, st.columnText(1)),
                     .user = try self.gpa.dupe(u8, st.columnText(2)),
                     .text = try self.gpa.dupe(u8, st.columnText(3)),
                     .ts = st.columnInt(4),
+                    .trip = if (trip_col.len == 0) null else try self.gpa.dupe(u8, trip_col),
                 };
                 errdefer {
                     self.gpa.free(p.board);
                     self.gpa.free(p.user);
                     self.gpa.free(p.text);
+                    if (p.trip) |t| self.gpa.free(t);
                 }
                 try self.posts.append(self.gpa, p);
                 self.indexPost(self.posts.items.len - 1);
@@ -314,10 +414,11 @@ pub const BoardModel = struct {
             }
         }
         {
-            var st = try self.db.prepare(self.gpa, "SELECT id, post, parent, user, text, ts FROM comments ORDER BY id");
+            var st = try self.db.prepare(self.gpa, "SELECT id, post, parent, user, text, ts, trip FROM comments ORDER BY id");
             defer st.finalize();
             while (try st.step()) {
                 const parent_col = st.columnInt(2);
+                const trip_col = st.columnText(6);
                 const c = Comment{
                     .id = @intCast(st.columnInt(0)),
                     .post = @intCast(st.columnInt(1)),
@@ -325,10 +426,12 @@ pub const BoardModel = struct {
                     .user = try self.gpa.dupe(u8, st.columnText(3)),
                     .text = try self.gpa.dupe(u8, st.columnText(4)),
                     .ts = st.columnInt(5),
+                    .trip = if (trip_col.len == 0) null else try self.gpa.dupe(u8, trip_col),
                 };
                 errdefer {
                     self.gpa.free(c.user);
                     self.gpa.free(c.text);
+                    if (c.trip) |t| self.gpa.free(t);
                 }
                 try self.comments.append(self.gpa, c);
                 self.indexComment(self.comments.items.len - 1);
@@ -558,18 +661,25 @@ pub const BoardModel = struct {
     }
 
     /// Insert a post: validate, write-through INSERT, append, bump seq.
-    pub fn addPost(self: *BoardModel, board_slug: []const u8, user_token: []const u8, text_in: []const u8) ModelError!Post {
+    /// `trip_in` is the raw optional tripcode field — normalized,
+    /// HMAC'd (`tripHashHex`) and stored as a hash; the plaintext never
+    /// touches the db.
+    pub fn addPost(self: *BoardModel, board_slug: []const u8, user_token: []const u8, text_in: []const u8, trip_in: ?[]const u8) ModelError!Post {
         if (!validText(text_in)) return error.InvalidText;
         if (boardIndex(board_slug) == null) return error.UnknownBoard;
+        const tripcode = try normalizeTrip(trip_in);
+        const trip_hash = if (tripcode) |tc| try tripHashHex(self.gpa, user_token, tc) else null;
+        errdefer if (trip_hash) |h| self.gpa.free(h);
         const id = self.next_id;
         const ts = nowSeconds();
-        var st = self.db.prepare(self.gpa, "INSERT INTO posts (id, board, user, text, ts) VALUES (?, ?, ?, ?, ?)") catch |e| return dbErr(e);
+        var st = self.db.prepare(self.gpa, "INSERT INTO posts (id, board, user, text, ts, trip) VALUES (?, ?, ?, ?, ?, ?)") catch |e| return dbErr(e);
         defer st.finalize();
         st.bindInt(1, @intCast(id)) catch |e| return dbErr(e);
         st.bindText(2, board_slug) catch |e| return dbErr(e);
         st.bindText(3, user_token) catch |e| return dbErr(e);
         st.bindText(4, text_in) catch |e| return dbErr(e);
         st.bindInt(5, ts) catch |e| return dbErr(e);
+        st.bindText(6, trip_hash) catch |e| return dbErr(e);
         _ = st.step() catch |e| return dbErr(e);
 
         const p = Post{
@@ -578,6 +688,7 @@ pub const BoardModel = struct {
             .user = self.gpa.dupe(u8, user_token) catch @panic("OOM"),
             .text = self.gpa.dupe(u8, text_in) catch @panic("OOM"),
             .ts = ts,
+            .trip = trip_hash,
         };
         self.posts.append(self.gpa, p) catch @panic("OOM");
         self.indexPost(self.posts.items.len - 1);
@@ -590,16 +701,20 @@ pub const BoardModel = struct {
 
     /// Insert a comment under `post_id`, optionally replying to `parent_id`
     /// (must be a comment of the same post). Write-through + append.
-    pub fn addComment(self: *BoardModel, post_id: u64, parent_id: ?u64, user_token: []const u8, text_in: []const u8) ModelError!Comment {
+    /// `trip_in` is the raw optional tripcode — hashed like addPost's.
+    pub fn addComment(self: *BoardModel, post_id: u64, parent_id: ?u64, user_token: []const u8, text_in: []const u8, trip_in: ?[]const u8) ModelError!Comment {
         if (!validText(text_in)) return error.InvalidText;
         if (self.findPost(post_id) == null) return error.PostNotFound;
         if (parent_id) |pid| {
             const pi = self.findComment(pid) orelse return error.ParentNotFound;
             if (self.comments.items[pi].post != post_id) return error.ParentNotFound;
         }
+        const tripcode = try normalizeTrip(trip_in);
+        const trip_hash = if (tripcode) |tc| try tripHashHex(self.gpa, user_token, tc) else null;
+        errdefer if (trip_hash) |h| self.gpa.free(h);
         const id = self.next_id;
         const ts = nowSeconds();
-        var st = self.db.prepare(self.gpa, "INSERT INTO comments (id, post, parent, user, text, ts) VALUES (?, ?, ?, ?, ?, ?)") catch |e| return dbErr(e);
+        var st = self.db.prepare(self.gpa, "INSERT INTO comments (id, post, parent, user, text, ts, trip) VALUES (?, ?, ?, ?, ?, ?, ?)") catch |e| return dbErr(e);
         defer st.finalize();
         st.bindInt(1, @intCast(id)) catch |e| return dbErr(e);
         st.bindInt(2, @intCast(post_id)) catch |e| return dbErr(e);
@@ -607,6 +722,7 @@ pub const BoardModel = struct {
         st.bindText(4, user_token) catch |e| return dbErr(e);
         st.bindText(5, text_in) catch |e| return dbErr(e);
         st.bindInt(6, ts) catch |e| return dbErr(e);
+        st.bindText(7, trip_hash) catch |e| return dbErr(e);
         _ = st.step() catch |e| return dbErr(e);
 
         const c = Comment{
@@ -616,6 +732,7 @@ pub const BoardModel = struct {
             .user = self.gpa.dupe(u8, user_token) catch @panic("OOM"),
             .text = self.gpa.dupe(u8, text_in) catch @panic("OOM"),
             .ts = ts,
+            .trip = trip_hash,
         };
         self.comments.append(self.gpa, c) catch @panic("OOM");
         self.indexComment(self.comments.items.len - 1);
@@ -648,15 +765,15 @@ test "board model: add/load, ordering, ids, validation" {
     try std.testing.expectEqualStrings("Anon#2", try m.ensureUser(tok2));
     try std.testing.expectEqualStrings("Anon#1", try m.ensureUser(tok1));
 
-    const p1 = try m.addPost("b", tok1, "first post");
-    const p2 = try m.addPost("tech", tok2, "second post");
+    const p1 = try m.addPost("b", tok1, "first post", null);
+    const p2 = try m.addPost("tech", tok2, "second post", null);
     try std.testing.expectEqual(@as(u64, 1), p1.id);
     try std.testing.expectEqual(@as(u64, 2), p2.id);
     try std.testing.expectEqual(@as(usize, 2), m.posts.items.len);
 
-    const c1 = try m.addComment(p1.id, null, tok2, "first comment");
-    const c2 = try m.addComment(p1.id, c1.id, tok1, "nested reply");
-    const c3 = try m.addComment(p2.id, null, tok1, "on post 2");
+    const c1 = try m.addComment(p1.id, null, tok2, "first comment", null);
+    const c2 = try m.addComment(p1.id, c1.id, tok1, "nested reply", null);
+    const c3 = try m.addComment(p2.id, null, tok1, "on post 2", null);
     try std.testing.expectEqual(@as(u64, 3), c1.id);
     try std.testing.expectEqual(@as(?u64, c1.id), c2.parent);
     // Shared id space across posts+comments: 1,2 posts → 3,4,5 comments.
@@ -684,11 +801,11 @@ test "board model: add/load, ordering, ids, validation" {
     try std.testing.expect(m.comment(999) == null);
 
     // Validation.
-    try std.testing.expectError(error.InvalidText, m.addPost("b", tok1, ""));
-    try std.testing.expectError(error.InvalidText, m.addComment(p1.id, null, tok1, ""));
-    try std.testing.expectError(error.UnknownBoard, m.addPost("nope", tok1, "x"));
-    try std.testing.expectError(error.PostNotFound, m.addComment(999, null, tok1, "x"));
-    try std.testing.expectError(error.ParentNotFound, m.addComment(p2.id, c1.id, tok1, "wrong post"));
+    try std.testing.expectError(error.InvalidText, m.addPost("b", tok1, "", null));
+    try std.testing.expectError(error.InvalidText, m.addComment(p1.id, null, tok1, "", null));
+    try std.testing.expectError(error.UnknownBoard, m.addPost("nope", tok1, "x", null));
+    try std.testing.expectError(error.PostNotFound, m.addComment(999, null, tok1, "x", null));
+    try std.testing.expectError(error.ParentNotFound, m.addComment(p2.id, c1.id, tok1, "wrong post", null));
 
     const seq = m.global_seq.load(.seq_cst);
     try std.testing.expect(seq >= 5); // 2 posts + 3 comments
@@ -700,14 +817,14 @@ test "board indexes reproduce the old scan semantics and track addComment" {
     defer m.deinit();
 
     _ = try m.ensureUser("tok-idx");
-    const p1 = try m.addPost("b", "tok-idx", "alpha");
-    const p2 = try m.addPost("tech", "tok-idx", "beta");
-    const p3 = try m.addPost("b", "tok-idx", "gamma");
-    const c1 = try m.addComment(p1.id, null, "tok-idx", "t1");
-    const c2 = try m.addComment(p1.id, c1.id, "tok-idx", "r1");
-    const c3 = try m.addComment(p2.id, null, "tok-idx", "other post");
-    const c4 = try m.addComment(p1.id, null, "tok-idx", "t2");
-    const c5 = try m.addComment(p1.id, c2.id, "tok-idx", "r2");
+    const p1 = try m.addPost("b", "tok-idx", "alpha", null);
+    const p2 = try m.addPost("tech", "tok-idx", "beta", null);
+    const p3 = try m.addPost("b", "tok-idx", "gamma", null);
+    const c1 = try m.addComment(p1.id, null, "tok-idx", "t1", null);
+    const c2 = try m.addComment(p1.id, c1.id, "tok-idx", "r1", null);
+    const c3 = try m.addComment(p2.id, null, "tok-idx", "other post", null);
+    const c4 = try m.addComment(p1.id, null, "tok-idx", "t2", null);
+    const c5 = try m.addComment(p1.id, c2.id, "tok-idx", "r2", null);
     _ = c3;
     _ = c5;
 
@@ -769,8 +886,8 @@ test "board indexes reproduce the old scan semantics and track addComment" {
     }
 
     // addComment updates the indexes immediately, preserving order.
-    const c6 = try m.addComment(p1.id, c4.id, "tok-idx", "late reply");
-    const c7 = try m.addComment(p1.id, c1.id, "tok-idx", "second reply");
+    const c6 = try m.addComment(p1.id, c4.id, "tok-idx", "late reply", null);
+    const c7 = try m.addComment(p1.id, c1.id, "tok-idx", "second reply", null);
     const kids1 = try m.childIdx(alloc, c1.id);
     defer alloc.free(kids1);
     try std.testing.expectEqual(@as(usize, 2), kids1.len);
@@ -813,12 +930,18 @@ test "board model persists and reloads from a file db" {
     std.Io.Dir.deleteFileAbsolute(io, path ++ "-shm") catch {};
     defer std.Io.Dir.deleteFileAbsolute(io, path ++ "-shm") catch {};
 
+    var trip_saved: []u8 = &.{};
+    var c2_trip: []u8 = &.{};
+    defer if (trip_saved.len != 0) alloc.free(trip_saved);
+    defer if (c2_trip.len != 0) alloc.free(c2_trip);
     {
         var m = try BoardModel.init(alloc, path);
         _ = try m.ensureUser("tok-persist");
-        _ = try m.addPost("tech", "tok-persist", "survives restart");
-        const c = try m.addComment(1, null, "tok-persist", "persisted comment");
-        _ = try m.addComment(1, c.id, "tok-persist", "persisted reply");
+        const p = try m.addPost("tech", "tok-persist", "survives restart", "persist-trip");
+        trip_saved = try alloc.dupe(u8, p.trip.?);
+        const c = try m.addComment(1, null, "tok-persist", "persisted comment", null);
+        const c2 = try m.addComment(1, c.id, "tok-persist", "persisted reply", "reply-trip");
+        c2_trip = try alloc.dupe(u8, c2.trip.?);
         m.deinit();
     }
     {
@@ -826,6 +949,9 @@ test "board model persists and reloads from a file db" {
         defer m.deinit();
         try std.testing.expectEqual(@as(usize, 1), m.posts.items.len);
         try std.testing.expectEqualStrings("survives restart", m.posts.items[0].text);
+        // Trip hashes round-trip through the db unchanged.
+        try std.testing.expectEqualStrings(trip_saved, m.posts.items[0].trip.?);
+        try std.testing.expectEqualStrings(c2_trip, m.comments.items[1].trip.?);
         try std.testing.expectEqualStrings("Anon#1", m.userName("tok-persist").?);
         // Indexes were rebuilt by load(): tops/kids resolve without scans.
         const tops = try m.topCommentIdx(alloc, 1);
@@ -835,7 +961,7 @@ test "board model persists and reloads from a file db" {
         defer alloc.free(kids);
         try std.testing.expectEqual(@as(usize, 1), kids.len);
         // next_id continues the shared sequence.
-        const p = try m.addPost("b", "tok-persist", "second life");
+        const p = try m.addPost("b", "tok-persist", "second life", null);
         try std.testing.expect(p.id > 1);
     }
 }
@@ -846,8 +972,8 @@ test "board model: likes toggle once per account, counts, kind isolation" {
     defer m.deinit();
     _ = try m.ensureUser("tok-a");
     _ = try m.ensureUser("tok-b");
-    const p = try m.addPost("tech", "tok-a", "liked post");
-    const c = try m.addComment(p.id, null, "tok-a", "liked comment");
+    const p = try m.addPost("tech", "tok-a", "liked post", null);
+    const c = try m.addComment(p.id, null, "tok-a", "liked comment", null);
 
     // First toggle inserts, second removes — the same token can never
     // hold two votes on one target.
@@ -887,11 +1013,11 @@ test "board model: likes survive reload from a file db" {
     {
         var m = try BoardModel.init(alloc, path);
         _ = try m.ensureUser("tok-like");
-        const p = try m.addPost("tech", "tok-like", "persisted likes");
+        const p = try m.addPost("tech", "tok-like", "persisted likes", null);
         _ = try m.toggleLike(.post, p.id, "tok-like");
         _ = try m.toggleLike(.post, p.id, "tok-like"); // toggles back off
         _ = try m.toggleLike(.post, p.id, "tok-like"); // and on again
-        const c = try m.addComment(p.id, null, "tok-like", "liked reply");
+        const c = try m.addComment(p.id, null, "tok-like", "liked reply", null);
         _ = try m.toggleLike(.comment, c.id, "tok-like");
         m.deinit();
     }
@@ -903,5 +1029,138 @@ test "board model: likes survive reload from a file db" {
         try std.testing.expect(!(try m.toggleLike(.post, 1, "tok-like")));
         try std.testing.expectEqual(@as(u32, 0), m.likeCount(1));
         try std.testing.expectEqual(@as(u32, 1), m.likeCount(2));
+    }
+}
+
+test "board model: tripcodes hash per-user and derive stable !codes" {
+    const alloc = std.testing.allocator;
+    var m = try BoardModel.init(alloc, ":memory:");
+    defer m.deinit();
+    _ = try m.ensureUser("tok-t1");
+    _ = try m.ensureUser("tok-t2");
+
+    const p = try m.addPost("b", "tok-t1", "tripped post", "swordfish");
+    const trip = p.trip orelse return error.TestUnexpectedResult;
+    // The column holds the HMAC hex (64 chars) — never the plaintext.
+    try std.testing.expectEqual(@as(usize, 64), trip.len);
+    try std.testing.expect(std.mem.indexOf(u8, trip, "swordfish") == null);
+    const code = tripCode(alloc, p.trip).?;
+    defer alloc.free(code);
+    try std.testing.expectEqual(@as(usize, 8), code.len);
+    for (code) |ch| try std.testing.expect(std.ascii.isAlphanumeric(ch));
+
+    // Same token + tripcode (modulo surrounding whitespace) → the same
+    // stored hash and the same derived code.
+    const p2 = try m.addPost("b", "tok-t1", "again", "  swordfish  ");
+    try std.testing.expectEqualStrings(trip, p2.trip.?);
+    const code2 = tripCode(alloc, p2.trip).?;
+    defer alloc.free(code2);
+    try std.testing.expectEqualStrings(code, code2);
+
+    // A different tripcode hashes differently.
+    const p3 = try m.addPost("b", "tok-t1", "other", "different");
+    try std.testing.expect(!std.mem.eql(u8, trip, p3.trip.?));
+
+    // The hash binds the user token: same tripcode, different poster →
+    // different stored hash and different public code.
+    const p4 = try m.addPost("b", "tok-t2", "other user", "swordfish");
+    try std.testing.expect(!std.mem.eql(u8, trip, p4.trip.?));
+    const code4 = tripCode(alloc, p4.trip).?;
+    defer alloc.free(code4);
+    try std.testing.expect(!std.mem.eql(u8, code, code4));
+
+    // Comments carry their own independent trip.
+    const c = try m.addComment(p.id, null, "tok-t2", "tripped comment", "reply-trip");
+    try std.testing.expect(c.trip != null);
+    try std.testing.expect(!std.mem.eql(u8, c.trip.?, trip));
+
+    // Empty/whitespace/absent trip → no trip stored.
+    const p5 = try m.addPost("b", "tok-t1", "plain", "   ");
+    try std.testing.expect(p5.trip == null);
+    const p6 = try m.addPost("b", "tok-t1", "plain2", null);
+    try std.testing.expect(p6.trip == null);
+
+    // Over-long tripcodes are rejected outright.
+    var long_buf: [max_trip_len + 1]u8 = @splat('x');
+    try std.testing.expectError(error.InvalidTrip, m.addPost("b", "tok-t1", "x", &long_buf));
+    try std.testing.expectError(error.InvalidTrip, m.addComment(p.id, null, "tok-t1", "x", &long_buf));
+}
+
+test "board model: migrates a pre-trip schema; legacy rows load with null trip" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "/tmp/zboard-test-migrate.db";
+    std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, path ++ "-wal") catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, path ++ "-wal") catch {};
+    std.Io.Dir.deleteFileAbsolute(io, path ++ "-shm") catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, path ++ "-shm") catch {};
+
+    {
+        // Hand-build a database with the PRE-trip schema (what an old
+        // zboard binary created) plus one legacy row.
+        var d = try db.Db.open(alloc, path);
+        defer d.close();
+        try d.exec(alloc,
+            \\CREATE TABLE users (
+            \\    token TEXT PRIMARY KEY,
+            \\    created INTEGER NOT NULL
+            \\);
+            \\CREATE TABLE posts (
+            \\    id INTEGER PRIMARY KEY,
+            \\    board TEXT NOT NULL,
+            \\    user TEXT NOT NULL,
+            \\    text TEXT NOT NULL,
+            \\    ts INTEGER NOT NULL
+            \\);
+            \\CREATE TABLE comments (
+            \\    id INTEGER PRIMARY KEY,
+            \\    post INTEGER NOT NULL,
+            \\    parent INTEGER,
+            \\    user TEXT NOT NULL,
+            \\    text TEXT NOT NULL,
+            \\    ts INTEGER NOT NULL
+            \\);
+            \\CREATE TABLE likes (
+            \\    kind TEXT NOT NULL,
+            \\    target INTEGER NOT NULL,
+            \\    user TEXT NOT NULL,
+            \\    ts INTEGER NOT NULL,
+            \\    PRIMARY KEY (kind, target, user)
+            \\);
+        );
+        var u = try d.prepare(alloc, "INSERT INTO users (token, created) VALUES ('old-tok', 1)");
+        defer u.finalize();
+        _ = try u.step();
+        var pins = try d.prepare(alloc, "INSERT INTO posts (id, board, user, text, ts) VALUES (1, 'b', 'old-tok', 'legacy post', 1)");
+        defer pins.finalize();
+        _ = try pins.step();
+        var cins = try d.prepare(alloc, "INSERT INTO comments (id, post, parent, user, text, ts) VALUES (2, 1, NULL, 'old-tok', 'legacy comment', 1)");
+        defer cins.finalize();
+        _ = try cins.step();
+    }
+    {
+        var m = try BoardModel.init(alloc, path);
+        defer m.deinit();
+        // init's migrate() added the trip column; legacy rows load
+        // with trip == null (NULL column → empty columnText).
+        try std.testing.expectEqual(@as(usize, 1), m.posts.items.len);
+        try std.testing.expectEqualStrings("legacy post", m.posts.items[0].text);
+        try std.testing.expect(m.posts.items[0].trip == null);
+        try std.testing.expectEqual(@as(usize, 1), m.comments.items.len);
+        try std.testing.expect(m.comments.items[0].trip == null);
+        // New writes on the migrated db carry trips.
+        const p = try m.addPost("b", "old-tok", "new post", "tc");
+        try std.testing.expect(p.trip != null);
+        try std.testing.expect(m.posts.items[0].trip == null);
+        // defer deinits at block end → the column survives a reopen.
+    }
+    {
+        var m = try BoardModel.init(alloc, path);
+        defer m.deinit();
+        try std.testing.expectEqual(@as(usize, 2), m.posts.items.len);
+        try std.testing.expect(m.posts.items[1].trip != null);
+        try std.testing.expect(m.posts.items[0].trip == null);
     }
 }

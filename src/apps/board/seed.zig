@@ -11,6 +11,8 @@ const SeedComment = struct {
     parent: ?usize,
     user: []const u8,
     text: []const u8,
+    /// Optional plaintext tripcode — hashed like any user-submitted trip.
+    trip: ?[]const u8 = null,
 };
 
 const SeedPost = struct {
@@ -18,6 +20,8 @@ const SeedPost = struct {
     user: []const u8,
     text: []const u8,
     comments: []const SeedComment,
+    /// Optional plaintext tripcode — hashed like any user-submitted trip.
+    trip: ?[]const u8 = null,
 };
 
 pub const posts = [_]SeedPost{
@@ -88,6 +92,7 @@ pub const posts = [_]SeedPost{
             .{ .parent = null, .user = "seed-17", .text = "Наследство, скорее всего. Или подделка класса люкс — проверь регистрацию животного" },
             .{ .parent = 0, .user = "seed-18", .text = "А если настоящий? Это же вообще другая лига. Тут недели зарплаты хлопок для рубашек не покроют" },
         },
+        .trip = "real-horse-energy",
     },
 
     // ── /nexus/ — железо и прошивки ─────────────────────────────
@@ -102,8 +107,9 @@ pub const posts = [_]SeedPost{
         .comments = &.{
             .{ .parent = null, .user = "seed-20", .text = "481 — агрессивная готовность встретить новый день. Начальник просит снизить" },
             .{ .parent = null, .user = "seed-21", .text = "888 — желание смотреть телевизор, что бы ни случилось. По пятницам" },
-            .{ .parent = 1, .user = "seed-22", .text = "Это вообще из легального диапазона?" },
+            .{ .parent = 1, .user = "seed-22", .text = "Это вообще из легального диапазона?", .trip = "diag-42" },
         },
+        .trip = "mood-org",
     },
     .{
         .board = "nexus",
@@ -169,13 +175,13 @@ pub fn apply(m: *model.BoardModel) !struct { posts: usize, comments: usize } {
     if (m.posts.items.len != 0) return error.NonEmpty;
     for (posts) |sp| {
         _ = try m.ensureUser(sp.user);
-        const p = try m.addPost(sp.board, sp.user, sp.text);
+        const p = try m.addPost(sp.board, sp.user, sp.text, sp.trip);
         // Temp parent indexes → real ids.
         var real: [64]u64 = undefined;
         for (sp.comments, 0..) |sc, i| {
             _ = try m.ensureUser(sc.user);
             const parent: ?u64 = if (sc.parent) |pi| real[pi] else null;
-            const c = try m.addComment(p.id, parent, sc.user, sc.text);
+            const c = try m.addComment(p.id, parent, sc.user, sc.text, sc.trip);
             real[i] = c.id;
         }
     }

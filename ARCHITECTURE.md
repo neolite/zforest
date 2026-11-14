@@ -1579,7 +1579,7 @@ emit time, so arena resets can't dangle patch payloads. zboard's
 hand-declared Session gained the two parity fields (its own
 servePage/render overrides never read them).
 
-## Board auth — phased (ADR-0001, proposed)
+## Board auth — phased (ADR-0001; phase 1 landed)
 
 Auth for zboard is phased: tripcodes first (per-post secret, zero
 auth state, no group-key impact), accounts second (zfxa cookie +
@@ -1588,3 +1588,13 @@ share Dom per route and per-viewer UI diverges grouped sessions).
 Live islands/binders cannot carry per-session UI inside groups —
 their ops go to the session log while groups publish one shared
 batch. Full decision record: docs/adr/0001-board-auth.md.
+
+Phase 1 shipped: optional `trip` input on the post/comment/reply
+forms rides the existing `fields` payload (no new actions). The
+model stores `HMAC-SHA256(trip_secret, "<user_token>:<tripcode>")`
+hex in a nullable `trip` column — added to the CREATE schema plus a
+`PRAGMA table_info`-guarded `ALTER TABLE` for pre-existing dbs — and
+`view.authorName` appends the derived `!code` (first 8 hash bytes →
+base64 alnum, secret-free) to post/comment author labels only; the
+`#who` chip and group key stay trip-free since the suffix is per-post
+content, not viewer state.

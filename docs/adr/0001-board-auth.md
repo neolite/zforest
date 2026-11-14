@@ -1,6 +1,6 @@
 # Board auth: phased identity — tripcodes first, accounts second
 
-**Status:** proposed
+**Status:** phase 1 landed (tripcodes); accounts still proposed
 
 zboard today is purely anonymous: the `users` table stores only
 `zfxu` cookie tokens and `anonName(rownum)` derives display names.
@@ -56,11 +56,19 @@ Ship auth in two phases:
 
 - Phase 1 touches only `model.zig` (column + HMAC verify), the post/
   comment forms, and name formatting — no session, group, or client
-  changes.
-- Phase 2 adds a schema migration path (first `ALTER TABLE` need —
-  current schema is `CREATE TABLE IF NOT EXISTS` only), an auth
-  cookie alongside `zfxu`, and the group-key auth dimension. Session
-  cap accounting is unchanged (auth rides the existing session).
+  changes. **Landed:** `posts`/`comments` gained a nullable `trip`
+  TEXT column (CREATE for fresh dbs + a `PRAGMA table_info`-guarded
+  `ALTER TABLE` migration for existing ones); the column stores
+  `HMAC-SHA256(trip_secret, "<user_token>:<tripcode>")` as hex and the
+  public `!code` (8 base64-ish chars) is derived from the stored hash
+  at render time — `model.tripCode`, `view.authorName`. The `trip`
+  input rides the existing `fields` payload on post/comment/reply —
+  no new actions, no gen/ changes.
+- Phase 2 adds an auth cookie alongside `zfxu`, the `accounts` table,
+  and the group-key auth dimension; it reuses phase 1's
+  `PRAGMA`-guarded `ALTER TABLE` migration pattern for new columns.
+  Session cap accounting is unchanged (auth rides the existing
+  session).
 - PBKDF2 iteration count is a demo-grade trade-off; if zboard ever
   holds real accounts, swap the KDF — the `pass_hash` column format
   (`salt$iterations$hash`) leaves room.

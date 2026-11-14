@@ -278,19 +278,21 @@ pub const BoardDeps = struct {
         return actions.dispatch(s, action, arg, value, fields);
     }
 
-    /// `post` — fields {board, text} → addPost on the shared model.
+    /// `post` — fields {board, text, trip?} → addPost on the shared
+    /// model; `trip` is the optional 4chan-style tripcode (hashed in
+    /// the model, never stored plaintext).
     pub fn on_post(s: *Session, arg: ?[]const u8, value: ?[]const u8, fields: ?*const std.json.ObjectMap) !void {
         _ = arg;
         _ = value;
         const f = fields orelse return error.InvalidAction;
         const slug = fieldStr(f, "board") orelse return error.InvalidAction;
         const text = fieldStr(f, "text") orelse return error.InvalidAction;
-        _ = try model.get().addPost(slug, s.deps.user_token, text);
+        _ = try model.get().addPost(slug, s.deps.user_token, text, fieldStr(f, "trip"));
         s.deps.ping.emit(.{});
     }
 
-    /// `comment` — fields {post, parent?, text} → addComment; clears
-    /// the inline-reply target.
+    /// `comment` — fields {post, parent?, text, trip?} → addComment;
+    /// clears the inline-reply target.
     pub fn on_comment(s: *Session, arg: ?[]const u8, value: ?[]const u8, fields: ?*const std.json.ObjectMap) !void {
         _ = arg;
         _ = value;
@@ -298,7 +300,7 @@ pub const BoardDeps = struct {
         const post_id = fieldU64(f, "post") orelse return error.InvalidAction;
         const parent = fieldU64(f, "parent");
         const text = fieldStr(f, "text") orelse return error.InvalidAction;
-        _ = try model.get().addComment(post_id, parent, s.deps.user_token, text);
+        _ = try model.get().addComment(post_id, parent, s.deps.user_token, text, fieldStr(f, "trip"));
         s.deps.reply_to = null;
         s.deps.ping.emit(.{});
     }
@@ -794,7 +796,7 @@ test "setRoute/servePage reset dom, SSR per route, and 404 dangling ids" {
     defer mm.deinit();
     model.shared = mm;
     defer model.shared = null;
-    _ = try mm.addPost("b", "tok1", "a post");
+    _ = try mm.addPost("b", "tok1", "a post", null);
 
     const s = createSession(alloc, std.testing.io);
     defer s.deinit();
@@ -902,10 +904,10 @@ test "thread SSR emits nested keyed comment trees and reply anchors" {
     model.shared = mm;
     defer model.shared = null;
 
-    _ = try mm.addPost("b", "tok1", "root post");
-    const c1 = try mm.addComment(1, null, "tok1", "first");
-    const c2 = try mm.addComment(1, c1.id, "tok1", "child of first");
-    _ = try mm.addComment(1, c2.id, "tok1", "grandchild");
+    _ = try mm.addPost("b", "tok1", "root post", null);
+    const c1 = try mm.addComment(1, null, "tok1", "first", null);
+    const c2 = try mm.addComment(1, c1.id, "tok1", "child of first", null);
+    _ = try mm.addComment(1, c2.id, "tok1", "grandchild", null);
 
     const s = createSession(alloc, std.testing.io);
     defer s.deinit();
@@ -949,10 +951,10 @@ test "comment page breadcrumbs walk the parent chain; focused subtree only" {
     model.shared = mm;
     defer model.shared = null;
 
-    _ = try mm.addPost("tech", "tok1", "p");
-    const c1 = try mm.addComment(1, null, "tok1", "root c");
-    const c2 = try mm.addComment(1, c1.id, "tok1", "mid c");
-    const c3 = try mm.addComment(1, c2.id, "tok1", "leaf c");
+    _ = try mm.addPost("tech", "tok1", "p", null);
+    const c1 = try mm.addComment(1, null, "tok1", "root c", null);
+    const c2 = try mm.addComment(1, c1.id, "tok1", "mid c", null);
+    const c3 = try mm.addComment(1, c2.id, "tok1", "leaf c", null);
 
     const s = createSession(alloc, std.testing.io);
     defer s.deinit();
@@ -1020,7 +1022,7 @@ test "comment on another session patches the board counter live" {
     model.shared = mm;
     defer model.shared = null;
 
-    _ = try mm.addPost("b", "tok1", "thread post");
+    _ = try mm.addPost("b", "tok1", "thread post", null);
     // Board-index session already rendered (SSR-equivalent seed).
     const s = createSession(alloc, std.testing.io);
     defer s.deinit();
@@ -1133,7 +1135,7 @@ test "render groups: equal keys share one group; one render per model bump" {
     // Model bump → the FIRST member's syncPull renders+publishes once;
     // the second sees last_rendered_seq already current — dedup proof:
     // rev (one per render) advances by exactly 1 for two sessions.
-    _ = try mm.addPost("b", "tok1", "grouped post");
+    _ = try mm.addPost("b", "tok1", "grouped post", null);
     a.syncPull();
     try std.testing.expectEqual(@as(u64, 1), g.rev);
     try std.testing.expectEqual(g.rev, g.history.latest_rev);
@@ -1162,8 +1164,8 @@ test "render groups v2: reply_to fork clones the stream; A→B→A still snapsho
     model.shared = mm;
     defer model.shared = null;
 
-    _ = try mm.addPost("b", "tok1", "p");
-    const c1 = try mm.addComment(1, null, "tok1", "c");
+    _ = try mm.addPost("b", "tok1", "p", null);
+    const c1 = try mm.addComment(1, null, "tok1", "c", null);
 
     const a = createSession(alloc, std.testing.io);
     defer a.deinit();
@@ -1176,7 +1178,7 @@ test "render groups v2: reply_to fork clones the stream; A→B→A still snapsho
 
     // Give the base group a published batch so its ring is non-empty —
     // the fork must carry it verbatim for lagging cursors.
-    _ = try mm.addComment(1, null, "tok2", "c2");
+    _ = try mm.addComment(1, null, "tok2", "c2", null);
     a.syncPull();
     try std.testing.expectEqual(@as(u64, 1), base.rev);
 
@@ -1218,7 +1220,7 @@ test "render groups: minted identity re-keys the session out of the anon group" 
     model.shared = mm;
     defer model.shared = null;
 
-    _ = try mm.addPost("b", "tok1", "p");
+    _ = try mm.addPost("b", "tok1", "p", null);
     const a = createSession(alloc, std.testing.io);
     defer a.deinit();
     const d = createSession(alloc, std.testing.io);
@@ -1302,10 +1304,10 @@ test "sortTops: newest-first default, top orders by likes then recency" {
     defer mm.deinit();
     model.shared = mm;
     defer model.shared = null;
-    _ = try mm.addPost("b", "tok", "post");
-    _ = try mm.addComment(1, null, "tok", "oldest");
-    _ = try mm.addComment(1, null, "tok", "middle");
-    _ = try mm.addComment(1, null, "tok", "newest");
+    _ = try mm.addPost("b", "tok", "post", null);
+    _ = try mm.addComment(1, null, "tok", "oldest", null);
+    _ = try mm.addComment(1, null, "tok", "middle", null);
+    _ = try mm.addComment(1, null, "tok", "newest", null);
     const c_old = mm.comments.items[0].id;
     const c_mid = mm.comments.items[1].id;
     const c_new = mm.comments.items[2].id;
@@ -1407,8 +1409,8 @@ test "dirty-only dispatch: unrelated scope mutations skip group renders" {
     defer mm.deinit();
     model.shared = mm;
     defer model.shared = null;
-    _ = try mm.addPost("b", "tok", "post one");
-    _ = try mm.addPost("b", "tok", "post two");
+    _ = try mm.addPost("b", "tok", "post one", null);
+    _ = try mm.addPost("b", "tok", "post two", null);
 
     const a = createSession(alloc, std.testing.io);
     defer a.deinit();
@@ -1444,4 +1446,69 @@ test "dirty-only dispatch: unrelated scope mutations skip group renders" {
     try a.dispatch("comment", null, null, &cf2);
     a.syncPull();
     try std.testing.expect(ga.rev > rev_a);
+}
+
+test "tripcode field flows through dispatch into stored hash + author label" {
+    const alloc = std.testing.allocator;
+    const mm = testModel(alloc);
+    defer mm.deinit();
+    model.shared = mm;
+    defer model.shared = null;
+
+    const s = createSession(alloc, std.testing.io);
+    defer s.deinit();
+    try std.testing.expect(s.setRoute("/b/b"));
+
+    // Post with a tripcode: the form field rides `fields` into the
+    // model, which stores only the HMAC hash.
+    var f: std.json.ObjectMap = .empty;
+    defer f.deinit(alloc);
+    try f.put(alloc, "board", .{ .string = "b" });
+    try f.put(alloc, "text", .{ .string = "tripped!" });
+    try f.put(alloc, "trip", .{ .string = "swordfish" });
+    try s.dispatch("post", null, null, &f);
+    const p = mm.posts.items[0];
+    try std.testing.expect(p.trip != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.trip.?, "swordfish") == null);
+
+    // SSR ships the optional trip input and renders "Anon#1!code".
+    const page = viewStr(s, alloc);
+    defer alloc.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "name=\"trip\"") != null);
+    const code = model.tripCode(alloc, p.trip).?;
+    defer alloc.free(code);
+    var want1: [320]u8 = undefined;
+    const label = std.fmt.bufPrint(&want1, "Anon#1!{s}", .{code}) catch unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, page, label) != null);
+
+    // A comment carries its OWN trip — same poster, different code.
+    var cf: std.json.ObjectMap = .empty;
+    defer cf.deinit(alloc);
+    try cf.put(alloc, "post", .{ .string = "1" });
+    try cf.put(alloc, "text", .{ .string = "tripped comment" });
+    try cf.put(alloc, "trip", .{ .string = "reply-secret" });
+    try s.dispatch("comment", null, null, &cf);
+    const c = mm.comments.items[0];
+    try std.testing.expect(c.trip != null);
+    const ccode = model.tripCode(alloc, c.trip).?;
+    defer alloc.free(ccode);
+    try std.testing.expect(!std.mem.eql(u8, code, ccode));
+
+    try std.testing.expect(s.setRoute("/t/1"));
+    const tpage = viewStr(s, alloc);
+    defer alloc.free(tpage);
+    var want2: [320]u8 = undefined;
+    const clabel = std.fmt.bufPrint(&want2, "Anon#1!{s}", .{ccode}) catch unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, tpage, clabel) != null);
+    // The post's own trip label still renders on the thread card.
+    try std.testing.expect(std.mem.indexOf(u8, tpage, label) != null);
+
+    // No trip field → plain author, no '!'.
+    var pf: std.json.ObjectMap = .empty;
+    defer pf.deinit(alloc);
+    try pf.put(alloc, "board", .{ .string = "b" });
+    try pf.put(alloc, "text", .{ .string = "plain post" });
+    try pf.put(alloc, "trip", .{ .string = "   " });
+    try s.dispatch("post", null, null, &pf);
+    try std.testing.expect(mm.posts.items[1].trip == null);
 }
