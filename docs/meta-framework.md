@@ -259,50 +259,35 @@ fetch functions — there is no network fetch in-process; introducing
 one means adopting the async protocol anyway, at which point it's an
 effect, not a loader. v0 loaders = typed `prepare` + env injection.
 
-### 2.6 Client-side navigation
+### 2.6 Client-side navigation — LANDED (client.js `softNav`)
 
-Today every navigation is a full document load: `<a href>` → GET →
-`(token, route)` session → SSR → fresh `EventSource("/events?r=" +
-location.pathname)` (client.js:197-198; `route` feeds the
-`x-zforest-route` header at :246).
+Every internal `<a href="/...">` click is intercepted (no modifier
+keys, no `target`/`download`/`data-reload`, same-origin only) and
+navigates without a document reload:
 
-What SPA-like nav would concretely require:
+1. `fetch(href)` — a normal page GET: the server mints/looks up the
+   `(token, route)` session, runs `servePage`, returns SSR HTML.
+   Nothing new server-side; non-2xx falls back to `location.href`.
+2. `DOMParser` lifts `<main>` innerHTML, `<title>`, and the
+   `zforest-csrf` meta out of the response; `history.pushState`
+   records the URL; `route`/`lastRev`/`csrfToken`/`ready` update.
+3. `connect()` closes the old EventSource and opens
+   `/events?r=<new path>` — the fresh `snapshot` (full-state ops
+   dump) reconciles the swapped `<main>`, re-gates submit controls,
+   and restores `lastRev` ordering for the new session's revisions.
 
-1. Client `navigate(path)`: `history.pushState`, close the current
-   EventSource, request a nav payload for the target route.
-2. Server: `parseRoute(target)` (generated), ensure/create the
-   `(token, target)` session, bring it current (`servePage`-
-   equivalent: `syncMembership` + `ensureGroupCurrent`), serialize
-   `{route, rev, ops, csrf}` — `ops` is the same
-   `writeSnapshotOps` full-state dump `serveEvents` already emits
-   (`stream.zig:14`).
-3. Client: update `route` var + CSRF meta + `lastRev`, open
-   `EventSource("/events?r=" + newroute)`, `applyOps(ops)`, refresh
-   `<title>`/`page_class` if the app varies them.
+Same-path query changes (`?q=`) soft-nav too: the session key is
+the path, so the route-session is reused and the snapshot simply
+re-asserts the re-rendered state. Back/forward is NOT intercepted —
+`popstate` falls through to a full document load (correct, just not
+instant). Draft stash (`sessionStorage`) runs before nav exactly as
+on session-loss reload.
 
-The old route-session stays alive server-side exactly as it does for
-a second tab — no teardown, cap accounting unchanged. Per-route CSRF
-tokens differ, so the nav response must carry the new token (today
-it's read once at load, client.js:169-172). Unsent drafts need the
-existing `sessionStorage` stash (client.js:143-152) extended to nav.
-Back/forward needs `popstate` → nav mapping; the server keeps no
-history, so simplest is intercept-and-navigate or fall back to full
-load (§7).
-
-Honest assessment: soft-nav's real win is perceived speed and
-preserved JS state (draft stash, scroll, future island widgets) —
-NOT DOM preservation, since a snapshot of `<main>` rebuilds it
-anyway. It skips document parse + asset re-eval: ~150 lines in
-client.js + ~80 server + tests. MPA is not embarrassing — SSR +
-one snapshot is already a single round trip. Schedule after v0
-proves the conventions; do not block v0 on it.
-
-Rejected alternative: a "route change" action that re-keys the
-existing session in place — impossible by construction: Dom, history,
-graph, revision and CSRF are all per-`(token, route)`; the session
-key IS the route. Mutating it would orphan the stream lineage and
-violate the incarnation/epoch invariants the render-group work just
-established.
+Rejected alternative (kept for the record): a dedicated nav payload
+`{route, rev, ops, csrf}` — unnecessary; the page GET already
+produces everything and keeps `servePage` as the single render
+entry. Mutating a session's route key in place remains impossible by
+construction (Dom/history/graph/rev/CSRF are per-`(token, route)`).
 
 ### 2.7 Streaming SSR / Suspense
 

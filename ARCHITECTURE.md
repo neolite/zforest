@@ -1498,3 +1498,15 @@ All board tests ported 1:1 (route-parse test rewritten for the
  two-layer split; dangling-id assertions moved from `setRoute` to
 `servePage`). Verified: `zig build test`, `zig build`, live smoke on
 all four routes + 404 cases against a seeded db.
+
+## Soft navigation (landed)
+
+`client.js` intercepts same-origin internal link clicks and performs
+soft navigation: fetch the target page (normal GET — server mints the
+`(token, route)` session and SSRs as usual), graft `<main>`/`<title>`
+/CSRF meta from the response into the live document, `pushState`, then
+reconnect `EventSource` — the snapshot's full-state ops reconcile the
+swapped DOM and reset revision ordering. No new server endpoint: the
+page GET is the nav payload. Opt-outs: modifier keys, `target`,
+`download`, `data-reload` on the anchor. Back/forward falls back to
+full loads. Query-only changes reuse the path-keyed session.

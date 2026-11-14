@@ -195,38 +195,44 @@
   // Sessions are keyed (cookie token, route) server-side: the stream and
   // every action must name this page's route so they hit the right view.
   var route = location.pathname;
-  var es = new EventSource("/events?r=" + route);
-  es.addEventListener("snapshot", function (ev) {
-    var d;
-    try {
-      d = JSON.parse(ev.data);
-    } catch (e) {
-      console.error("zforest: bad snapshot json", e);
-      return;
-    }
-    applySnapshot(d);
-  });
-  es.addEventListener("patch", function (ev) {
-    var d;
-    try {
-      d = JSON.parse(ev.data);
-    } catch (e) {
-      console.error("zforest: bad patch json", e);
-      return;
-    }
-    if (d.rev > lastRev) { // ignore obsolete batches
-      applyOps(d.patches);
-      lastRev = d.rev;
-    } else {
-      console.debug("zforest: skipping patch rev " + d.rev + " (lastRev " + lastRev + ")");
-    }
-  });
-  es.addEventListener("session_expired", function () {
-    es.close();
-    reloadOnce();
-  });
+  var es = null;
+
+  function connect() {
+    if (es) es.close();
+    es = new EventSource("/events?r=" + route);
+    es.addEventListener("snapshot", function (ev) {
+      var d;
+      try {
+        d = JSON.parse(ev.data);
+      } catch (e) {
+        console.error("zforest: bad snapshot json", e);
+        return;
+      }
+      applySnapshot(d);
+    });
+    es.addEventListener("patch", function (ev) {
+      var d;
+      try {
+        d = JSON.parse(ev.data);
+      } catch (e) {
+        console.error("zforest: bad patch json", e);
+        return;
+      }
+      if (d.rev > lastRev) { // ignore obsolete batches
+        applyOps(d.patches);
+        lastRev = d.rev;
+      } else {
+        console.debug("zforest: skipping patch rev " + d.rev + " (lastRev " + lastRev + ")");
+      }
+    });
+    es.addEventListener("session_expired", function () {
+      es.close();
+      reloadOnce();
+    });
+  }
   // EventSource auto-reconnects on any drop; every fresh connection gets a
   // full snapshot first, which always resyncs the DOM.
+  connect();
 
   // Serialize actions through a promise queue so revisions stay ordered.
   // The response is an ACK {rev} only — patches arrive via the SSE stream.
@@ -328,6 +334,74 @@
       var af = form.querySelector("[autofocus]") || form.querySelector("input:not([type=hidden]), textarea");
       if (af) af.focus();
     }).catch(fail);
+  });
+
+  // ── soft navigation ─────────────────────────────────────────
+  // Internal links swap <main> + reconnect the stream instead of a
+  // full reload. The GET still hits the server — it mints/looks up
+  // the route-session and returns SSR HTML; we lift <main>, <title>
+  // and the CSRF meta out of the response, pushState the URL, then
+  // reopen EventSource: its snapshot reconciles any drift (snapshot
+  // ops are state dumps — idempotent over matching markup).
+  // Opt out per-link with data-reload, per-gesture with modifier keys.
+  var navSeq = 0;
+
+  function softNav(url, href) {
+    var my = ++navSeq;
+    stashDraft();
+    fetch(href, { credentials: "same-origin" }).then(function (r) {
+      if (!r.ok) {
+        location.href = href; // 404/500 → let the browser navigate
+        return null;
+      }
+      return r.text();
+    }).then(function (html) {
+      if (html === null || my !== navSeq) return; // superseded or failed
+      var doc = new DOMParser().parseFromString(html, "text/html");
+      var fresh = doc.querySelector("main");
+      var cur = document.querySelector("main");
+      if (!fresh || !cur) {
+        location.href = href;
+        return;
+      }
+      cur.innerHTML = fresh.innerHTML;
+      var t = doc.querySelector("title");
+      if (t) document.title = t.textContent;
+      var cm = doc.querySelector('meta[name="zforest-csrf"]');
+      var lm = document.querySelector('meta[name="zforest-csrf"]');
+      if (cm && lm) {
+        csrfToken = cm.getAttribute("content");
+        lm.setAttribute("content", csrfToken);
+      }
+      route = url.pathname;
+      lastRev = 0; // new route-session numbers revisions independently
+      ready = false; // re-gate submit controls until the snapshot lands
+      history.pushState(null, "", href);
+      window.scrollTo(0, 0);
+      connect();
+    }).catch(function () {
+      location.href = href;
+    });
+  }
+
+  document.addEventListener("click", function (ev) {
+    if (ev.defaultPrevented || ev.button !== 0) return;
+    if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
+    var a = ev.target.closest("a[href]");
+    if (!a || a.hasAttribute("download") || a.target) return;
+    if (a.hasAttribute("data-reload")) return;
+    var href = a.getAttribute("href");
+    if (!href || href.charAt(0) !== "/") return;
+    var url;
+    try {
+      url = new URL(href, location.href);
+    } catch (e) {
+      return;
+    }
+    if (url.origin !== location.origin) return;
+    if (url.pathname === location.pathname && url.search === location.search) return;
+    ev.preventDefault();
+    softNav(url, href);
   });
 
   // Restore a draft stashed before a session-loss reload.
