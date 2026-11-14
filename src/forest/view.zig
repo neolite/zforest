@@ -433,6 +433,15 @@ fn bindGet(store: anytype) Bound {
     };
 }
 
+/// Public operand binder for alternate view frontends (zmeta `h`,
+/// generated code): wraps a `*T.get()` store pointer as a `Bound`
+/// with live hooks intact when the store exposes the watch contract.
+/// Prefer this over re-implementing `bindGet` — `.live = null` ports
+/// silently lose `bindTree` self-updates.
+pub fn bind(store: anytype) Bound {
+    return bindGet(store);
+}
+
 fn assertGettable(comptime S: type) void {
     if (!isGetPtr(S)) {
         @compileError("expected a pointer to a type exposing .get(), found " ++ @typeName(S));

@@ -294,7 +294,7 @@ test "comment_row: computed .text binding stays live through zsx lowering" {
     try std.testing.expectEqualStrings("\u{25B2} 9", log.patches.items[0].text.text);
 }
 
-test "post_form: raw store attr keeps live hooks via zsx+el; h.* drops them" {
+test "post_form: raw store attr keeps live hooks via zsx, h and el" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -315,13 +315,13 @@ test "post_form: raw store attr keeps live hooks via zsx+el; h.* drops them" {
         if (env.draft) |d| d.emit("changed");
         emitted[vi] = log.patches.items.len != 0;
     }
-    // zsx (forest.el path) and el keep Bound.live → 1 attr binding each.
-    // h's ported bindGet leaves live=null → no subscription (the
-    // documented h-vs-el divergence that motivates emitting el calls).
+    // All three keep Bound.live → 1 attr binding each. h routes store
+    // operands through forest.bind, so the old h-vs-el divergence is
+    // gone (fixed after the spike — see h.zig internals note).
     try std.testing.expectEqual(@as(usize, 1), binding_counts[0]);
-    try std.testing.expectEqual(@as(usize, 0), binding_counts[1]);
+    try std.testing.expectEqual(@as(usize, 1), binding_counts[1]);
     try std.testing.expectEqual(@as(usize, 1), binding_counts[2]);
     try std.testing.expect(emitted[0]);
-    try std.testing.expect(!emitted[1]);
+    try std.testing.expect(emitted[1]);
     try std.testing.expect(emitted[2]);
 }

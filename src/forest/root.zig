@@ -26,6 +26,7 @@ pub const fragment = view.fragment;
 pub const variant = view.variant;
 pub const when = view.when;
 pub const computed = view.computed;
+pub const bind = view.bind;
 pub const writeHtml = view.writeHtml;
 pub const writeSnapshotOps = view.writeSnapshotOps;
 pub const diff = view.diff;

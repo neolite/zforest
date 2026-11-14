@@ -28,12 +28,9 @@
 //!     `el`'s `.id`. `.text(v)` is the bound textContent and accepts
 //!     everything forest's `.text` does: strings, ints, optionals,
 //!     `*T.get()` store pointers, `computed(...)` bindings, `Value`s.
-//!     Store pointers resolve LAZILY at render/diff/seed time, but —
-//!     unlike `el`-built attrs — they carry no `live` hooks: forest's
-//!     `liveFor`/`bindGet` are private, so h-built `*Store.get()`
-//!     bindings stay diff-resolved (the next re-render picks up
-//!     changes). `computed(store, f)` keeps its live hooks because
-//!     forest constructs that `Bound` itself.
+//!     Store pointers resolve LAZILY at render/diff/seed time through
+//!     `forest.bind` — live hooks intact, so h-built `*Store.get()`
+//!     bindings self-update under `bindTree` exactly like `el` ones.
 //!   - `.class(s)` APPENDS (space-joined) rather than sets, so utility
 //!     classes compose across calls; a null/absent operand is a no-op.
 //!     Mixed string/bound operands merge into one lazy bound that
@@ -496,13 +493,13 @@ pub fn wbr(alloc: std.mem.Allocator) Builder(.wbr) {
 
 // ── internals — ports of forest.view's private helpers ──────────
 //
-// `forest.el` keeps its operand pipeline private (`resolveValue`,
-// `valueFor`, `bindGet`, `attrOf`, `normChildren`, `isGetPtr`,
-// `presenceOf`, `assertDomEvent`). h builds `Element`s directly, so it
-// mirrors those helpers here — same semantics, same operand set. The
-// ONE deliberate difference: `bindGet` below leaves `Bound.live`
-// null (forest's `liveFor` is private), so raw `*T.get()` bindings are
-// diff-resolved rather than live-subscribed.
+// `forest.el` keeps most of its operand pipeline private
+// (`resolveValue`, `valueFor`, `attrOf`, `normChildren`,
+// `presenceOf`, `assertDomEvent`). h builds `Element`s directly, so
+// it mirrors those helpers here — same semantics, same operand set.
+// Store operands go through `view.bind` (forest's `bindGet`) so
+// `Bound.live` hooks survive; merged class pairs still carry
+// `.live = null` — a lazy join has no single store to subscribe.
 
 fn isGetPtr(comptime T: type) bool {
     return switch (@typeInfo(T)) {
@@ -575,7 +572,7 @@ fn valueFor(alloc: std.mem.Allocator, v: anytype) ?Value {
         .null => return null,
         .optional => return if (v) |inner| valueFor(alloc, inner) else null,
         .pointer => {
-            if (comptime isGetPtr(T)) return .{ .bound = bindGet(v) };
+            if (comptime isGetPtr(T)) return .{ .bound = view.bind(v) };
             return .{ .str = v };
         },
         else => {
@@ -585,24 +582,9 @@ fn valueFor(alloc: std.mem.Allocator, v: anytype) ?Value {
     }
 }
 
-/// Port of forest's private `bindGet` — same lazy thunk, except
-/// `.live` stays null (see the file header / internals note).
-fn bindGet(store: anytype) Bound {
-    const S = @TypeOf(store);
-    const gen = struct {
-        fn call(alloc: std.mem.Allocator, ctx: *const anyopaque) ?[]const u8 {
-            const s: *const std.meta.Child(S) = @ptrCast(@alignCast(ctx));
-            return resolveStr(alloc, s.get());
-        }
-    };
-    return .{
-        .ctx = store,
-        .call = &gen.call,
-        .presence = comptime getReturnsBool(S),
-        .live = null,
-    };
-}
-
+/// Store operands go through `view.bind` — forest's own `bindGet`
+/// with `Bound.live` hooks intact, so h-built bindings self-update
+/// under `bindTree` exactly like `forest.el` ones.
 /// Port of forest's private `attrOf`: one `Attr` from a name + operand.
 fn makeAttr(alloc: std.mem.Allocator, name: []const u8, v: anytype) Attr {
     const T = @TypeOf(v);
@@ -913,4 +895,57 @@ test "h .for_/.href/.value/.name/.placeholder emit plain attrs" {
 
     const l = a(alloc).href("/item/1").child("cog").node();
     try std.testing.expectEqualStrings("<a href=\"/item/1\">cog</a>", renderStr(alloc, &.{l}));
+}
+
+test "h store bindings keep Bound.live hooks via view.bind" {
+    // Minimal watch-contract store: `get` + `watchCtx` + `unwatch` +
+    // `Value` — the same duck-typed contract forest's bindTree uses.
+    const LiveStore = struct {
+        const Self = @This();
+        pub const Value = []const u8;
+        pub const Sub = struct { index: u32 };
+        const Entry = struct {
+            ctx: *anyopaque,
+            cb: *const fn (*anyopaque, []const u8) void,
+        };
+        subs: std.ArrayListUnmanaged(Entry) = .empty,
+        v: []const u8 = "hi",
+        pub fn get(self: *const Self) []const u8 {
+            return self.v;
+        }
+        pub fn watchCtx(self: *Self, ctx: anytype, comptime cb: *const fn (@TypeOf(ctx), []const u8) void) Sub {
+            const CtxT = @TypeOf(ctx);
+            const S = struct {
+                fn call(ptr: *anyopaque, val: []const u8) void {
+                    const c: CtxT = @ptrCast(@alignCast(ptr));
+                    cb(c, val);
+                }
+            };
+            const idx = self.subs.items.len;
+            self.subs.append(std.testing.allocator, .{ .ctx = @ptrCast(ctx), .cb = &S.call }) catch @panic("OOM");
+            return .{ .index = @intCast(idx) };
+        }
+        pub fn unwatch(self: *Self, sub: Sub) void {
+            if (sub.index < self.subs.items.len) self.subs.items[sub.index].cb = undefined;
+        }
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var st = LiveStore{};
+    const b = span(alloc).text(&st).node();
+    const el = switch (b) {
+        .element => |e| e,
+        else => return error.TestUnexpectedResult,
+    };
+    // .text stored as an Element attr? — locate the bound operand:
+    // Element.text is a Value; assert it carries live hooks.
+    const tv = el.text orelse return error.TestUnexpectedResult;
+    const bound = switch (tv) {
+        .bound => |bb| bb,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(bound.live != null);
 }

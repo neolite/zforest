@@ -10,6 +10,17 @@ in zforest view code? A minimal transpiler (`src/zmeta/zsx.zig`,
 **Verdict up front: the precommitted bar is met — `.zsx` is adopt-worthy
 on the measured evidence, with caveats.** See [Verdict](#verdict).
 
+> **Post-review update:** a hostile Astra review of this spike
+> recommended **against adoption** — the −36% figure depends on
+> anonymous `ctx:` literals (named-ctx style measures −22%), the
+> transpiler is a second compiler (~1k lines + build steps) whose
+> diagnostics/IDE costs were never measured, whitespace rules can
+> change rendered content, and `forest.el`/`h.*` already cover the
+> ergonomic need. The spike is preserved as an experiment; the
+> transpiler is NOT part of the supported view surface. `h.*`'s
+> `Bound.live` gap cited below was fixed afterwards via `forest.bind`,
+> removing zsx's one real advantage.
+
 ## Grammar
 
 One root element per file. No HTML error recovery, no components, no

@@ -1317,13 +1317,13 @@ or comptime tuples mixing those. `.class()` appends space-joined
 offer; `.for_` dodges the keyword.
 
 Because h builds `Element`s directly (forest's operand pipeline —
-`resolveValue`/`valueFor`/`bindGet`/`attrOf`/`normChildren` — is
-private), h.zig ports those helpers verbatim. ONE deliberate
-divergence: ported `bindGet` leaves `Bound.live = null`
-(`liveFor` is private), so raw `*T.get()` bindings are
-diff-resolved, not live-subscribed; `computed(store, f)` keeps its
-live hooks because forest builds that `Bound` itself. Documented in
-the file header — revisit if a live-mode app adopts h.
+`resolveValue`/`valueFor`/`attrOf`/`normChildren` — is private), h.zig
+ports those helpers verbatim. Store operands route through
+`forest.bind` (exported `view.bindGet` wrapper, added post-spike):
+`Bound.live` hooks survive, so raw `*T.get()` bindings self-update
+under `bindTree` exactly like `forest.el` ones. The only remaining
+`.live = null` case is h's merged class-pair `Bound` — a lazy join
+of two operands has no single store to subscribe.
 
 Tag gaps (forest-side, unpatched per scope): the `Tag` enum has no
 `h4`/`nav`/`header`/`code`/`small` — h covers exactly the enum's 48
@@ -1335,13 +1335,16 @@ in h.zig cover el-equivalence, lazy store/computed `.text`,
 data-on/data-arg emission, presence attrs, child-type normalization,
 class append/merge, `eachOf` keyed interop and `.lid` composition.
 
-## zsx spike: JSX-like .zsx template transpiler (done — adopt-worthy)
+## zsx spike: JSX-like .zsx template transpiler (experiment — not adopted)
 
 Time-boxed spike on `feat/zsx-spike`: `src/zmeta/zsx.zig` (~700 lines
 parser+emitter+CLI, `zig build zsx` / `zig build zsx-check`) lowers
-`.zsx` templates to `forest.el` calls — deliberately NOT `h.*`, whose
-ported `bindGet` drops `Bound.live` for raw `*T.get()` bindings. Full
-grammar/mapping/diagnostics/LOC evidence in `docs/zsx-spike.md`.
+`.zsx` templates to `forest.el` calls. Full grammar/mapping/
+diagnostics/LOC evidence in `docs/zsx-spike.md`. Astra review
+(post-spike) recommends AGAINST adoption — the spike stays as a
+tagged experiment; `forest.el` remains canonical, `h.*` the
+ergonomic layer (its `Bound.live` gap was fixed afterwards via
+`forest.bind`).
 
 Fixture (`src/apps/zsx_spike/`): post form + comment row with bound
 like `.text`, `w-rep-N` `when` reply, nested keyed `eachOf` kids —
@@ -1352,7 +1355,8 @@ each written three ways (zsx→gen, `h.*`, `forest.el`). Results:
   mount/unmount) are byte-identical across all three versions.
 - `computed` `.text` stays live through lowering (`bindTree`
   subscribes, `emit` patches); raw store attr keeps `Bound.live`
-  (zsx/el: 1 binding + patch; h: 0 — the documented h gap).
+  (at spike time h dropped it — fixed post-spike via `forest.bind`,
+  so all three now subscribe identically).
 - Parse diagnostics are positioned `path:line:col` with clean
   messages; type errors inside `{…}` holes cite `gen/*.zig` with the
   verbatim expr (one hop from source via the header comment).
