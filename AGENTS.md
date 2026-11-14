@@ -22,6 +22,9 @@ combo discounts, booking history).
 - `src/car_data.zig`: static catalogue — brands/models/years with engine/transmission/drivetrain specs, service list by `Cat`, combo discount rules.
 - `src/car_app.zig`: zcar session/view — per-session cart (`AutoHashMapUnmanaged`), vehicle selection state, upsell suggestions, booking records; dispatch actions `set_brand`/`set_model`/`set_year`/`toggle_svc`/`add_svc`/`book`; `discounts` writes into a caller buffer (no stack-slice escape).
 - `src/car_main.zig`: `zcar` executable entry point (`zcar [port] [bind-ip]`).
+- `src/zmeta/`: plain-source meta-framework layer (NOT a named module — relative imports preserve `History`/`Dom`/`zefx`/`forest` type identity). `session.zig` is the generic `Session(Deps)` skeleton, `env.zig` the render context, `root.zig` the plain-source export surface, `gen.zig` the routing/action codegen (`zig build gen`).
+- `src/apps/<name>/`: zmeta app dirs — `pages/**/*.zig` (file-based routes; `[name]` segments → typed `params` fields), `actions.zig` (action-name manifest), generated `gen/routes.zig` + `gen/actions.zig` (checked in).
+- `src/zmeta_demo_main.zig`: `zmeta-demo` executable entry point (`zmeta-demo [port] [bind-ip]`); flat `src/` placement keeps every relative import inside the module path.
 - `src/server/http.zig`: generic-over-`Session` HTTP/SSE server (cookie sessions, POST /action → ACK, GET /events → SSE stream, `Ip4Address` bind, `setRoute`/`servePage`/`syncPull`/`out_cookie`/`readCookies` hooks, per-action `Set-Cookie`).
 - `src/server/history.zig`: bounded per-session ring of serialized patch batches for SSE subscribers.
 - `src/server/stream.zig`: `{rev,ops}` snapshot serialization for SSE snapshot events.
@@ -66,11 +69,13 @@ combo discounts, booking history).
 - Generated artifacts: `.zig-cache/` and `zig-out/` (do not edit manually).
 
 ## Build, Test, and Development Commands
-- `zig build`: compile and install the executables (`zforest`, `zboard`, `zmon`, `zcar`).
+- `zig build`: compile and install the executables (`zforest`, `zboard`, `zmon`, `zcar`, `zmeta-demo`).
 - `zig build run`: run the todo server on 127.0.0.1:8080 (port arg optional).
 - `zig build run-board`: run the board server (`zboard [port] [bind-ip] [db-path]`).
 - `zig build run-mon`: run the dashboard (`zmon [port] [bind-ip]`).
 - `zig build run-car`: run the booking demo (`zcar [port] [bind-ip]`).
+- `zig build run-demo`: run the zmeta codegen demo (`zmeta-demo [port] [bind-ip]`).
+- `zig build gen`: regenerate `src/apps/*/gen/*.zig` from pages/ + actions.zig manifests.
 - `zig build test`: run module + executable test targets for all apps.
 - `zig build -Doptimize=ReleaseFast`: build with release optimization.
 - `zig fmt src/**/*.zig build.zig`: format code before committing.

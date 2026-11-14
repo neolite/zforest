@@ -1,0 +1,888 @@
+//! zmeta codegen (docs/meta-framework.md §2.1, §2.9, §5.1): scans an
+//! app's `pages/` directory and `actions.zig` manifest, then emits
+//! `gen/routes.zig` + `gen/actions.zig`.
+//!
+//! File conventions (v0):
+//!
+//!   pages/index.zig             → route "/"
+//!   pages/about.zig             → route "/about"
+//!   pages/item/[id].zig         → route "/item/:id"
+//!   pages/t/[post]/index.zig    → route "/t/:post"
+//!   pages/t/[post]/c/[c].zig    → route "/t/:post/c/:c"
+//!
+//! Every page file MUST declare `pub const params = struct { ... };`
+//! (empty `struct {}` for static routes) — field names must match the
+//! `[name]` segment names exactly and field types drive the generated
+//! parser. v0 param types: integers only (`u8`..`u128`, `usize`,
+//! `i8`..`i128`, `isize`); string/slice params are deferred (they need
+//! session-owned storage — see ARCHITECTURE.md "zmeta codegen").
+//!
+//! Optional page decls: `pub fn prepare(s, p, env) !void` (any error →
+//! 404 before view work) and `pub fn view(a, s, p, env) forest.Node`
+//! (required). Optional `pub const route_name = "tag"` overrides the
+//! filename-derived union tag.
+//!
+//! actions.zig manifest: `pub const actions = .{ "ping", "like" };` —
+//! each name becomes `act.<name>` (comptime-checked in `.on` attrs) and
+//! a dispatch arm calling `on_<name>` on the app's Deps type.
+//!
+//! Usage: `zig run src/zmeta/gen.zig -- [app-dir ...]` — with no args,
+//! scans `src/apps/*/` for directories containing `pages/`.
+//! Deterministic: output depends only on the file tree + contents.
+//!
+//! This file is ALSO a library: the pure helpers below are unit-tested
+//! via the `zmeta-gen` test target in build.zig.
+
+const std = @import("std");
+const Io = std.Io;
+const Dir = Io.Dir;
+const Allocator = std.mem.Allocator;
+
+const int_types = [_][]const u8{
+    "u8", "u16", "u32", "u64", "u128", "usize",
+    "i8", "i16", "i32", "i64", "i128", "isize",
+};
+
+const GenError = error{
+    OutOfMemory,
+    FileNotFound,
+    BadParams,
+    BadRouteName,
+    BadSegment,
+    BadAction,
+    DuplicateRoute,
+    DuplicateTag,
+    ParamMismatch,
+};
+
+// ─────────────────────────────────────────────
+// model
+// ─────────────────────────────────────────────
+
+const Param = struct {
+    name: []const u8,
+    ty: []const u8,
+};
+
+const Seg = union(enum) {
+    /// Literal path segment ("item", "t", "c").
+    static: []const u8,
+    /// `[name]` dynamic segment — `name` must be a params field.
+    dynamic: []const u8,
+};
+
+const Page = struct {
+    /// Path relative to the app dir, e.g. "pages/item/[id].zig".
+    rel: []const u8,
+    /// Route segments derived from `rel` (trailing "index" dropped).
+    segs: []const Seg,
+    /// `pub const params` fields, in declaration order.
+    params: []const Param,
+    /// Union tag: `pub const route_name` override or derived.
+    tag: []const u8,
+};
+
+// ─────────────────────────────────────────────
+// entry point
+// ─────────────────────────────────────────────
+
+pub fn main(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+    const io = init.io;
+    const argv = init.minimal.args.vector;
+
+    var app_dirs: std.ArrayList([]const u8) = .empty;
+    defer app_dirs.deinit(arena);
+    if (argv.len > 1) {
+        for (argv[1..]) |a| {
+            try app_dirs.append(arena, try arena.dupe(u8, std.mem.span(a)));
+        }
+    } else {
+        try discoverApps(io, arena, "src/apps", &app_dirs);
+    }
+    std.mem.sort([]const u8, app_dirs.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lt);
+    if (app_dirs.items.len == 0) {
+        std.debug.print("zmeta-gen: no apps found (looked in src/apps/*/pages)\n", .{});
+        return;
+    }
+    for (app_dirs.items) |dir| {
+        std.debug.print("zmeta-gen: {s}\n", .{dir});
+        try genApp(io, arena, dir);
+    }
+}
+
+/// Scan `root` for subdirectories containing a `pages/` dir — the app
+/// convention is `src/apps/<name>/{app.zig,pages/,actions.zig,gen/}`.
+fn discoverApps(io: Io, arena: Allocator, root: []const u8, out: *std.ArrayList([]const u8)) !void {
+    var d = Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => |e| return e,
+    };
+    defer d.close(io);
+    var it = d.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        const name = try arena.dupe(u8, entry.name);
+        // Existence check for <root>/<name>/pages.
+        const pages = try std.fmt.allocPrint(arena, "{s}/{s}/pages", .{ root, name });
+        Dir.cwd().access(io, pages, .{}) catch continue;
+        try out.append(arena, try std.fmt.allocPrint(arena, "{s}/{s}", .{ root, name }));
+    }
+}
+
+/// Generate `gen/routes.zig` + `gen/actions.zig` for one app dir.
+fn genApp(io: Io, arena: Allocator, app_dir: []const u8) !void {
+    const pages = try scanPages(io, arena, app_dir);
+    if (pages.len == 0) return error.FileNotFound;
+
+    var parsed = try arena.alloc(Page, pages.len);
+    for (pages, 0..) |rel, i| {
+        const src = try readAppFile(io, arena, app_dir, rel);
+        parsed[i] = try buildPage(arena, rel, src);
+    }
+    try checkConflicts(parsed);
+    std.mem.sort(Page, parsed, {}, pageLessThan);
+
+    const zmeta_path = try zmetaImportPath(io, arena, app_dir);
+    const routes_src = try emitRoutes(arena, zmeta_path, parsed);
+    const actions_src = try emitActions(io, arena, app_dir);
+
+    const gen_rel = try std.fmt.allocPrint(arena, "{s}/gen", .{app_dir});
+    try Dir.cwd().createDirPath(io, gen_rel);
+    var gen_dir = try Dir.cwd().openDir(io, gen_rel, .{});
+    defer gen_dir.close(io);
+    try gen_dir.writeFile(io, .{ .sub_path = "routes.zig", .data = routes_src });
+    try gen_dir.writeFile(io, .{ .sub_path = "actions.zig", .data = actions_src });
+}
+
+// ─────────────────────────────────────────────
+// scanning
+// ─────────────────────────────────────────────
+
+/// Recursively collect `.zig` files under `<app_dir>/pages/` as
+/// app-dir-relative paths ("pages/item/[id].zig"), sorted.
+fn scanPages(io: Io, arena: Allocator, app_dir: []const u8) ![]const []const u8 {
+    const pages_dir = try std.fmt.allocPrint(arena, "{s}/pages", .{app_dir});
+    var dir = Dir.cwd().openDir(io, pages_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return &.{},
+        else => |e| return e,
+    };
+    defer dir.close(io);
+
+    var out: std.ArrayList([]const u8) = .empty;
+    var walker = try dir.walk(arena);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.path, ".zig")) continue;
+        // entry.path is invalidated by the next next() — dupe now.
+        try out.append(arena, try std.fmt.allocPrint(arena, "pages/{s}", .{entry.path}));
+    }
+    const items = out.items;
+    std.mem.sort([]const u8, items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lt);
+    return items;
+}
+
+fn readAppFile(io: Io, arena: Allocator, app_dir: []const u8, rel: []const u8) ![]const u8 {
+    const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ app_dir, rel });
+    return Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20));
+}
+
+// ─────────────────────────────────────────────
+// page parsing
+// ─────────────────────────────────────────────
+
+/// Build a Page from a page file's source: route segments from the
+/// path, params fields + optional route_name from the decls.
+fn buildPage(arena: Allocator, rel: []const u8, src: []const u8) GenError!Page {
+    const segs = try routeSegments(arena, rel);
+    const params = parseParams(arena, src) orelse return error.BadParams;
+    try checkParamSegments(segs, params);
+
+    const tag = if (parseRouteName(src)) |rn| rn else try deriveTag(arena, segs);
+    if (!std.zig.isValidId(tag)) return error.BadRouteName;
+    return .{ .rel = rel, .segs = segs, .params = params, .tag = tag };
+}
+
+/// "pages/item/[id].zig" → segs [static "item", dynamic "id"];
+/// "pages/index.zig" → [] (route "/"). A trailing "index" file stem
+/// contributes no segment; "index" elsewhere is a literal segment.
+fn routeSegments(arena: Allocator, rel: []const u8) GenError![]const Seg {
+    if (!std.mem.startsWith(u8, rel, "pages/")) return error.BadSegment;
+    if (!std.mem.endsWith(u8, rel, ".zig")) return error.BadSegment;
+    var body = rel["pages/".len .. rel.len - ".zig".len];
+    if (std.mem.eql(u8, body, "index")) {
+        body = "";
+    } else if (std.mem.endsWith(u8, body, "/index")) {
+        body = body[0 .. body.len - "/index".len];
+    }
+
+    var segs: std.ArrayList(Seg) = .empty;
+    if (body.len == 0) return segs.items;
+    var it = std.mem.splitScalar(u8, body, '/');
+    while (it.next()) |part| {
+        if (part.len == 0) return error.BadSegment;
+        if (part[0] == '[') {
+            if (part.len < 3 or part[part.len - 1] != ']') return error.BadSegment;
+            const name = part[1 .. part.len - 1];
+            if (std.mem.indexOf(u8, name, "...") != null) return error.BadSegment; // catch-all deferred (§7)
+            if (!std.zig.isValidId(name)) return error.BadSegment;
+            segs.append(arena, .{ .dynamic = name }) catch return error.OutOfMemory;
+        } else {
+            if (std.mem.indexOfAny(u8, part, "[]") != null) return error.BadSegment;
+            segs.append(arena, .{ .static = part }) catch return error.OutOfMemory;
+        }
+    }
+    return segs.items;
+}
+
+/// Extract `pub const params = struct { name: ty, ... };` fields.
+/// Returns null when the decl is absent/malformed. v0: flat
+/// int-typed fields only.
+fn parseParams(arena: Allocator, src: []const u8) ?[]const Param {
+    const decl = findDecl(src, "pub const params") orelse return null;
+    var i = skipWs(src, decl);
+    if (i >= src.len or src[i] != '=') return null;
+    i = skipWs(src, i + 1);
+    const kw = "struct";
+    if (!std.mem.startsWith(u8, src[i..], kw)) return null;
+    i = skipWs(src, i + kw.len);
+    if (i >= src.len or src[i] != '{') return null;
+    const open = i;
+    // Find the matching close brace; a nested '{' means a non-flat
+    // params type — unsupported in v0.
+    var close: ?usize = null;
+    var j = open + 1;
+    while (j < src.len) : (j += 1) {
+        switch (src[j]) {
+            '{' => return null,
+            '}' => {
+                close = j;
+                break;
+            },
+            else => {},
+        }
+    }
+    const end = close orelse return null;
+    const body = src[open + 1 .. end];
+
+    var params: std.ArrayList(Param) = .empty;
+    var fit = std.mem.splitScalar(u8, body, ',');
+    while (fit.next()) |raw_field| {
+        var field = std.mem.trim(u8, raw_field, " \t\r\n");
+        if (std.mem.indexOf(u8, field, "//")) |cidx| field = field[0..cidx];
+        field = std.mem.trim(u8, field, " \t\r\n");
+        if (field.len == 0) continue;
+        const colon = std.mem.indexOfScalar(u8, field, ':') orelse return null;
+        const name = std.mem.trim(u8, field[0..colon], " \t");
+        const ty = std.mem.trim(u8, field[colon + 1 ..], " \t");
+        if (name.len == 0 or ty.len == 0) return null;
+        if (std.mem.indexOfAny(u8, ty, "=,;") != null) return null; // no defaults/exprs
+        if (!std.zig.isValidId(name)) return null;
+        var is_int = false;
+        for (int_types) |t| {
+            if (std.mem.eql(u8, ty, t)) {
+                is_int = true;
+                break;
+            }
+        }
+        if (!is_int) return null; // v0: integer params only
+        params.append(arena, .{ .name = name, .ty = ty }) catch return null;
+    }
+    return params.items;
+}
+
+/// `pub const route_name = "tag";` → the literal, or null.
+fn parseRouteName(src: []const u8) ?[]const u8 {
+    const decl = findDecl(src, "pub const route_name") orelse return null;
+    var i = skipWs(src, decl);
+    if (i >= src.len or src[i] != '=') return null;
+    i = skipWs(src, i + 1);
+    if (i >= src.len or src[i] != '"') return null;
+    const start = i + 1;
+    var j = start;
+    while (j < src.len and src[j] != '"') : (j += 1) {
+        if (src[j] == '\\') return null; // no escapes in v0
+    }
+    if (j >= src.len) return null;
+    return src[start..j];
+}
+
+/// Find `needle` in `src` and return the index just past it.
+fn findDecl(src: []const u8, needle: []const u8) ?usize {
+    const idx = std.mem.indexOf(u8, src, needle) orelse return null;
+    return idx + needle.len;
+}
+
+fn skipWs(src: []const u8, i: usize) usize {
+    var j = i;
+    while (j < src.len and std.ascii.isWhitespace(src[j])) j += 1;
+    return j;
+}
+
+/// Dynamic `[name]` segments must correspond 1:1 to params fields.
+fn checkParamSegments(segs: []const Seg, params: []const Param) GenError!void {
+    var dyn_count: usize = 0;
+    for (segs) |s| {
+        if (s == .dynamic) dyn_count += 1;
+    }
+    if (dyn_count != params.len) return error.ParamMismatch;
+    for (segs) |s| {
+        const name = switch (s) {
+            .dynamic => |n| n,
+            .static => continue,
+        };
+        var found = false;
+        for (params) |p| {
+            if (std.mem.eql(u8, p.name, name)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return error.ParamMismatch;
+    }
+}
+
+/// Default tag: static segments joined with "_", or "index" for "/".
+fn deriveTag(arena: Allocator, segs: []const Seg) GenError![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    var first = true;
+    for (segs) |s| {
+        const name = switch (s) {
+            .static => |v| v,
+            .dynamic => continue,
+        };
+        if (!first) buf.append(arena, '_') catch return error.OutOfMemory;
+        first = false;
+        buf.appendSlice(arena, name) catch return error.OutOfMemory;
+    }
+    if (buf.items.len == 0) return "index";
+    return buf.items;
+}
+
+/// Two pages may not produce the same segment shape (static segments
+/// equal, dynamics in the same positions) — the parser could not tell
+/// them apart. Tag names must also be unique.
+fn checkConflicts(pages: []const Page) GenError!void {
+    for (pages, 0..) |p, i| {
+        for (pages[i + 1 ..]) |q| {
+            if (sameShape(p.segs, q.segs)) {
+                std.debug.print(
+                    "zmeta-gen: ambiguous routes {s} and {s} — same segment shape\n",
+                    .{ p.rel, q.rel },
+                );
+                return error.DuplicateRoute;
+            }
+            if (std.mem.eql(u8, p.tag, q.tag)) {
+                std.debug.print(
+                    "zmeta-gen: duplicate route tag '{s}': {s} and {s}\n",
+                    .{ p.tag, p.rel, q.rel },
+                );
+                return error.DuplicateTag;
+            }
+        }
+    }
+}
+
+fn sameShape(a: []const Seg, b: []const Seg) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |sa, sb| {
+        switch (sa) {
+            .static => |sv| switch (sb) {
+                .static => |bv| if (!std.mem.eql(u8, sv, bv)) return false,
+                .dynamic => return false,
+            },
+            .dynamic => switch (sb) {
+                .static => return false,
+                .dynamic => {},
+            },
+        }
+    }
+    return true;
+}
+
+/// Match precedence: at the first differing segment, static beats
+/// dynamic; otherwise lexicographic on statics; shorter routes first.
+fn pageLessThan(_: void, a: Page, b: Page) bool {
+    const n = @min(a.segs.len, b.segs.len);
+    for (a.segs[0..n], b.segs[0..n]) |sa, sb| {
+        const a_dyn = sa == .dynamic;
+        const b_dyn = sb == .dynamic;
+        if (a_dyn != b_dyn) return b_dyn; // static sorts before dynamic
+        if (!a_dyn) {
+            const c = std.mem.order(u8, sa.static, sb.static);
+            if (c != .eq) return c == .lt;
+        }
+    }
+    return a.segs.len < b.segs.len;
+}
+
+// ─────────────────────────────────────────────
+// emission: routes.zig
+// ─────────────────────────────────────────────
+
+fn emitRoutes(arena: Allocator, zmeta_path: []const u8, pages: []const Page) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const w = &out.writer;
+
+    try w.writeAll(
+        \\//! GENERATED FILE — do not edit. Regenerate with `zig build gen`
+        \\//! (or `zig run src/zmeta/gen.zig -- <app-dir>`).
+        \\//! Source: pages/ files + actions.zig manifest.
+        \\
+        \\const std = @import("std");
+        \\const forest = @import("forest");
+        \\const zmeta = @import("
+    );
+    try w.writeAll(zmeta_path);
+    try w.writeAll("\");\n\n");
+    for (pages) |p| {
+        try w.print("const {s}_page = @import(\"../{s}\");\n", .{ p.tag, p.rel });
+    }
+    try w.writeAll("\n");
+
+    // Route union — payload is the page's declared `params` type.
+    try w.writeAll(
+        \\/// Typed route — one tag per page file. Dynamic `[name]`
+        \\/// segments carry the page's `params` struct as payload.
+        \\pub const Route = union(enum) {
+        \\
+    );
+    for (pages) |p| {
+        try w.print("    {s}: {s}_page.params,\n", .{ p.tag, p.tag });
+    }
+    try w.writeAll("};\n\n");
+
+    // parseRoute
+    var max_depth: usize = 0;
+    for (pages) |p| max_depth = @max(max_depth, p.segs.len);
+    const buf_len = @max(@as(usize, 1), max_depth);
+    try w.writeAll(
+        \\/// Parse a request path into a typed Route. Static segments take
+        \\/// precedence over `[name]` dynamics at the same position; params
+        \\/// parse as integers (v0). Returns null on any mismatch — the
+        \\/// caller maps that to 404.
+        \\pub fn parseRoute(path: []const u8) ?Route {
+        \\
+    );
+    // "/" early-out: the root page's tag, or an explicit null.
+    var root_tag: ?[]const u8 = null;
+    for (pages) |p| {
+        if (p.segs.len == 0) root_tag = p.tag;
+    }
+    if (root_tag) |t| {
+        try w.print("    if (std.mem.eql(u8, path, \"/\")) return Route{{ .{s} = .{{}} }};\n", .{t});
+    } else {
+        try w.writeAll("    if (std.mem.eql(u8, path, \"/\")) return null;\n");
+    }
+    try w.writeAll(
+        \\    const rest = if (std.mem.startsWith(u8, path, "/")) path[1..] else return null;
+        \\    var segs: [
+    );
+    try w.print("{d}", .{buf_len});
+    try w.writeAll(
+        \\][]const u8 = undefined;
+        \\    var n: usize = 0;
+        \\    var it = std.mem.splitScalar(u8, rest, '/');
+        \\    while (it.next()) |seg| {
+        \\        if (n == segs.len) return null;
+        \\        segs[n] = seg;
+        \\        n += 1;
+        \\    }
+        \\    return result: {
+        \\
+    );
+    for (pages) |p| {
+        if (p.segs.len == 0) continue; // "/" handled above
+        try emitRouteMatch(arena, w, p);
+    }
+    try w.writeAll(
+        \\        break :result null;
+        \\    };
+        \\}
+        \\
+    );
+
+    // setRoute / validPath glue — the app's Deps delegates here; `s` is
+    // duck-typed (`s.deps.route` must be a `Route`).
+    try w.writeAll(
+        \\
+        \\/// Session glue: parse + store the typed route. Deps.setRoute
+        \\/// delegates here; returns false → 404.
+        \\pub fn setRoute(s: anytype, path: []const u8) bool {
+        \\    const r = parseRoute(path) orelse return false;
+        \\    s.deps.route = r;
+        \\    return true;
+        \\}
+        \\
+        \\/// Pure route pre-check for the server's validPath hook.
+        \\pub fn validPath(path: []const u8) bool {
+        \\    return parseRoute(path) != null;
+        \\}
+        \\
+    );
+
+    // href constructors
+    try w.writeAll(
+        \\
+        \\/// Type-safe href: `href(a, .{ .item = .{ .id = 3 } })` allocates
+        \\/// the path in `a` (the render arena in views). Static routes
+        \\/// return comptime literals.
+        \\pub fn href(a: std.mem.Allocator, r: Route) []const u8 {
+        \\    return switch (r) {
+        \\
+    );
+    for (pages) |p| {
+        try emitHrefCase(arena, w, p);
+    }
+    try w.writeAll("    };\n}\n\n");
+
+    // prepare dispatch — optional per-page `prepare(s, p, env)`.
+    try w.writeAll(
+        \\fn preparePage(comptime Page: type, s: anytype, p: anytype, env: *const zmeta.Env) !void {
+        \\    if (@hasDecl(Page, "prepare")) try Page.prepare(s, p, env);
+        \\}
+        \\
+        \\/// Route-param gate: Deps.prepare delegates here. Any page
+        \\/// `prepare` error → servePage 404s before view work.
+        \\pub fn prepare(s: anytype, env: *const zmeta.Env) !void {
+        \\    switch (s.deps.route) {
+        \\
+    );
+    for (pages) |p| {
+        try w.print("        .{s} => |p| try preparePage({s}_page, s, p, env),\n", .{ p.tag, p.tag });
+    }
+    try w.writeAll(
+        \\    }
+        \\}
+        \\
+        \\/// View dispatch: Deps.view delegates here. Each page's
+        \\/// `view(a, s, params, env) forest.Node` becomes one node.
+        \\pub fn viewNodes(a: std.mem.Allocator, s: anytype, env: *const zmeta.Env) []const forest.Node {
+        \\    const nodes = a.alloc(forest.Node, 1) catch @panic("OOM");
+        \\    nodes[0] = switch (s.deps.route) {
+        \\
+    );
+    for (pages) |p| {
+        try w.print("        .{s} => |p| {s}_page.view(a, s, p, env),\n", .{ p.tag, p.tag });
+    }
+    try w.writeAll(
+        \\    };
+        \\    return nodes;
+        \\}
+        \\
+    );
+    return out.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+/// One route's match arm inside parseRoute's `result:` block.
+fn emitRouteMatch(arena: Allocator, w: *std.Io.Writer, p: Page) !void {
+    var cond: std.ArrayList(u8) = .empty;
+    try cond.appendSlice(arena, "        if (n == ");
+    var nb: [24]u8 = undefined;
+    try cond.appendSlice(arena, std.fmt.bufPrint(&nb, "{d}", .{p.segs.len}) catch unreachable);
+    for (p.segs, 0..) |s, i| {
+        const name = switch (s) {
+            .static => |v| v,
+            .dynamic => continue,
+        };
+        try cond.appendSlice(arena, " and std.mem.eql(u8, segs[");
+        try cond.appendSlice(arena, std.fmt.bufPrint(&nb, "{d}", .{i}) catch unreachable);
+        try cond.appendSlice(arena, "], \"");
+        try cond.appendSlice(arena, name);
+        try cond.appendSlice(arena, "\")");
+    }
+    try cond.appendSlice(arena, ") {\n");
+    try w.writeAll(cond.items);
+
+    // Dynamic params: parse each `[name]` segment as its field type.
+    for (p.segs, 0..) |s, i| {
+        const name = switch (s) {
+            .dynamic => |v| v,
+            .static => continue,
+        };
+        try w.print(
+            "            const {s} = std.fmt.parseInt({s}, segs[{d}], 10) catch break :result null;\n",
+            .{ name, paramType(p, name), i },
+        );
+    }
+    // Construct the payload in params-declaration order.
+    try w.print("            break :result Route{{ .{s} = .{{ ", .{p.tag});
+    for (p.params, 0..) |param, i| {
+        if (i != 0) try w.writeAll(", ");
+        try w.print(".{s} = {s}", .{ param.name, param.name });
+    }
+    try w.writeAll(" } };\n        }\n");
+}
+
+fn paramType(p: Page, name: []const u8) []const u8 {
+    for (p.params) |param| {
+        if (std.mem.eql(u8, param.name, name)) return param.ty;
+    }
+    unreachable;
+}
+
+/// `.{ .tag => "/static/path", }` or an allocPrint arm for dynamics.
+fn emitHrefCase(arena: Allocator, w: *std.Io.Writer, p: Page) !void {
+    if (p.segs.len == 0) {
+        try w.print("        .{s} => \"/\",\n", .{p.tag});
+        return;
+    }
+    var has_dyn = false;
+    for (p.segs) |s| {
+        if (s == .dynamic) has_dyn = true;
+    }
+    if (!has_dyn) {
+        // All-static route: comptime literal path.
+        var path: std.ArrayList(u8) = .empty;
+        try path.append(arena, '/');
+        for (p.segs, 0..) |s, i| {
+            if (i != 0) try path.append(arena, '/');
+            try path.appendSlice(arena, s.static);
+        }
+        try w.print("        .{s} => \"{s}\",\n", .{ p.tag, path.items });
+        return;
+    }
+    // Dynamic: allocPrint with "{d}" per `[name]` segment, args p.<name>
+    // in path order.
+    var fmt: std.ArrayList(u8) = .empty;
+    try fmt.append(arena, '/');
+    var args: std.ArrayList(u8) = .empty;
+    for (p.segs, 0..) |s, i| {
+        if (i != 0) try fmt.append(arena, '/');
+        switch (s) {
+            .static => |v| try fmt.appendSlice(arena, v),
+            .dynamic => |name| {
+                try fmt.appendSlice(arena, "{d}");
+                if (args.items.len != 0) try args.appendSlice(arena, ", ");
+                try args.appendSlice(arena, "p.");
+                try args.appendSlice(arena, name);
+            },
+        }
+    }
+    try w.print(
+        "        .{s} => |p| std.fmt.allocPrint(a, \"{s}\", .{{{s}}}) catch @panic(\"OOM\"),\n",
+        .{ p.tag, fmt.items, args.items },
+    );
+}
+
+// ─────────────────────────────────────────────
+// emission: actions.zig
+// ─────────────────────────────────────────────
+
+fn emitActions(io: Io, arena: Allocator, app_dir: []const u8) ![]const u8 {
+    const manifest_rel = try std.fmt.allocPrint(arena, "{s}/actions.zig", .{app_dir});
+    const src = Dir.cwd().readFileAlloc(io, manifest_rel, arena, .limited(1 << 20)) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => |e| return e,
+    };
+    const names = if (src) |s| try parseActionManifest(arena, s) else &.{};
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    try w.writeAll(
+        \\//! GENERATED FILE — do not edit. Regenerate with `zig build gen`.
+        \\//! Source: actions.zig manifest (spec §2.9 v0 name table).
+        \\
+        \\const std = @import("std");
+        \\
+        \\/// Comptime action names shared by view `.on` attrs and the
+        \\/// dispatch skeleton — `act.like` in `.on = .{ .click = act.like }`
+        \\/// is compile-checked; the wire stays strings.
+        \\pub const act = struct {
+        \\
+    );
+    for (names) |n| {
+        try w.print("    pub const {s} = \"{s}\";\n", .{ n, n });
+    }
+    try w.writeAll("};\n\n");
+    try w.writeAll(
+        \\/// Dispatch skeleton: each whitelisted action calls the app's
+        \\/// `on_<name>` decl on the Deps type (`@TypeOf(s.deps)`), with
+        \\/// the same (arg, value, fields) payload the session contract
+        \\/// receives. Unknown actions → error.InvalidAction.
+        \\pub fn dispatch(
+        \\    s: anytype,
+        \\    action: []const u8,
+        \\    arg: ?[]const u8,
+        \\    value: ?[]const u8,
+        \\    fields: ?*const std.json.ObjectMap,
+        \\) !void {
+        \\    const D = @TypeOf(s.deps);
+        \\
+    );
+    for (names) |n| {
+        try w.print("    if (std.mem.eql(u8, action, act.{s})) return D.on_{s}(s, arg, value, fields);\n", .{ n, n });
+    }
+    try w.writeAll("    return error.InvalidAction;\n}\n");
+    return out.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+/// Parse `pub const actions = .{ "a", "b" };` → name list.
+fn parseActionManifest(arena: Allocator, src: []const u8) GenError![]const []const u8 {
+    const decl = findDecl(src, "pub const actions") orelse return error.BadAction;
+    var i = skipWs(src, decl);
+    if (i >= src.len or src[i] != '=') return error.BadAction;
+    i = skipWs(src, i + 1);
+    if (!std.mem.startsWith(u8, src[i..], ".{")) return error.BadAction;
+    i += 2;
+    var names: std.ArrayList([]const u8) = .empty;
+    while (i < src.len) : (i += 1) {
+        switch (src[i]) {
+            '}' => return names.items,
+            '"' => {
+                const start = i + 1;
+                var j = start;
+                while (j < src.len and src[j] != '"') : (j += 1) {
+                    if (src[j] == '\\') return error.BadAction;
+                }
+                if (j >= src.len) return error.BadAction;
+                const name = src[start..j];
+                if (!std.zig.isValidId(name)) return error.BadAction;
+                names.append(arena, name) catch return error.OutOfMemory;
+                i = j;
+            },
+            ',', ' ', '\t', '\r', '\n' => {},
+            else => return error.BadAction,
+        }
+    }
+    return error.BadAction;
+}
+
+/// Relative @import path from `<app>/gen/` to the repo's
+/// `src/zmeta/root.zig`: walk app_dir's ancestors for the directory
+/// containing `src/zmeta/root.zig`, then compute the ../.. path.
+fn zmetaImportPath(io: Io, arena: Allocator, app_dir: []const u8) ![]const u8 {
+    var dir: []const u8 = app_dir;
+    var tried_cwd = false;
+    while (true) {
+        const candidate = try std.fmt.allocPrint(arena, "{s}/src/zmeta/root.zig", .{dir});
+        Dir.cwd().access(io, candidate, .{}) catch {
+            const parent = std.fs.path.dirname(dir);
+            if (parent) |p| {
+                dir = p;
+                continue;
+            }
+            // Single-component relative paths have no dirname — the
+            // cwd itself is the last ancestor worth trying.
+            if (!tried_cwd) {
+                tried_cwd = true;
+                dir = ".";
+                continue;
+            }
+            return error.FileNotFound;
+        };
+        // Found the repo root at `dir`. Import path is relative from
+        // "<app>/gen" to "<dir>/src/zmeta/root.zig".
+        const from = try std.fmt.allocPrint(arena, "{s}/gen", .{app_dir});
+        const rel = try std.fs.path.relativeAlloc(arena, ".", null, from, candidate);
+        return rel;
+    }
+}
+
+// ─────────────────────────────────────────────
+// tests
+// ─────────────────────────────────────────────
+
+test "routeSegments maps page paths to route segments" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cases = [_]struct { rel: []const u8, want: []const Seg }{
+        .{ .rel = "pages/index.zig", .want = &.{} },
+        .{ .rel = "pages/about.zig", .want = &.{.{ .static = "about" }} },
+        .{ .rel = "pages/item/[id].zig", .want = &.{ .{ .static = "item" }, .{ .dynamic = "id" } } },
+        .{ .rel = "pages/t/[post]/index.zig", .want = &.{ .{ .static = "t" }, .{ .dynamic = "post" } } },
+        .{ .rel = "pages/t/[post]/c/[comment].zig", .want = &.{
+            .{ .static = "t" }, .{ .dynamic = "post" }, .{ .static = "c" }, .{ .dynamic = "comment" },
+        } },
+        .{ .rel = "pages/foo/index.zig", .want = &.{.{ .static = "foo" }} },
+    };
+    for (cases) |c| {
+        const segs = try routeSegments(arena, c.rel);
+        try std.testing.expectEqual(c.want.len, segs.len);
+        for (c.want, segs) |w, g| {
+            switch (w) {
+                .static => |ws| try std.testing.expectEqualStrings(ws, g.static),
+                .dynamic => |wd| try std.testing.expectEqualStrings(wd, g.dynamic),
+            }
+        }
+    }
+}
+
+test "routeSegments rejects malformed paths" {
+    const arena = std.testing.allocator;
+    try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/[...rest].zig"));
+    try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/[]/x.zig"));
+    try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/a[0].zig"));
+    try std.testing.expectError(error.BadSegment, routeSegments(arena, "notpages/x.zig"));
+}
+
+test "parseParams extracts flat int fields" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const src =
+        \\pub const params = struct { id: u64, slug: i32 };
+        \\pub fn view() void {}
+    ;
+    const params = parseParams(arena, src).?;
+    try std.testing.expectEqual(@as(usize, 2), params.len);
+    try std.testing.expectEqualStrings("id", params[0].name);
+    try std.testing.expectEqualStrings("u64", params[0].ty);
+    try std.testing.expectEqualStrings("slug", params[1].name);
+    try std.testing.expectEqualStrings("i32", params[1].ty);
+}
+
+test "parseParams rejects non-int and nested types" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expect(parseParams(arena, "pub const params = struct { s: []const u8 };") == null);
+    try std.testing.expect(parseParams(arena, "pub const params = struct { x: struct { y: u64 } };") == null);
+    try std.testing.expect(parseParams(arena, "pub const view = 1;") == null);
+}
+
+test "checkParamSegments enforces segment/field bijection" {
+    const segs = [_]Seg{ .{ .static = "item" }, .{ .dynamic = "id" } };
+    const ok = [_]Param{.{ .name = "id", .ty = "u64" }};
+    try checkParamSegments(&segs, &ok);
+    const missing = [_]Param{};
+    try std.testing.expectError(error.ParamMismatch, checkParamSegments(&segs, &missing));
+    const wrong = [_]Param{.{ .name = "other", .ty = "u64" }};
+    try std.testing.expectError(error.ParamMismatch, checkParamSegments(&segs, &wrong));
+}
+
+test "pageLessThan orders static before dynamic at first difference" {
+    const a = Page{ .rel = "pages/a/[x].zig", .segs = &.{ .{ .static = "a" }, .{ .dynamic = "x" } }, .params = &.{}, .tag = "a_x" };
+    const b = Page{ .rel = "pages/a/b.zig", .segs = &.{ .{ .static = "a" }, .{ .static = "b" } }, .params = &.{}, .tag = "a_b" };
+    try std.testing.expect(pageLessThan({}, b, a)); // "/a/b" before "/a/:x"
+    try std.testing.expect(!pageLessThan({}, a, b));
+}
+
+test "parseActionManifest extracts quoted names" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const names = try parseActionManifest(arena, "pub const actions = .{ \"ping\", \"like_it\" };");
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqualStrings("ping", names[0]);
+    try std.testing.expectEqualStrings("like_it", names[1]);
+    try std.testing.expectError(error.BadAction, parseActionManifest(arena, "pub const actions = .{ \"bad-name\" };"));
+}
+
+test "sameShape detects ambiguous routes" {
+    const a = [_]Seg{ .{ .static = "a" }, .{ .dynamic = "x" } };
+    const b = [_]Seg{ .{ .static = "a" }, .{ .dynamic = "y" } };
+    const c = [_]Seg{ .{ .static = "a" }, .{ .static = "b" } };
+    try std.testing.expect(sameShape(&a, &b));
+    try std.testing.expect(!sameShape(&a, &c));
+}

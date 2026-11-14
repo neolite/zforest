@@ -906,3 +906,133 @@ per exe; a named `zmeta` module would fork `History` away from
   `s.deps.*` field access).
 - Deferred: file-based routing codegen, typed action tables, typed
   route params, `/api/*`, soft-nav, islands — all per §5/§7.
+
+## zmeta codegen: file-based routes + action table (done)
+
+Second slice of `docs/meta-framework.md` §5 landed on
+`feat/zmeta-codegen`: `src/zmeta/gen.zig` is both a library and a CLI
+(`zig run src/zmeta/gen.zig -- [app-dir ...]`, or `zig build gen` for
+the default `src/apps/*/pages/` scan). It is plain source like the
+rest of `zmeta/` — no named module, no build-time dependency: output
+is deterministic and CHECKED IN under `src/apps/<name>/gen/`, so
+`zig build` compiles generated files directly and a stale regen is a
+reviewable diff, not a cache artefact.
+
+Conventions (spec §5.1/§5.3 v0):
+
+- `src/apps/<name>/pages/**/*.zig` — one file per route:
+  `pages/index.zig` → `/`, `pages/about.zig` → `/about`,
+  `pages/item/[id].zig` → `/item/:id`,
+  `pages/t/[post]/c/[c].zig` → `/t/:post/c/:c`. Every page declares
+  `pub const params = struct { ... };` (empty struct for static
+  routes); `[name]` segments map 1:1 onto `params` fields, validated
+  at gen time (ParamMismatch, DuplicateRoute, ambiguous shapes).
+- Param types are integer-only in v0 (`u8`…`u128`, `i8`…`i128`,
+  `usize`/`isize`) — string params need session-owned storage for the
+  slice, deferred (§7). Static segments take precedence over dynamics
+  at the same position; the emitted parser is a flat segment-count +
+  literal-match chain, not a trie.
+- Optional page decls: `pub const route_name`, `pub fn prepare(s, p,
+  env) !void` (any error → servePage 404s before view work — the
+  dangling-param gate, spec §2.5), `pub fn view(a, s, p, env)
+  forest.Node`.
+- `src/apps/<name>/actions.zig` — `pub const actions = .{ "ping",
+  "like" };` manifest → comptime `act.ping`/`act.like` string consts
+  (usable in `.on = .{ .click = act.like }`, compile-checked against
+  the DOM-event whitelist; the wire stays strings) plus a `dispatch`
+  skeleton calling `on_<name>` on the Deps type with the standard
+  `(arg, value, fields)` payload. Unknown actions →
+  `error.InvalidAction`.
+
+Generated `gen/routes.zig` API: `Route` union (one tag per page,
+payload = the page's `params` type), `parseRoute(path) ?Route`,
+`validPath`, `setRoute(s, path) bool` (writes `s.deps.route`),
+`href(a, route) []const u8` (static routes → comptime literals,
+dynamic → `allocPrint` into the render arena), `prepare(s, env)` and
+`viewNodes(a, s, env)` dispatch. `gen/actions.zig`: `act` table +
+`dispatch(s, action, arg, value, fields)`.
+
+Pilot: `src/apps/zmeta_demo/` (`pages/index.zig`,
+`pages/item/[id].zig` — prepare 404s unknown ids, like button carries
+`data-arg`) + flat entry `src/zmeta_demo_main.zig` (the `*_main.zig`
+convention doubles as the module-path boundary: Zig refuses relative
+imports escaping the module root's directory, so the exe root must
+live in `src/` while the app dir holds pages/gen). Deps delegates
+`setRoute`/`validPath`/`prepare`/`view`/`dispatch` to the generated
+modules — ~40 lines of glue total. `zig build run-demo` (port 8084),
+`zig build gen` regenerates. Verified: `/` 200, `/item/1` 200 with
+generated hrefs, `/item/99` + `/item/x` + `/bogus` 404, action POST
+`{"action":"like","arg":"1"}` → `{"rev":1}` → `likes: 1` on re-render,
+SSE snapshot serializes bound nodes.
+
+Deferred (per §5/§7): string/slice route params (need owned storage),
+`route_name` currently only affects the union tag (no custom URL
+override yet), catch-all `[...rest]` segments, route groups/layouts,
+`/api/*` RPC routes, soft-nav/`history.pushState` integration,
+islands, and migrating zboard/zcar/zmon (their manual routing stays —
+the generator targets new zmeta apps).
+
+## zmeta codegen: file-based routes + action table (done)
+
+Second slice of `docs/meta-framework.md` §5 landed on
+`feat/zmeta-codegen`: `src/zmeta/gen.zig` is both a library and a CLI
+(`zig run src/zmeta/gen.zig -- [app-dir ...]`, or `zig build gen` for
+the default `src/apps/*/pages/` scan). It is plain source like the
+rest of `zmeta/` — no named module, no build-time dependency: output
+is deterministic and CHECKED IN under `src/apps/<name>/gen/`, so
+`zig build` compiles generated files directly and a stale regen is a
+reviewable diff, not a cache artefact.
+
+Conventions (spec §5.1/§5.3 v0):
+
+- `src/apps/<name>/pages/**/*.zig` — one file per route:
+  `pages/index.zig` → `/`, `pages/about.zig` → `/about`,
+  `pages/item/[id].zig` → `/item/:id`,
+  `pages/t/[post]/c/[c].zig` → `/t/:post/c/:c`. Every page declares
+  `pub const params = struct { ... };` (empty struct for static
+  routes); `[name]` segments map 1:1 onto `params` fields, validated
+  at gen time (ParamMismatch, DuplicateRoute, ambiguous shapes).
+- Param types are integer-only in v0 (`u8`…`u128`, `i8`…`i128`,
+  `usize`/`isize`) — string params need session-owned storage for the
+  slice, deferred (§7). Static segments take precedence over dynamics
+  at the same position; the emitted parser is a flat segment-count +
+  literal-match chain, not a trie.
+- Optional page decls: `pub const route_name`, `pub fn prepare(s, p,
+  env) !void` (any error → servePage 404s before view work — the
+  dangling-param gate, spec §2.5), `pub fn view(a, s, p, env)
+  forest.Node`.
+- `src/apps/<name>/actions.zig` — `pub const actions = .{ "ping",
+  "like" };` manifest → comptime `act.ping`/`act.like` string consts
+  (usable in `.on = .{ .click = act.like }`, compile-checked against
+  the DOM-event whitelist; the wire stays strings) plus a `dispatch`
+  skeleton calling `on_<name>` on the Deps type with the standard
+  `(arg, value, fields)` payload. Unknown actions →
+  `error.InvalidAction`.
+
+Generated `gen/routes.zig` API: `Route` union (one tag per page,
+payload = the page's `params` type), `parseRoute(path) ?Route`,
+`validPath`, `setRoute(s, path) bool` (writes `s.deps.route`),
+`href(a, route) []const u8` (static routes → comptime literals,
+dynamic → `allocPrint` into the render arena), `prepare(s, env)` and
+`viewNodes(a, s, env)` dispatch. `gen/actions.zig`: `act` table +
+`dispatch(s, action, arg, value, fields)`.
+
+Pilot: `src/apps/zmeta_demo/` (`pages/index.zig`,
+`pages/item/[id].zig` — prepare 404s unknown ids, like button carries
+`data-arg`) + flat entry `src/zmeta_demo_main.zig` (the `*_main.zig`
+convention doubles as the module-path boundary: Zig refuses relative
+imports escaping the module root's directory, so the exe root must
+live in `src/` while the app dir holds pages/gen). Deps delegates
+`setRoute`/`validPath`/`prepare`/`view`/`dispatch` to the generated
+modules — ~40 lines of glue total. `zig build run-demo` (port 8084),
+`zig build gen` regenerates. Verified: `/` 200, `/item/1` 200 with
+generated hrefs, `/item/99` + `/item/x` + `/bogus` 404, action POST
+`{"action":"like","arg":"1"}` → `{"rev":1}` → `likes: 1` on re-render,
+SSE snapshot serializes bound nodes.
+
+Deferred (per §5/§7): string/slice route params (need owned storage),
+`route_name` currently only affects the union tag (no custom URL
+override yet), catch-all `[...rest]` segments, route groups/layouts,
+`/api/*` RPC routes, soft-nav/`history.pushState` integration,
+islands, and migrating zboard/zcar/zmon (their manual routing stays —
+the generator targets new zmeta apps).
