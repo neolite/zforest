@@ -1,8 +1,0 @@
-<li id={ctx.id_str} class="comment">
-  <div class="cmeta">
-    <a class="plink" href={ctx.permalink}>{ctx.hash}</a> · <span class="who">{ctx.c.author}</span> · <span class="ts">{ctx.ts_str}</span> <button class="reply-btn" on:click={ctx.env.act_reply} arg={ctx.num}>ответить</button> <button id={ctx.like_id} class="like-btn" on:click={ctx.env.act_like} arg={ctx.like_arg} text={ctx.like_label} />
-  </div>
-  <div class="ctext">{ctx.c.text}</div>
-  {forest.when(a, .{ .id = ctx.rep_id }, ctx.replying, ctx.reply_form)}
-  <ul lid="kids" class="kids">{forest.eachOf(a, ctx.c.children, ctx.env, ctx.kid_row)}</ul>
-</li>
