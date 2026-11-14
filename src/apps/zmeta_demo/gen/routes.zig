@@ -8,12 +8,14 @@ const zmeta = @import("../../../zmeta/root.zig");
 
 const index_page = @import("../pages/index.zig");
 const item_page = @import("../pages/item/[id].zig");
+const structure_page = @import("../pages/structure.zig");
 
 /// Typed route — one tag per page file. Dynamic `[name]`
 /// segments carry the page's `params` struct as payload.
 pub const Route = union(enum) {
     index: index_page.params,
     item: item_page.params,
+    structure: structure_page.params,
 };
 
 /// Parse a request path into a typed Route. Static segments take
@@ -35,6 +37,9 @@ pub fn parseRoute(path: []const u8) ?Route {
         if (n == 2 and std.mem.eql(u8, segs[0], "item")) {
             const id = std.fmt.parseInt(u64, segs[1], 10) catch break :result null;
             break :result Route{ .item = .{ .id = id } };
+        }
+        if (n == 1 and std.mem.eql(u8, segs[0], "structure")) {
+            break :result Route{ .structure = .{  } };
         }
         break :result null;
     };
@@ -60,6 +65,7 @@ pub fn href(a: std.mem.Allocator, r: Route) []const u8 {
     return switch (r) {
         .index => "/",
         .item => |p| std.fmt.allocPrint(a, "/item/{d}", .{p.id}) catch @panic("OOM"),
+        .structure => "/structure",
     };
 }
 
@@ -73,6 +79,7 @@ pub fn prepare(s: anytype, env: *const zmeta.Env) !void {
     switch (s.deps.route) {
         .index => |p| try preparePage(index_page, s, p, env),
         .item => |p| try preparePage(item_page, s, p, env),
+        .structure => |p| try preparePage(structure_page, s, p, env),
     }
 }
 
@@ -83,6 +90,7 @@ pub fn viewNodes(a: std.mem.Allocator, s: anytype, env: *const zmeta.Env) []cons
     nodes[0] = switch (s.deps.route) {
         .index => |p| index_page.view(a, s, p, env),
         .item => |p| item_page.view(a, s, p, env),
+        .structure => |p| structure_page.view(a, s, p, env),
     };
     return nodes;
 }
