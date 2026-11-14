@@ -1209,3 +1209,88 @@ skeleton (would need a Deps-declared hook or a board_groups-facing
 API change — neither is warranted while board_groups stays
 board-owned).
 
+## zmon on the zmeta Session skeleton (done)
+
+`feat/zmeta-mon`: zmon is the `.live_shared` archetype's first
+inhabitant — the last hand-rolled `Session` migrated.
+`src/mon_app.zig` is the only file touched (`mon_model.zig`,
+`server/*`, `forest/*`, `zefx/*` byte-identical; `mon_main.zig`
+needed no changes — `mon_app.Session`/`mon_app.model` kept their
+names).
+
+`pub const MonDeps` carries every former session field — the 15
+dashboard stores (`st_*` incl. the `map`-derived `st_ok`/`st_bad`),
+`seen_seq`, `fmt_arena` + `view_arena`, the `view_nodes` once-built
+cache, and the `ping` event — plus `archetype = .live_shared` and
+the page-metadata consts (`page_title`/`page_class`/`cookie_name`).
+`mon_app.model` (the shared `MonModel`) stays module-global,
+app-owned. `MonDeps` declares NO render-group hooks, so
+`zmeta.Session(MonDeps)` selects the plain per-session variant —
+correct: zmon keeps its own Dom/log/history per session.
+
+Unlike board, `Session` is the one-liner `pub const Session =
+zmeta.Session(MonDeps)` — nothing outside Deps calls statics on the
+session type, so the hand-declared workaround wasn't needed.
+
+The live render path maps onto the render-path overrides added for
+grouped apps (`feat/zmeta-grouped`); the skeleton's default
+after-flush diff is bypassed entirely:
+
+- `Deps.render` = `s.log.revision = s.seq.get()` — the whole hook.
+  Live `Binder`s (`forest.bindTree` subscriptions) emit their patch
+  ops into `s.log` during the flush notify phase, BEFORE the
+  after-flush hook runs; there is no rebuild+diff to do. This is
+  exactly what the hand-rolled after-flush `commit` thunk did.
+- `Deps.servePage` replaces the whole pipeline because the skeleton
+  default lacks the `refreshStores` step: setRoute → refreshStores →
+  `dom.reset` → `writeView` → `seedDom` (verbatim ordering).
+- `Deps.writeView`/`Deps.buildViewNodes`/`Deps.seedDom` reuse the
+  cached `view_arena` tree (`viewNodes`); `seedDom` keeps the
+  diff-seed → `log.clear()` → `bindTree(fmt_arena)` sequence.
+- `Deps.view` exists for contract completeness only — every path
+  that would call it is overridden (same convention as board).
+- `Deps.syncPull`/`Deps.dispatch`/`Deps.validPath`/`Deps.wire`/
+  `Deps.deinit` are verbatim ports (`s.deps.*` instead of `self.*`;
+  `onPing` → `s.bumpSeq()`).
+
+Publish path unchanged: no group hooks → http.zig keeps the inline
+`log.writeJson` → `history.publish(seq.get())` on POST and the
+`seq.get() > history.latest_rev` drain on SSE poll. `log.revision`
+(stamped by `Deps.render`) is what `writeJson` serializes as "rev" —
+it always equals `seq.get()` at publish time because dispatch and
+syncPull both end in a flush before the server reads the log.
+
+Arenas: `fmt_arena` is dual-purpose (refreshStores format scratch +
+every Binder's emit-time arena) — reset only at the top of
+refreshStores, retained otherwise; `view_arena` is session-lifetime.
+`Deps.deinit` frees both BEFORE the skeleton's `dom.deinit` destroys
+binders — safe because binders never emit during teardown (destroy
+only unwatches + frees via gpa).
+
+Skeleton gaps for live mode (worked around Deps-side, skeleton
+untouched):
+
+- No first-class "live" render mode: `Deps.render` is a one-line
+  revision stamp — works, but the contract still lists `view` as
+  required even when every consumer of it is overridden.
+- `Deps.servePage` had to be overridden wholesale only to insert
+  `refreshStores` ahead of `writeView` (a `Deps.prepare` hook doing
+  the refresh would also have worked through the default pipeline;
+  the explicit override was kept for fidelity).
+- `bindTree`'s emit arena must outlive the session — Deps-owned
+  `fmt_arena` covers it; the skeleton owns no equivalent.
+
+Tests: two new mon_app tests drive the skeleton session end-to-end
+(servePage SSR + 404, dispatch → live patch ops with rev stamp,
+syncPull fan-out, ctl_* validation, snapshot serialization + view
+cache identity). `zig build test` 17/17 green, `zig build` all 5
+exes green. Live smoke on `zmon 8898`: GET / → 200 with `zfxm`
+cookie; POST inject_storm/ctl_rate/ctl_err → ACKs rev 1/2/…; SSE
+snapshot carries live values (sparklines, feed, log, variant pill
+state); patch stream ~10 rev/s from the ticker; ctl_err 3000→0
+drove live `when` ops swapping `mon-pill-ok`/`mon-pill-bad`.
+
+Deferred: `zcar` migration (the last hand-rolled Session), and any
+future first-class live render mode in the skeleton (would let
+`Deps.render`/`servePage` shrink to nothing — today they exist only
+to bypass the diff pipeline).
