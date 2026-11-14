@@ -167,6 +167,31 @@ pub fn build(b: *std.Build) void {
     const gen_tests = b.addTest(.{ .root_module = gen_mod });
     const run_gen_tests = b.addRunArtifact(gen_tests);
 
+    // zsx spike: `.zsx` template → forest.el transpiler
+    // (src/zmeta/zsx.zig, docs/zsx-spike.md). `zig build zsx`
+    // regenerates src/apps/*/gen/*.zig from templates/; `zig build
+    // zsx-check` verifies the checked-in output is fresh. Same
+    // checked-in-output convention as `zig build gen`.
+    const zsx_mod = b.createModule(.{
+        .root_source_file = b.path("src/zmeta/zsx.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const zsx_tool = b.addExecutable(.{ .name = "zforest-zsx", .root_module = zsx_mod });
+    const zsx_run = b.addRunArtifact(zsx_tool);
+    zsx_run.setCwd(b.path("."));
+    const zsx_step = b.step("zsx", "Regenerate .zsx template gen files (templates/ → gen/*.zig)");
+    zsx_step.dependOn(&zsx_run.step);
+
+    const zsx_check_run = b.addRunArtifact(zsx_tool);
+    zsx_check_run.setCwd(b.path("."));
+    zsx_check_run.addArgs(&.{"--check"});
+    const zsx_check_step = b.step("zsx-check", "Verify .zsx generated files are fresh");
+    zsx_check_step.dependOn(&zsx_check_run.step);
+
+    const zsx_tests = b.addTest(.{ .root_module = zsx_mod });
+    const run_zsx_tests = b.addRunArtifact(zsx_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_zefx_tests.step);
     test_step.dependOn(&run_forest_tests.step);
@@ -176,4 +201,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_zcar_tests.step);
     test_step.dependOn(&run_demo_tests.step);
     test_step.dependOn(&run_gen_tests.step);
+    test_step.dependOn(&run_zsx_tests.step);
 }
