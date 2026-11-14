@@ -904,5 +904,18 @@ per exe; a named `zmeta` module would fork `History` away from
   zmeta.Session(TodoDeps)`. Behavior identical (same routes/actions/
   DOM; ~290 contract lines removed, view/tests unchanged modulo
   `s.deps.*` field access).
+- Second pilot: `car_app.zig` refactored the same way — `CarDeps`
+  holds brand/model/year + services cart + bookings + `next_booking`
+  + the `mutate` event; `Session = zmeta.Session(CarDeps)`. The app
+  uses only required Deps decls plus `deinit`/`wire`/`validPath`
+  (kept so bogus paths still 404 before a session is minted — the
+  skeleton default accepts every path and relies on servePage's
+  setRoute gate, which would mint-then-404). Session methods became
+  file-scope fns taking `*Session` (`hasSvc`/`discounts`/`cartIds`/
+  `applyMutation`/…), `Session.Discount`/`Session.Suggestion` moved
+  to file scope, `createSession` is the same one-liner as todo's.
+  No skeleton gaps hit — car is single-route per-session like todo.
+  Verified live: page SSR, action POSTs (set_brand→book), booking
+  recorded, bogus route 404, `zig build test` green.
 - Deferred: file-based routing codegen, typed action tables, typed
   route params, `/api/*`, soft-nav, islands — all per §5/§7.
