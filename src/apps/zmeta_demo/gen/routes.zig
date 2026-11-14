@@ -9,6 +9,7 @@ const zmeta = @import("../../../zmeta/root.zig");
 const index_page = @import("../pages/index.zig");
 const docs_rest_page = @import("../pages/docs/[...rest].zig");
 const item_page = @import("../pages/item/[id].zig");
+const search_page = @import("../pages/search.zig");
 const structure_page = @import("../pages/structure.zig");
 const tag_page = @import("../pages/tag/[tag].zig");
 const lay_root = @import("../pages/_layout.zig");
@@ -19,6 +20,7 @@ pub const Route = union(enum) {
     index: index_page.params,
     docs_rest: docs_rest_page.params,
     item: item_page.params,
+    search: search_page.params,
     structure: structure_page.params,
     tag: tag_page.params,
 };
@@ -55,6 +57,9 @@ pub fn parseRoute(path: []const u8) ?Route {
             const id = std.fmt.parseInt(u64, segs[1], 10) catch break :result null;
             break :result Route{ .item = .{ .id = id } };
         }
+        if (n == 1 and std.mem.eql(u8, segs[0], "search")) {
+            break :result Route{ .search = .{} };
+        }
         if (n == 1 and std.mem.eql(u8, segs[0], "structure")) {
             break :result Route{ .structure = .{} };
         }
@@ -87,6 +92,7 @@ pub fn href(a: std.mem.Allocator, r: Route) []const u8 {
         .index => "/",
         .docs_rest => |p| std.fmt.allocPrint(a, "/docs/{s}", .{p.rest}) catch @panic("OOM"),
         .item => |p| std.fmt.allocPrint(a, "/item/{d}", .{p.id}) catch @panic("OOM"),
+        .search => "/search",
         .structure => "/structure",
         .tag => |p| std.fmt.allocPrint(a, "/tag/{s}", .{p.tag}) catch @panic("OOM"),
     };
@@ -103,6 +109,7 @@ pub fn prepare(s: anytype, env: *const zmeta.Env) !void {
         .index => |p| try preparePage(index_page, s, p, env),
         .docs_rest => |p| try preparePage(docs_rest_page, s, p, env),
         .item => |p| try preparePage(item_page, s, p, env),
+        .search => |p| try preparePage(search_page, s, p, env),
         .structure => |p| try preparePage(structure_page, s, p, env),
         .tag => |p| try preparePage(tag_page, s, p, env),
     }
@@ -118,6 +125,7 @@ pub fn viewNodes(a: std.mem.Allocator, s: anytype, env: *const zmeta.Env) []cons
         .index => |p| lay_root.layout(a, s, env, index_page.view(a, s, p, env)),
         .docs_rest => |p| lay_root.layout(a, s, env, docs_rest_page.view(a, s, p, env)),
         .item => |p| lay_root.layout(a, s, env, item_page.view(a, s, p, env)),
+        .search => |p| lay_root.layout(a, s, env, search_page.view(a, s, p, env)),
         .structure => |p| lay_root.layout(a, s, env, structure_page.view(a, s, p, env)),
         .tag => |p| lay_root.layout(a, s, env, tag_page.view(a, s, p, env)),
     };

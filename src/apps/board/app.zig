@@ -479,6 +479,9 @@ pub const Session = struct {
     /// Owned copy: request buffers die with the request.
     route: []const u8 = "/",
     route_owned: bool = false,
+    /// Raw query string of the last page GET — the `Env.query` source.
+    query: []const u8 = "",
+    query_owned: bool = false,
 
     /// Page shell metadata — forwarded from BoardDeps (the skeleton
     /// applies the same defaults when Deps doesn't declare them).
@@ -552,7 +555,7 @@ pub const Session = struct {
     /// — they exist only so a future skeleton change can't produce a
     /// "no field or member named viewEnv" error through an alias.
     pub fn viewEnv(self: *Session) zmeta.Env {
-        return .{ .route = self.route };
+        return .{ .route = self.route, .query = self.query };
     }
 
     pub fn render(self: *Session) void {
@@ -567,6 +570,7 @@ pub const Session = struct {
     pub const deinit = Skel.deinit;
     pub const setCsrf = Skel.setCsrf;
     pub const setRoute = Skel.setRoute;
+    pub const setQuery = Skel.setQuery;
     pub const validPath = Skel.validPath;
     pub const readCookies = Skel.readCookies;
     pub const servePage = Skel.servePage;

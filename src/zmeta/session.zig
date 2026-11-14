@@ -220,6 +220,7 @@ fn SessionMethods(comptime Deps: type) type {
         pub fn deinit(self: anytype) void {
             if (self.csrf_token.len != 0) self.gpa.free(self.csrf_token);
             if (self.route_owned) self.gpa.free(self.route);
+            if (self.query_owned) self.gpa.free(self.query);
             if (@hasDecl(Deps, "deinit")) Deps.deinit(self);
             self.dom.deinit();
             self.log.deinit();
@@ -252,6 +253,18 @@ fn SessionMethods(comptime Deps: type) type {
             else
                 std.mem.eql(u8, self.route, "/");
             return ok;
+        }
+
+        /// Request-query hook: own the raw query string (no `?`) so
+        /// `Env.query`/`queryParam` stay valid for the session's
+        /// lifetime — patch renders keep seeing it until the next
+        /// navigation. Called by the server on every page GET.
+        pub fn setQuery(self: anytype, query: []const u8) void {
+            if (!std.mem.eql(u8, self.query, query)) {
+                if (self.query_owned) self.gpa.free(self.query);
+                self.query = self.gpa.dupe(u8, query) catch @panic("OOM");
+                self.query_owned = true;
+            }
         }
 
         /// Pure route check run before a session is minted — forwarded
@@ -315,7 +328,7 @@ fn SessionMethods(comptime Deps: type) type {
 
         /// The `Env` handed to `Deps.view`/`Deps.prepare` this render.
         fn viewEnv(self: anytype) Env {
-            return .{ .route = self.route };
+            return .{ .route = self.route, .query = self.query };
         }
 
         /// Diff the view into DOM patches. Runs post-settle (after-flush)
@@ -478,6 +491,10 @@ fn SessionPlain(comptime Deps: type) type {
         /// source. Owned copy: request buffers die with the request.
         route: []const u8 = "/",
         route_owned: bool = false,
+        /// Raw query string of the last page GET — the `Env.query`
+        /// source. Owned copy like `route`.
+        query: []const u8 = "",
+        query_owned: bool = false,
 
         /// Page shell metadata — forwarded from Deps when declared,
         /// otherwise the same defaults `server/http.zig` applies.
@@ -498,6 +515,7 @@ fn SessionPlain(comptime Deps: type) type {
         pub const deinit = M.deinit;
         pub const setCsrf = M.setCsrf;
         pub const setRoute = M.setRoute;
+        pub const setQuery = M.setQuery;
         pub const validPath = M.validPath;
         pub const readCookies = M.readCookies;
         pub const servePage = M.servePage;
@@ -552,6 +570,10 @@ fn SessionGrouped(comptime Deps: type) type {
         /// source. Owned copy: request buffers die with the request.
         route: []const u8 = "/",
         route_owned: bool = false,
+        /// Raw query string of the last page GET — the `Env.query`
+        /// source. Owned copy like `route`.
+        query: []const u8 = "",
+        query_owned: bool = false,
 
         /// Page shell metadata — forwarded from Deps when declared,
         /// otherwise the same defaults `server/http.zig` applies.
@@ -572,6 +594,7 @@ fn SessionGrouped(comptime Deps: type) type {
         pub const deinit = M.deinit;
         pub const setCsrf = M.setCsrf;
         pub const setRoute = M.setRoute;
+        pub const setQuery = M.setQuery;
         pub const validPath = M.validPath;
         pub const readCookies = M.readCookies;
         pub const servePage = M.servePage;
@@ -688,6 +711,13 @@ test "skeleton session: servePage emits HTML, dispatch+flush emits patch ops" {
     var bw: std.Io.Writer.Allocating = .init(alloc);
     defer bw.deinit();
     try std.testing.expect(!(try s.servePage("/bogus", &bw.writer)));
+
+    // setQuery owns the raw query for Env.query (server calls it on
+    // every page GET); empty → owned empty string.
+    s.setQuery("q=zig&tag=lang");
+    try std.testing.expectEqualStrings("q=zig&tag=lang", s.query);
+    s.setQuery("");
+    try std.testing.expectEqualStrings("", s.query);
 
     // syncPull is the per_session no-op; Env.route reflects setRoute.
     s.syncPull();

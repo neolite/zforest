@@ -79,7 +79,7 @@ pub fn href(a: std.mem.Allocator, r: Route) []const u8 {
         .index => "/",
         .b => |p| std.fmt.allocPrint(a, "/b/{s}", .{p.slug}) catch @panic("OOM"),
         .t => |p| std.fmt.allocPrint(a, "/t/{d}", .{p.post}) catch @panic("OOM"),
-        .t_c => |p| std.fmt.allocPrint(a, "/t/{d}/c/{d}", .{ p.post, p.comment }) catch @panic("OOM"),
+        .t_c => |p| std.fmt.allocPrint(a, "/t/{d}/c/{d}", .{p.post, p.comment}) catch @panic("OOM"),
     };
 }
 

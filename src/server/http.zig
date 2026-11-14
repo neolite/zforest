@@ -397,6 +397,11 @@ fn handle(
         // Auxiliary cookies (board's `zfxu`) also apply to page loads —
         // identity survives reloads, not just POSTs.
         if (@hasDecl(Session, "readCookies")) e.readCookies(cookie_hdr);
+        // Raw query string (no '?') → Env.query; the session owns a
+        // copy so it survives the request buffer and stays readable on
+        // later patch renders until the next navigation.
+        const qmark = std.mem.indexOfScalar(u8, req.head.target, '?');
+        e.setQuery(if (qmark) |i| req.head.target[i + 1 ..] else "");
         // Render into the request arena; servePage decides route validity.
         var aw: std.Io.Writer.Allocating = .init(arena);
         renderHead(Session, e, &aw.writer) catch @panic("OOM");

@@ -7,4 +7,5 @@
 pub const Archetype = @import("../../zmeta/root.zig").Archetype;
 pub const Env = @import("../../zmeta/root.zig").Env;
 pub const Session = @import("../../zmeta/root.zig").Session;
+pub const queryParam = @import("../../zmeta/root.zig").queryParam;
 pub const h = @import("../../zmeta/root.zig").h;
