@@ -1410,3 +1410,36 @@ zboard stays flat (`src/board*.zig`) deliberately: its render-group
 hooks predate the file-routing codegen and its routes are already
 hand-typed — migrating it is a separate decision, not part of this
 convention sweep.
+
+## zmeta: `_layout.zig` route layouts + `zig build new-app` (done)
+
+Two DX pieces toward the "Next-like" surface:
+
+**Layouts** — `pages/**/_layout.zig` files are reserved framework
+files (other `_`-prefixed names are rejected by gen with
+`error.ReservedFile`). Each exports
+`pub fn layout(a, s, env, inner: forest.Node) forest.Node`; the
+generated `viewNodes` wraps each page's node with every layout whose
+directory is the page's dir or an ancestor — `pages/_layout.zig` is
+the root shell, `pages/item/_layout.zig` wraps only the item subtree.
+Nesting composes outermost-first. Layouts apply inside `viewNodes`,
+so SSR/snapshot/patch paths all see the wrapped tree for free.
+zmeta_demo's root layout (nav shell) is the live example.
+
+Pure helpers (`layoutId` dir→const-name sanitization, `pageWraps`
+ancestor matching with `/`-boundary checks, outermost-first ordering)
+are unit-tested in gen.zig; `emitViewNodesWraps` emits the nested
+`lay_x.layout(a, s, env, …)` expression per route arm.
+
+**Scaffold** — `zig build new-app -- <name>` (`src/zmeta/scaffold.zig`,
+`zmeta-new` exe) writes `src/apps/<name>/` (app.zig Deps skeleton,
+pages/index.zig, actions.zig manifest, zmeta.zig shim) plus
+`src/<name>_main.zig`, then the build step chains a second
+`zmeta-gen` run so `gen/` exists immediately. The tool prints the
+~15 build.zig lines needed to register the exe — unregistered apps
+are inert (nothing imports them), verified end-to-end with a
+throwaway `helloz` app (served "/", 404'd "/nope") before removal.
+
+Generator fix along the way: an empty `actions = .{}` manifest used
+to emit a dispatch with five unused parameters — `emitActions` now
+discards them explicitly when the manifest is empty.

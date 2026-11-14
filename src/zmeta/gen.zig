@@ -862,11 +862,17 @@ fn emitActions(io: Io, arena: Allocator, app_dir: []const u8) ![]const u8 {
         \\    value: ?[]const u8,
         \\    fields: ?*const std.json.ObjectMap,
         \\) !void {
-        \\    const D = @TypeOf(s.deps);
         \\
     );
-    for (names) |n| {
-        try w.print("    if (std.mem.eql(u8, action, act.{s})) return D.on_{s}(s, arg, value, fields);\n", .{ n, n });
+    if (names.len == 0) {
+        // Empty manifest: no dispatch arms, so every parameter is
+        // unused — discard them explicitly.
+        try w.writeAll("    _ = s;\n    _ = action;\n    _ = arg;\n    _ = value;\n    _ = fields;\n");
+    } else {
+        try w.writeAll("    const D = @TypeOf(s.deps);\n");
+        for (names) |n| {
+            try w.print("    if (std.mem.eql(u8, action, act.{s})) return D.on_{s}(s, arg, value, fields);\n", .{ n, n });
+        }
     }
     try w.writeAll("    return error.InvalidAction;\n}\n");
     return out.toOwnedSlice() catch return error.OutOfMemory;

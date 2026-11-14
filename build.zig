@@ -96,6 +96,24 @@ pub fn build(b: *std.Build) void {
     gen_run.setCwd(b.path("."));
     gen_step.dependOn(&gen_run.step);
 
+    // `zig build new-app -- <name>`: scaffold src/apps/<name>/ +
+    // src/<name>_main.zig, then regenerate gen/ for the new app in the
+    // same invocation (the scaffold step must finish first).
+    const scaffold_mod = b.createModule(.{
+        .root_source_file = b.path("src/zmeta/scaffold.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const scaffold_tool = b.addExecutable(.{ .name = "zmeta-new", .root_module = scaffold_mod });
+    const new_app_step = b.step("new-app", "Scaffold a new zmeta app: zig build new-app -- <name>");
+    const new_app_run = b.addRunArtifact(scaffold_tool);
+    new_app_run.setCwd(b.path("."));
+    new_app_run.addPassthruArgs();
+    new_app_step.dependOn(&new_app_run.step);
+    const gen_for_new = b.addRunArtifact(gen_tool);
+    gen_for_new.step.dependOn(&new_app_run.step);
+    new_app_step.dependOn(&gen_for_new.step);
+
     // The zmeta demo app: file-based routes with typed params + the
     // comptime action table, served through the zmeta Session skeleton.
     const demo_mod = b.createModule(.{
@@ -167,6 +185,9 @@ pub fn build(b: *std.Build) void {
     const gen_tests = b.addTest(.{ .root_module = gen_mod });
     const run_gen_tests = b.addRunArtifact(gen_tests);
 
+    const scaffold_tests = b.addTest(.{ .root_module = scaffold_mod });
+    const run_scaffold_tests = b.addRunArtifact(scaffold_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_zefx_tests.step);
     test_step.dependOn(&run_forest_tests.step);
@@ -176,4 +197,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_zcar_tests.step);
     test_step.dependOn(&run_demo_tests.step);
     test_step.dependOn(&run_gen_tests.step);
+    test_step.dependOn(&run_scaffold_tests.step);
 }

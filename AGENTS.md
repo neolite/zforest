@@ -76,7 +76,8 @@ combo discounts, booking history).
 - `zig build run-mon`: run the dashboard (`zmon [port] [bind-ip]`).
 - `zig build run-car`: run the booking demo (`zcar [port] [bind-ip]`).
 - `zig build run-demo`: run the zmeta codegen demo (`zmeta-demo [port] [bind-ip]`).
-- `zig build gen`: regenerate `src/apps/*/gen/*.zig` from pages/ + actions.zig manifests.
+- `zig build gen`: regenerate `src/apps/*/gen/*.zig` from pages/ + actions.zig manifests (`_layout.zig` files become route layouts, other `_`-prefixed files are rejected).
+- `zig build new-app -- <name>`: scaffold `src/apps/<name>/` + `src/<name>_main.zig`, then regenerate gen/ (prints the build.zig lines needed to register the exe).
 - `zig build test`: run module + executable test targets for all apps.
 - `zig build -Doptimize=ReleaseFast`: build with release optimization.
 - `zig fmt src/**/*.zig build.zig`: format code before committing.

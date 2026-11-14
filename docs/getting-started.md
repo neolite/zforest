@@ -22,6 +22,18 @@ zig build run-demo   # serves the zmeta demo on http://127.0.0.1:8084
 The demo is the reference app: open `/`, click around, then read
 `src/apps/zmeta_demo/` — every concept below lives there.
 
+### Scaffolding a new app
+
+```sh
+zig build new-app -- my_app
+```
+
+creates `src/apps/my_app/` (`app.zig`, `pages/index.zig`,
+`actions.zig`, `zmeta.zig`) plus `src/my_app_main.zig`, and
+regenerates `gen/` — then prints the ~15 `build.zig` lines needed to
+register the executable. Unregistered apps are inert: nothing
+imports them, so `zig build`/`zig build test` stay green.
+
 ## Project layout
 
 ```
@@ -29,6 +41,7 @@ src/apps/<name>/
 ├── pages/            file-based routes — one .zig per page
 │   ├── index.zig     "/"
 │   ├── about.zig     "/about"
+│   ├── _layout.zig   optional layout wrapping pages in its dir + below
 │   └── item/
 │       └── [id].zig  "/item/:id" — typed dynamic segment
 ├── actions.zig       action-name manifest (one per line-ish list)
@@ -48,7 +61,7 @@ src/zmeta_demo_main.zig  executable entry point (flat src/ placement)
 | server component | `pub fn view(a, s, p, env) h.Node` | returns a `forest.Node` tree via `h.*` |
 | server actions / API routes | `actions.zig` manifest + `on_<name>` in app.zig | POST `/action` → ACK `{rev}`; SSE carries the patch |
 | hydration / RSC payload | **none** | SSR HTML + `client.js` applies serialized ops; no client tree exists |
-| layouts / nested routes | — | not yet; page bodies compose via `h.fragment` |
+| `layout.tsx` | `pages/_layout.zig` | `pub fn layout(a, s, env, inner) Node`; wraps its dir + subdirs, root = `pages/_layout.zig` |
 | `next dev` | `zig build run-demo` | no watch mode yet; rebuild + rerun |
 
 ## Your first page
@@ -75,6 +88,23 @@ src/zmeta_demo_main.zig  executable entry point (flat src/ placement)
 That's the whole loop: page file → `zig build gen` → view function.
 Routing, 404s, typed params, SSR and live patching are generated or
 skeleton-provided.
+
+### Layouts
+
+Drop `pages/_layout.zig` next to your pages to wrap them all in a
+shared shell — the demo's nav bar is exactly this
+(`src/apps/zmeta_demo/pages/_layout.zig`):
+
+```zig
+pub fn layout(a: std.mem.Allocator, s: anytype, env: *const zmeta.Env, inner: forest.Node) forest.Node {
+    return h.div(a).class("shell").children(.{ nav, inner }).node();
+}
+```
+
+A `_layout.zig` in a subdirectory wraps only that subtree; layouts
+nest outermost-first (`pages/_layout.zig` → `pages/item/_layout.zig`
+→ page). `_`-prefixed files are reserved — other names are rejected
+by `zig build gen`.
 
 ## View ergonomics
 
