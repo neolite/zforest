@@ -189,6 +189,19 @@ pub fn build(b: *std.Build) void {
     const zsx_check_step = b.step("zsx-check", "Verify .zsx generated files are fresh");
     zsx_check_step.dependOn(&zsx_check_run.step);
 
+    // zsx spike app: parity tests over the generated templates vs the
+    // handwritten h.* and forest.el equivalents. The root is a flat
+    // src/ aggregator (like zmeta_demo_main.zig) so relative imports
+    // into zmeta/ stay inside the module path.
+    const spike_mod = b.createModule(.{
+        .root_source_file = b.path("src/zsx_spike_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &app_imports,
+    });
+    const spike_tests = b.addTest(.{ .root_module = spike_mod });
+    const run_spike_tests = b.addRunArtifact(spike_tests);
+
     const zsx_tests = b.addTest(.{ .root_module = zsx_mod });
     const run_zsx_tests = b.addRunArtifact(zsx_tests);
 
@@ -201,5 +214,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_zcar_tests.step);
     test_step.dependOn(&run_demo_tests.step);
     test_step.dependOn(&run_gen_tests.step);
+    test_step.dependOn(&run_spike_tests.step);
     test_step.dependOn(&run_zsx_tests.step);
 }

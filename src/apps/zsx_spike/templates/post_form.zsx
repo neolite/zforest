@@ -1,0 +1,5 @@
+<form id="post-form" class="post-form" autocomplete="off" on:submit={ctx.act_post}>
+  <input type="hidden" name="board" value={ctx.slug} />
+  <textarea id="post-text" name="text" placeholder={ctx.placeholder} rows="4" maxlength={ctx.max_len} value={ctx.draft} autofocus={true}></textarea>
+  <button type="submit">{ctx.submit_label}</button>
+</form>

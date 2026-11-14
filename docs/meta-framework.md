@@ -457,7 +457,10 @@ need manual lists. zboard's view code is roughly half of
 - **Template/HTML-ish codegen → Zig:** rejected — loses comptime
   checking of tags/attrs/events (the `Tag` enum + `assertDomEvent`
   whitelist, view.zig:485-492, are real safety), adds a parser,
-  complicates arena lifetimes.
+  complicates arena lifetimes. *(Revisited by the zsx spike —
+  `docs/zsx-spike.md`: a bounded transpiler that validates tags/events
+  at generation time and lowers to `forest.el` measured adopt-worthy;
+  see ARCHITECTURE.md "zsx spike".)*
 - **JSX parity: not a goal.** Zig has no JSX and won't grow one;
   comptime gives type safety, not brevity. Honest expectation: a
   helper layer cuts ~30-40% of view boilerplate; the rest is the
