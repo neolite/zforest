@@ -95,8 +95,12 @@ What codegen adds:
 
 Costs/notes: the generator is a small Zig tool run as a `zig build`
 step (or `zig run`) scanning `apps/<name>/pages/`; output is a
-`gen/routes.zig` module. Dynamic segments are `[name]`; catch-all
-`[...rest]` and route groups `(name)` are deferred (§7). Sessions
+`gen/routes.zig` module. Dynamic segments are `[name]` (int or
+`[]const u8` params); catch-all `[...rest]` (last segment only,
+non-empty remainder) is supported; route groups `(name)` remain
+deferred (§7). String params slice the session-owned route path —
+`skeleton.setRoute` dupes the request path before `Deps.setRoute`
+sees it, so stored routes outlive the request buffer. Sessions
 cap at 32 **(token, route) pairs** — soft-nav (§2.6) multiplies pair
 count exactly like extra tabs do today; no new accounting needed.
 

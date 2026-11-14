@@ -15,18 +15,23 @@ pub const Route = union(enum) {
 };
 
 /// Parse a request path into a typed Route. Static segments take
-/// precedence over `[name]` dynamics at the same position; params
-/// parse as integers (v0). Returns null on any mismatch — the
-/// caller maps that to 404.
+/// precedence over `[name]` dynamics at the same position;
+/// `[...name]` catch-alls match any non-empty tail. Int params
+/// parse as integers; `[]const u8` params slice the path —
+/// callers storing the route must pass session-owned memory
+/// (the skeleton's `setRoute` does). Returns null on any
+/// mismatch — the caller maps that to 404.
 pub fn parseRoute(path: []const u8) ?Route {
     if (std.mem.eql(u8, path, "/")) return Route{ .index = .{} };
-    const rest = if (std.mem.startsWith(u8, path, "/")) path[1..] else return null;
+    if (!std.mem.startsWith(u8, path, "/")) return null;
     var segs: [1][]const u8 = undefined;
     var n: usize = 0;
-    var it = std.mem.splitScalar(u8, rest, '/');
+    var it = std.mem.splitScalar(u8, path[1..], '/');
     while (it.next()) |seg| {
-        if (n == segs.len) return null;
-        segs[n] = seg;
+        // Store only what fits — catch-all routes match tails
+        // deeper than the deepest static route, so `n` keeps
+        // counting past the buffer instead of bailing out.
+        if (n < segs.len) segs[n] = seg;
         n += 1;
     }
     return result: {

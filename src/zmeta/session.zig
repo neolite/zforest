@@ -235,21 +235,23 @@ fn SessionMethods(comptime Deps: type) type {
             self.csrf_token = token;
         }
 
-        /// Request-route hook: `Deps.setRoute` validates (and stores
-        /// app route state); the default accepts "/" only. On success
-        /// the path is remembered for `Env.route`.
+        /// Request-route hook: own the path FIRST so `Deps.setRoute`
+        /// receives session-owned memory — string/catch-all route
+        /// params slice into it and must outlive the request buffer.
+        /// `Deps.setRoute` validates (and stores app route state); the
+        /// default accepts "/" only. On success the path is remembered
+        /// for `Env.route`.
         pub fn setRoute(self: anytype, path: []const u8) bool {
-            const ok = if (@hasDecl(Deps, "setRoute"))
-                Deps.setRoute(self, path)
-            else
-                std.mem.eql(u8, path, "/");
-            if (!ok) return false;
             if (!std.mem.eql(u8, self.route, path)) {
                 if (self.route_owned) self.gpa.free(self.route);
                 self.route = self.gpa.dupe(u8, path) catch @panic("OOM");
                 self.route_owned = true;
             }
-            return true;
+            const ok = if (@hasDecl(Deps, "setRoute"))
+                Deps.setRoute(self, self.route)
+            else
+                std.mem.eql(u8, self.route, "/");
+            return ok;
         }
 
         /// Pure route check run before a session is minted — forwarded

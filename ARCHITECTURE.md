@@ -1079,15 +1079,26 @@ Conventions (spec §5.1/§5.3 v0):
 - `src/apps/<name>/pages/**/*.zig` — one file per route:
   `pages/index.zig` → `/`, `pages/about.zig` → `/about`,
   `pages/item/[id].zig` → `/item/:id`,
+  `pages/tag/[tag].zig` → `/tag/:tag` (string param),
+  `pages/docs/[...rest].zig` → `/docs/*` (catch-all, last segment
+  only, non-empty remainder required),
   `pages/t/[post]/c/[c].zig` → `/t/:post/c/:c`. Every page declares
   `pub const params = struct { ... };` (empty struct for static
-  routes); `[name]` segments map 1:1 onto `params` fields, validated
-  at gen time (ParamMismatch, DuplicateRoute, ambiguous shapes).
-- Param types are integer-only in v0 (`u8`…`u128`, `i8`…`i128`,
-  `usize`/`isize`) — string params need session-owned storage for the
-  slice, deferred (§7). Static segments take precedence over dynamics
-  at the same position; the emitted parser is a flat segment-count +
-  literal-match chain, not a trie.
+  routes); `[name]`/`[...name]` segments map 1:1 onto `params` fields,
+  validated at gen time (ParamMismatch, DuplicateRoute, ambiguous
+  shapes).
+- Param types: integers (`u8`…`u128`, `i8`…`i128`, `usize`/`isize`)
+  and `[]const u8`. Int segments `parseInt`; string segments slice
+  one path segment; catch-all params slice the raw remainder
+  ("a/b/c"). String slices point into the request path, so
+  `SessionMethods.setRoute` owns the path FIRST (gpa dupe) and hands
+  `Deps.setRoute` the session-owned copy — stored routes outlive the
+  request buffer; param names colliding with generated parseRoute
+  locals (`path`/`segs`/`n`/`it`/`ca_off`) are rejected. Static
+  segments take precedence over dynamics, dynamics over catch-alls;
+  the emitted parser is a flat segment-count + literal-match chain,
+  not a trie. Catch-all tails deeper than the buffer still match —
+  the split loop counts `n` past capacity instead of bailing.
 - Optional page decls: `pub const route_name`, `pub fn prepare(s, p,
   env) !void` (any error → servePage 404s before view work — the
   dangling-param gate, spec §2.5), `pub fn view(a, s, p, env)
@@ -1121,12 +1132,11 @@ generated hrefs, `/item/99` + `/item/x` + `/bogus` 404, action POST
 `{"action":"like","arg":"1"}` → `{"rev":1}` → `likes: 1` on re-render,
 SSE snapshot serializes bound nodes.
 
-Deferred (per §5/§7): string/slice route params (need owned storage),
-`route_name` currently only affects the union tag (no custom URL
-override yet), catch-all `[...rest]` segments, route groups/layouts,
-`/api/*` RPC routes, soft-nav/`history.pushState` integration,
-islands, and migrating zboard/zcar/zmon (their manual routing stays —
-the generator targets new zmeta apps).
+Deferred (per §5/§7): `route_name` currently only affects the union
+tag (no custom URL override yet), optional catch-all `[[...rest]]`,
+query params, `/api/*` RPC routes, soft-nav/`history.pushState`
+integration, islands, and zboard's migration onto `src/apps/` (its
+manual routing stays — the generator targets new zmeta apps).
 
 ## zboard on the zmeta Session skeleton (done)
 

@@ -9,6 +9,8 @@
 //!   pages/item/[id].zig         → route "/item/:id"
 //!   pages/t/[post]/index.zig    → route "/t/:post"
 //!   pages/t/[post]/c/[c].zig    → route "/t/:post/c/:c"
+//!   pages/tag/[tag].zig         → route "/tag/:tag" (string param)
+//!   pages/docs/[...rest].zig    → route "/docs/*" (catch-all, last only)
 //!   pages/_layout.zig           → root layout wrapping EVERY page
 //!   pages/item/_layout.zig      → layout wrapping pages under pages/item/
 //!
@@ -21,10 +23,13 @@
 //!
 //! Every page file MUST declare `pub const params = struct { ... };`
 //! (empty `struct {}` for static routes) — field names must match the
-//! `[name]` segment names exactly and field types drive the generated
-//! parser. v0 param types: integers only (`u8`..`u128`, `usize`,
-//! `i8`..`i128`, `isize`); string/slice params are deferred (they need
-//! session-owned storage — see ARCHITECTURE.md "zmeta codegen").
+//! `[name]`/`[...name]` segment names exactly and field types drive
+//! the generated parser. Param types: integers (`u8`..`u128`, `usize`,
+//! `i8`..`i128`, `isize`) and `[]const u8` — string params slice one
+//! path segment, catch-all params slice the raw remainder ("a/b/c").
+//! String slices point into the request path, so the skeleton's
+//! `setRoute` hands `Deps.setRoute` a session-owned copy — stored
+//! routes stay valid after the request buffer is gone.
 //!
 //! Optional page decls: `pub fn prepare(s, p, env) !void` (any error →
 //! 404 before view work) and `pub fn view(a, s, p, env) forest.Node`
@@ -79,6 +84,9 @@ const Seg = union(enum) {
     static: []const u8,
     /// `[name]` dynamic segment — `name` must be a params field.
     dynamic: []const u8,
+    /// `[...name]` catch-all — LAST segment only; `name` must be a
+    /// `[]const u8` params field receiving the raw remainder ("a/b/c").
+    catchall: []const u8,
 };
 
 const Page = struct {
@@ -328,10 +336,17 @@ fn routeSegments(arena: Allocator, rel: []const u8) GenError![]const Seg {
         if (part.len == 0) return error.BadSegment;
         if (part[0] == '[') {
             if (part.len < 3 or part[part.len - 1] != ']') return error.BadSegment;
-            const name = part[1 .. part.len - 1];
-            if (std.mem.indexOf(u8, name, "...") != null) return error.BadSegment; // catch-all deferred (§7)
-            if (!std.zig.isValidId(name)) return error.BadSegment;
-            segs.append(arena, .{ .dynamic = name }) catch return error.OutOfMemory;
+            const inner = part[1 .. part.len - 1];
+            if (std.mem.startsWith(u8, inner, "...")) {
+                // Catch-all: last segment only, plain name after "...".
+                const name = inner[3..];
+                if (name.len == 0 or !std.zig.isValidId(name)) return error.BadSegment;
+                if (it.next() != null) return error.BadSegment;
+                segs.append(arena, .{ .catchall = name }) catch return error.OutOfMemory;
+            } else {
+                if (!std.zig.isValidId(inner)) return error.BadSegment;
+                segs.append(arena, .{ .dynamic = inner }) catch return error.OutOfMemory;
+            }
         } else {
             if (std.mem.indexOfAny(u8, part, "[]") != null) return error.BadSegment;
             segs.append(arena, .{ .static = part }) catch return error.OutOfMemory;
@@ -341,8 +356,10 @@ fn routeSegments(arena: Allocator, rel: []const u8) GenError![]const Seg {
 }
 
 /// Extract `pub const params = struct { name: ty, ... };` fields.
-/// Returns null when the decl is absent/malformed. v0: flat
-/// int-typed fields only.
+/// Returns null when the decl is absent/malformed. v1 types: integers
+/// (`[id]` segments) and `[]const u8` (string `[slug]` segments and
+/// `[...rest]` catch-all remainders — slices into the session-owned
+/// route path, see session.zig `setRoute`).
 fn parseParams(arena: Allocator, src: []const u8) ?[]const Param {
     const decl = findDecl(src, "pub const params") orelse return null;
     var i = skipWs(src, decl);
@@ -383,14 +400,18 @@ fn parseParams(arena: Allocator, src: []const u8) ?[]const Param {
         if (name.len == 0 or ty.len == 0) return null;
         if (std.mem.indexOfAny(u8, ty, "=,;") != null) return null; // no defaults/exprs
         if (!std.zig.isValidId(name)) return null;
-        var is_int = false;
-        for (int_types) |t| {
-            if (std.mem.eql(u8, ty, t)) {
-                is_int = true;
-                break;
-            }
-        }
-        if (!is_int) return null; // v0: integer params only
+        const is_int = for (int_types) |t| {
+            if (std.mem.eql(u8, ty, t)) break true;
+        } else false;
+        const is_str = std.mem.eql(u8, ty, "[]const u8");
+        if (!is_int and !is_str) return null; // flat int/string params only
+        // Param names become `const <name>` bindings inside the
+        // generated parseRoute — reject collisions with its locals.
+        if (std.mem.eql(u8, name, "path") or
+            std.mem.eql(u8, name, "segs") or
+            std.mem.eql(u8, name, "n") or
+            std.mem.eql(u8, name, "it") or
+            std.mem.eql(u8, name, "ca_off")) return null;
         params.append(arena, .{ .name = name, .ty = ty }) catch return null;
     }
     return params.items;
@@ -424,16 +445,17 @@ fn skipWs(src: []const u8, i: usize) usize {
     return j;
 }
 
-/// Dynamic `[name]` segments must correspond 1:1 to params fields.
+/// Dynamic `[name]`/`[...name]` segments must correspond 1:1 to params
+/// fields.
 fn checkParamSegments(segs: []const Seg, params: []const Param) GenError!void {
     var dyn_count: usize = 0;
     for (segs) |s| {
-        if (s == .dynamic) dyn_count += 1;
+        if (s != .static) dyn_count += 1;
     }
     if (dyn_count != params.len) return error.ParamMismatch;
     for (segs) |s| {
         const name = switch (s) {
-            .dynamic => |n| n,
+            .dynamic, .catchall => |n| n,
             .static => continue,
         };
         var found = false;
@@ -448,6 +470,9 @@ fn checkParamSegments(segs: []const Seg, params: []const Param) GenError!void {
 }
 
 /// Default tag: static segments joined with "_", or "index" for "/".
+/// Dynamics contribute nothing; a catch-all contributes its param
+/// name so "/docs/[...rest]" can't collide with "/docs" or
+/// "/docs/[id]" tags.
 fn deriveTag(arena: Allocator, segs: []const Seg) GenError![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     var first = true;
@@ -455,6 +480,7 @@ fn deriveTag(arena: Allocator, segs: []const Seg) GenError![]const u8 {
         const name = switch (s) {
             .static => |v| v,
             .dynamic => continue,
+            .catchall => |n| n,
         };
         if (!first) buf.append(arena, '_') catch return error.OutOfMemory;
         first = false;
@@ -491,29 +517,38 @@ fn checkConflicts(pages: []const Page) GenError!void {
 fn sameShape(a: []const Seg, b: []const Seg) bool {
     if (a.len != b.len) return false;
     for (a, b) |sa, sb| {
-        switch (sa) {
+        const same = switch (sa) {
             .static => |sv| switch (sb) {
-                .static => |bv| if (!std.mem.eql(u8, sv, bv)) return false,
-                .dynamic => return false,
+                .static => |bv| std.mem.eql(u8, sv, bv),
+                else => false,
             },
-            .dynamic => switch (sb) {
-                .static => return false,
-                .dynamic => {},
-            },
-        }
+            .dynamic => sb == .dynamic,
+            .catchall => sb == .catchall,
+        };
+        if (!same) return false;
     }
     return true;
 }
 
 /// Match precedence: at the first differing segment, static beats
-/// dynamic; otherwise lexicographic on statics; shorter routes first.
+/// dynamic beats catch-all; otherwise lexicographic on statics;
+/// shorter routes first.
 fn pageLessThan(_: void, a: Page, b: Page) bool {
     const n = @min(a.segs.len, b.segs.len);
     for (a.segs[0..n], b.segs[0..n]) |sa, sb| {
-        const a_dyn = sa == .dynamic;
-        const b_dyn = sb == .dynamic;
-        if (a_dyn != b_dyn) return b_dyn; // static sorts before dynamic
-        if (!a_dyn) {
+        const rank = struct {
+            fn f(s: Seg) u8 {
+                return switch (s) {
+                    .static => 0,
+                    .dynamic => 1,
+                    .catchall => 2,
+                };
+            }
+        }.f;
+        const ra = rank(sa);
+        const rb = rank(sb);
+        if (ra != rb) return ra < rb;
+        if (sa == .static) {
             const c = std.mem.order(u8, sa.static, sb.static);
             if (c != .eq) return c == .lt;
         }
@@ -581,9 +616,12 @@ fn emitRoutes(arena: Allocator, zmeta_path: []const u8, pages: []const Page, lay
     const buf_len = @max(@as(usize, 1), max_depth);
     try w.writeAll(
         \\/// Parse a request path into a typed Route. Static segments take
-        \\/// precedence over `[name]` dynamics at the same position; params
-        \\/// parse as integers (v0). Returns null on any mismatch — the
-        \\/// caller maps that to 404.
+        \\/// precedence over `[name]` dynamics at the same position;
+        \\/// `[...name]` catch-alls match any non-empty tail. Int params
+        \\/// parse as integers; `[]const u8` params slice the path —
+        \\/// callers storing the route must pass session-owned memory
+        \\/// (the skeleton's `setRoute` does). Returns null on any
+        \\/// mismatch — the caller maps that to 404.
         \\pub fn parseRoute(path: []const u8) ?Route {
         \\
     );
@@ -598,17 +636,19 @@ fn emitRoutes(arena: Allocator, zmeta_path: []const u8, pages: []const Page, lay
         try w.writeAll("    if (std.mem.eql(u8, path, \"/\")) return null;\n");
     }
     try w.writeAll(
-        \\    const rest = if (std.mem.startsWith(u8, path, "/")) path[1..] else return null;
+        \\    if (!std.mem.startsWith(u8, path, "/")) return null;
         \\    var segs: [
     );
     try w.print("{d}", .{buf_len});
     try w.writeAll(
         \\][]const u8 = undefined;
         \\    var n: usize = 0;
-        \\    var it = std.mem.splitScalar(u8, rest, '/');
+        \\    var it = std.mem.splitScalar(u8, path[1..], '/');
         \\    while (it.next()) |seg| {
-        \\        if (n == segs.len) return null;
-        \\        segs[n] = seg;
+        \\        // Store only what fits — catch-all routes match tails
+        \\        // deeper than the deepest static route, so `n` keeps
+        \\        // counting past the buffer instead of bailing out.
+        \\        if (n < segs.len) segs[n] = seg;
         \\        n += 1;
         \\    }
         \\    return result: {
@@ -648,7 +688,7 @@ fn emitRoutes(arena: Allocator, zmeta_path: []const u8, pages: []const Page, lay
     var any_dynamic = false;
     for (pages) |p| {
         for (p.segs) |s| {
-            if (s == .dynamic) any_dynamic = true;
+            if (s != .static) any_dynamic = true;
         }
     }
     try w.writeAll(
@@ -731,14 +771,16 @@ fn emitViewNodesWraps(arena: Allocator, w: *std.Io.Writer, p: Page, layouts: []c
 
 /// One route's match arm inside parseRoute's `result:` block.
 fn emitRouteMatch(arena: Allocator, w: *std.Io.Writer, p: Page) !void {
+    const has_catchall = p.segs.len > 0 and p.segs[p.segs.len - 1] == .catchall;
     var cond: std.ArrayList(u8) = .empty;
-    try cond.appendSlice(arena, "        if (n == ");
+    try cond.appendSlice(arena, "        if (n ");
+    try cond.appendSlice(arena, if (has_catchall) ">= " else "== ");
     var nb: [24]u8 = undefined;
     try cond.appendSlice(arena, std.fmt.bufPrint(&nb, "{d}", .{p.segs.len}) catch unreachable);
     for (p.segs, 0..) |s, i| {
         const name = switch (s) {
             .static => |v| v,
-            .dynamic => continue,
+            .dynamic, .catchall => continue,
         };
         try cond.appendSlice(arena, " and std.mem.eql(u8, segs[");
         try cond.appendSlice(arena, std.fmt.bufPrint(&nb, "{d}", .{i}) catch unreachable);
@@ -749,16 +791,35 @@ fn emitRouteMatch(arena: Allocator, w: *std.Io.Writer, p: Page) !void {
     try cond.appendSlice(arena, ") {\n");
     try w.writeAll(cond.items);
 
-    // Dynamic params: parse each `[name]` segment as its field type.
+    // Dynamic params: ints parse, `[]const u8` slices the path.
     for (p.segs, 0..) |s, i| {
         const name = switch (s) {
             .dynamic => |v| v,
-            .static => continue,
+            .static, .catchall => continue,
         };
+        const ty = paramType(p, name);
+        if (std.mem.eql(u8, ty, "[]const u8")) {
+            try w.print("            const {s} = segs[{d}];\n", .{ name, i });
+        } else {
+            try w.print(
+                "            const {s} = std.fmt.parseInt({s}, segs[{d}], 10) catch break :result null;\n",
+                .{ name, ty, i },
+            );
+        }
+    }
+    if (has_catchall) {
+        // Remainder = path slice starting after the "/" preceding the
+        // catch-all position: 1 (leading '/') + each prefix segment's
+        // len + its '/' delimiter.
+        const name = p.segs[p.segs.len - 1].catchall;
+        const prefix = p.segs.len - 1;
         try w.print(
-            "            const {s} = std.fmt.parseInt({s}, segs[{d}], 10) catch break :result null;\n",
-            .{ name, paramType(p, name), i },
-        );
+            \\            var ca_off: usize = 1;
+            \\            for (segs[0..{d}]) |sg| ca_off += sg.len + 1;
+            \\            const {s} = path[ca_off..];
+            \\            if ({s}.len == 0) break :result null;
+            \\
+        , .{ prefix, name, name });
     }
     // Construct the payload in params-declaration order.
     try w.print("            break :result Route{{ .{s} = .{{ ", .{p.tag});
@@ -784,7 +845,7 @@ fn emitHrefCase(arena: Allocator, w: *std.Io.Writer, p: Page) !void {
     }
     var has_dyn = false;
     for (p.segs) |s| {
-        if (s == .dynamic) has_dyn = true;
+        if (s != .static) has_dyn = true;
     }
     if (!has_dyn) {
         // All-static route: comptime literal path.
@@ -797,8 +858,9 @@ fn emitHrefCase(arena: Allocator, w: *std.Io.Writer, p: Page) !void {
         try w.print("        .{s} => \"{s}\",\n", .{ p.tag, path.items });
         return;
     }
-    // Dynamic: allocPrint with "{d}" per `[name]` segment, args p.<name>
-    // in path order.
+    // Dynamic: allocPrint — "{d}" for int params, "{s}" for
+    // `[]const u8` params and catch-all remainders; args p.<name> in
+    // path order.
     var fmt: std.ArrayList(u8) = .empty;
     try fmt.append(arena, '/');
     var args: std.ArrayList(u8) = .empty;
@@ -807,7 +869,14 @@ fn emitHrefCase(arena: Allocator, w: *std.Io.Writer, p: Page) !void {
         switch (s) {
             .static => |v| try fmt.appendSlice(arena, v),
             .dynamic => |name| {
-                try fmt.appendSlice(arena, "{d}");
+                const verb = if (std.mem.eql(u8, paramType(p, name), "[]const u8")) "{s}" else "{d}";
+                try fmt.appendSlice(arena, verb);
+                if (args.items.len != 0) try args.appendSlice(arena, ", ");
+                try args.appendSlice(arena, "p.");
+                try args.appendSlice(arena, name);
+            },
+            .catchall => |name| {
+                try fmt.appendSlice(arena, "{s}");
                 if (args.items.len != 0) try args.appendSlice(arena, ", ");
                 try args.appendSlice(arena, "p.");
                 try args.appendSlice(arena, name);
@@ -957,6 +1026,9 @@ test "routeSegments maps page paths to route segments" {
             .{ .static = "t" }, .{ .dynamic = "post" }, .{ .static = "c" }, .{ .dynamic = "comment" },
         } },
         .{ .rel = "pages/foo/index.zig", .want = &.{.{ .static = "foo" }} },
+        .{ .rel = "pages/tag/[tag].zig", .want = &.{ .{ .static = "tag" }, .{ .dynamic = "tag" } } },
+        .{ .rel = "pages/docs/[...rest].zig", .want = &.{ .{ .static = "docs" }, .{ .catchall = "rest" } } },
+        .{ .rel = "pages/[...rest].zig", .want = &.{.{ .catchall = "rest" }} },
     };
     for (cases) |c| {
         const segs = try routeSegments(arena, c.rel);
@@ -965,6 +1037,7 @@ test "routeSegments maps page paths to route segments" {
             switch (w) {
                 .static => |ws| try std.testing.expectEqualStrings(ws, g.static),
                 .dynamic => |wd| try std.testing.expectEqualStrings(wd, g.dynamic),
+                .catchall => |wc| try std.testing.expectEqualStrings(wc, g.catchall),
             }
         }
     }
@@ -972,7 +1045,8 @@ test "routeSegments maps page paths to route segments" {
 
 test "routeSegments rejects malformed paths" {
     const arena = std.testing.allocator;
-    try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/[...rest].zig"));
+    try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/[...rest]/x.zig")); // catch-all must be last
+    try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/[...].zig"));
     try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/[]/x.zig"));
     try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/a[0].zig"));
     try std.testing.expectError(error.BadSegment, routeSegments(arena, "notpages/x.zig"));
@@ -994,11 +1068,24 @@ test "parseParams extracts flat int fields" {
     try std.testing.expectEqualStrings("i32", params[1].ty);
 }
 
-test "parseParams rejects non-int and nested types" {
+test "parseParams accepts int and []const u8 fields" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    try std.testing.expect(parseParams(arena, "pub const params = struct { s: []const u8 };") == null);
+    const src =
+        \\pub const params = struct { id: u64, slug: []const u8, rest: []const u8 };
+        \\pub fn view() void {}
+    ;
+    const params = parseParams(arena, src).?;
+    try std.testing.expectEqual(@as(usize, 3), params.len);
+    try std.testing.expectEqualStrings("[]const u8", params[1].ty);
+}
+
+test "parseParams rejects unsupported and nested types" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expect(parseParams(arena, "pub const params = struct { s: []u8 };") == null);
     try std.testing.expect(parseParams(arena, "pub const params = struct { x: struct { y: u64 } };") == null);
     try std.testing.expect(parseParams(arena, "pub const view = 1;") == null);
 }
@@ -1011,6 +1098,11 @@ test "checkParamSegments enforces segment/field bijection" {
     try std.testing.expectError(error.ParamMismatch, checkParamSegments(&segs, &missing));
     const wrong = [_]Param{.{ .name = "other", .ty = "u64" }};
     try std.testing.expectError(error.ParamMismatch, checkParamSegments(&segs, &wrong));
+    // Catch-all counts as a dynamic field.
+    const ca = [_]Seg{ .{ .static = "docs" }, .{ .catchall = "rest" } };
+    const ca_ok = [_]Param{.{ .name = "rest", .ty = "[]const u8" }};
+    try checkParamSegments(&ca, &ca_ok);
+    try std.testing.expectError(error.ParamMismatch, checkParamSegments(&ca, &missing));
 }
 
 test "pageLessThan orders static before dynamic at first difference" {
