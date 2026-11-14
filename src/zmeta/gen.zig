@@ -9,6 +9,15 @@
 //!   pages/item/[id].zig         → route "/item/:id"
 //!   pages/t/[post]/index.zig    → route "/t/:post"
 //!   pages/t/[post]/c/[c].zig    → route "/t/:post/c/:c"
+//!   pages/_layout.zig           → root layout wrapping EVERY page
+//!   pages/item/_layout.zig      → layout wrapping pages under pages/item/
+//!
+//! A `_layout.zig` file is NOT a route: it must export
+//! `pub fn layout(a, s, env, inner: forest.Node) forest.Node` — the
+//! generated view dispatch wraps each page's node with every layout
+//! whose directory is the page's directory or an ancestor (root
+//! `pages/_layout.zig` first/outermost). Other `_`-prefixed files are
+//! rejected — underscore is reserved for framework files.
 //!
 //! Every page file MUST declare `pub const params = struct { ... };`
 //! (empty `struct {}` for static routes) — field names must match the
@@ -53,6 +62,7 @@ const GenError = error{
     DuplicateRoute,
     DuplicateTag,
     ParamMismatch,
+    ReservedFile,
 };
 
 // ─────────────────────────────────────────────
@@ -80,6 +90,18 @@ const Page = struct {
     params: []const Param,
     /// Union tag: `pub const route_name` override or derived.
     tag: []const u8,
+    /// Indices into the app's layout list, outermost first — the
+    /// generated view wraps `page.view` with each in turn.
+    wraps: []const usize = &.{},
+};
+
+/// A `pages/**/_layout.zig` file: `dir` is its directory relative to
+/// the app dir ("pages", "pages/item", ...), `id` the sanitized const
+/// name used in generated imports.
+const Layout = struct {
+    dir: []const u8,
+    rel: []const u8,
+    id: []const u8,
 };
 
 // ─────────────────────────────────────────────
@@ -136,19 +158,55 @@ fn discoverApps(io: Io, arena: Allocator, root: []const u8, out: *std.ArrayList(
 
 /// Generate `gen/routes.zig` + `gen/actions.zig` for one app dir.
 fn genApp(io: Io, arena: Allocator, app_dir: []const u8) !void {
-    const pages = try scanPages(io, arena, app_dir);
-    if (pages.len == 0) return error.FileNotFound;
+    const scanned = try scanPages(io, arena, app_dir);
+    if (scanned.len == 0) return error.FileNotFound;
 
-    var parsed = try arena.alloc(Page, pages.len);
-    for (pages, 0..) |rel, i| {
+    // Partition the scan: `_layout.zig` files are layouts, other
+    // `_`-prefixed files are reserved and rejected, the rest are pages.
+    var page_rels: std.ArrayList([]const u8) = .empty;
+    var layouts: std.ArrayList(Layout) = .empty;
+    for (scanned) |rel| {
+        const base = std.fs.path.basename(rel);
+        if (std.mem.startsWith(u8, base, "_")) {
+            if (std.mem.eql(u8, base, "_layout.zig")) {
+                const dir = std.fs.path.dirname(rel).?;
+                try layouts.append(arena, .{
+                    .dir = dir,
+                    .rel = rel,
+                    .id = try layoutId(arena, dir),
+                });
+            } else {
+                std.debug.print("zmeta-gen: {s}: '{s}' — underscore prefix is reserved for _layout.zig\n", .{ app_dir, rel });
+                return error.ReservedFile;
+            }
+        } else {
+            try page_rels.append(arena, rel);
+        }
+    }
+    if (page_rels.items.len == 0) return error.FileNotFound;
+
+    // Sort layouts outermost-first (shallowest dir, then lexicographic)
+    // so `wraps` indices compose root → leaf.
+    std.mem.sort(Layout, layouts.items, {}, struct {
+        fn lt(_: void, a: Layout, b: Layout) bool {
+            const da = std.mem.count(u8, a.dir, "/");
+            const db = std.mem.count(u8, b.dir, "/");
+            if (da != db) return da < db;
+            return std.mem.order(u8, a.dir, b.dir) == .lt;
+        }
+    }.lt);
+
+    var parsed = try arena.alloc(Page, page_rels.items.len);
+    for (page_rels.items, 0..) |rel, i| {
         const src = try readAppFile(io, arena, app_dir, rel);
         parsed[i] = try buildPage(arena, rel, src);
+        parsed[i].wraps = try pageWraps(arena, rel, layouts.items);
     }
     try checkConflicts(parsed);
     std.mem.sort(Page, parsed, {}, pageLessThan);
 
     const zmeta_path = try zmetaImportPath(io, arena, app_dir);
-    const routes_src = try emitRoutes(arena, zmeta_path, parsed);
+    const routes_src = try emitRoutes(arena, zmeta_path, parsed, layouts.items);
     const actions_src = try emitActions(io, arena, app_dir);
 
     const gen_rel = try std.fmt.allocPrint(arena, "{s}/gen", .{app_dir});
@@ -194,6 +252,44 @@ fn scanPages(io: Io, arena: Allocator, app_dir: []const u8) ![]const []const u8 
 fn readAppFile(io: Io, arena: Allocator, app_dir: []const u8, rel: []const u8) ![]const u8 {
     const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ app_dir, rel });
     return Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20));
+}
+
+/// Sanitized const name for a layout's directory: "pages" → "root",
+/// "pages/item" → "item", "pages/t/[post]" → "t__post_" — always a
+/// valid Zig identifier, unique per directory.
+fn layoutId(arena: Allocator, dir: []const u8) GenError![]const u8 {
+    const suffix = if (std.mem.eql(u8, dir, "pages")) "root" else dir["pages/".len..];
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.appendSlice(arena, "lay_");
+    for (suffix) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '_') {
+            try buf.append(arena, std.ascii.toLower(c));
+        } else {
+            try buf.append(arena, '_');
+        }
+    }
+    return buf.items;
+}
+
+/// The directory a page file lives in, app-dir-relative:
+/// "pages/index.zig" → "pages", "pages/item/[id].zig" → "pages/item".
+fn pageDir(rel: []const u8) []const u8 {
+    return std.fs.path.dirname(rel).?;
+}
+
+/// A layout applies to a page when the layout's directory is the
+/// page's directory or an ancestor of it ("pages/item" layout wraps
+/// "pages/item/[id].zig" but not "pages/index.zig"). `layouts` must
+/// already be sorted outermost-first; the result keeps that order.
+fn pageWraps(arena: Allocator, rel: []const u8, layouts: []const Layout) GenError![]const usize {
+    const dir = pageDir(rel);
+    var out: std.ArrayList(usize) = .empty;
+    for (layouts, 0..) |l, i| {
+        const applies = std.mem.eql(u8, dir, l.dir) or
+            (dir.len > l.dir.len and std.mem.startsWith(u8, dir, l.dir) and dir[l.dir.len] == '/');
+        if (applies) try out.append(arena, i);
+    }
+    return out.items;
 }
 
 // ─────────────────────────────────────────────
@@ -429,7 +525,7 @@ fn pageLessThan(_: void, a: Page, b: Page) bool {
 // emission: routes.zig
 // ─────────────────────────────────────────────
 
-fn emitRoutes(arena: Allocator, zmeta_path: []const u8, pages: []const Page) ![]const u8 {
+fn emitRoutes(arena: Allocator, zmeta_path: []const u8, pages: []const Page, layouts: []const Layout) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     const w = &out.writer;
 
@@ -446,6 +542,24 @@ fn emitRoutes(arena: Allocator, zmeta_path: []const u8, pages: []const Page) ![]
     try w.writeAll("\");\n\n");
     for (pages) |p| {
         try w.print("const {s}_page = @import(\"../{s}\");\n", .{ p.tag, p.rel });
+    }
+    // Layout imports — only the ones some page actually wraps with.
+    var used = std.AutoHashMap(usize, void).init(arena);
+    defer used.deinit();
+    for (pages) |p| {
+        for (p.wraps) |wi| try used.put(wi, {});
+    }
+    var used_ids: std.ArrayList(usize) = .empty;
+    var kit = used.keyIterator();
+    while (kit.next()) |k| try used_ids.append(arena, k.*);
+    std.mem.sort(usize, used_ids.items, {}, struct {
+        fn lt(_: void, a: usize, b: usize) bool {
+            return a < b;
+        }
+    }.lt);
+    for (used_ids.items) |wi| {
+        const l = layouts[wi];
+        try w.print("const {s} = @import(\"../{s}\");\n", .{ l.id, l.rel });
     }
     try w.writeAll("\n");
 
@@ -574,14 +688,16 @@ fn emitRoutes(arena: Allocator, zmeta_path: []const u8, pages: []const Page) ![]
         \\}
         \\
         \\/// View dispatch: Deps.view delegates here. Each page's
-        \\/// `view(a, s, params, env) forest.Node` becomes one node.
+        \\/// `view(a, s, params, env) forest.Node` becomes one node,
+        \\/// wrapped by every applicable `_layout.zig` (outermost
+        \\/// first — `pages/_layout.zig` wraps all pages).
         \\pub fn viewNodes(a: std.mem.Allocator, s: anytype, env: *const zmeta.Env) []const forest.Node {
         \\    const nodes = a.alloc(forest.Node, 1) catch @panic("OOM");
         \\    nodes[0] = switch (s.deps.route) {
         \\
     );
     for (pages) |p| {
-        try w.print("        .{s} => |p| {s}_page.view(a, s, p, env),\n", .{ p.tag, p.tag });
+        try emitViewNodesWraps(arena, w, p, layouts);
     }
     try w.writeAll(
         \\    };
@@ -590,6 +706,27 @@ fn emitRoutes(arena: Allocator, zmeta_path: []const u8, pages: []const Page) ![]
         \\
     );
     return out.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+/// One viewNodes switch arm: `page.view(...)` wrapped by the page's
+/// applicable `_layout.zig` files — innermost layout applied first, so
+/// `lay_root.layout(a, s, env, lay_item.layout(a, s, env, view))`.
+fn emitViewNodesWraps(arena: Allocator, w: *std.Io.Writer, p: Page, layouts: []const Layout) !void {
+    var expr: std.ArrayList(u8) = .empty;
+    try expr.appendSlice(arena, p.tag);
+    try expr.appendSlice(arena, "_page.view(a, s, p, env)");
+    var i = p.wraps.len;
+    while (i > 0) {
+        i -= 1;
+        const lid = layouts[p.wraps[i]].id;
+        var wrapped: std.ArrayList(u8) = .empty;
+        try wrapped.appendSlice(arena, lid);
+        try wrapped.appendSlice(arena, ".layout(a, s, env, ");
+        try wrapped.appendSlice(arena, expr.items);
+        try wrapped.append(arena, ')');
+        expr = wrapped;
+    }
+    try w.print("        .{s} => |p| {s},\n", .{ p.tag, expr.items });
 }
 
 /// One route's match arm inside parseRoute's `result:` block.
@@ -894,4 +1031,47 @@ test "sameShape detects ambiguous routes" {
     const c = [_]Seg{ .{ .static = "a" }, .{ .static = "b" } };
     try std.testing.expect(sameShape(&a, &b));
     try std.testing.expect(!sameShape(&a, &c));
+}
+
+test "layoutId sanitizes layout dirs into valid const names" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings("lay_root", try layoutId(arena, "pages"));
+    try std.testing.expectEqualStrings("lay_item", try layoutId(arena, "pages/item"));
+    try std.testing.expectEqualStrings("lay_t__post_", try layoutId(arena, "pages/t/[post]"));
+    for ([_][]const u8{ "pages", "pages/item", "pages/t/[post]" }) |d| {
+        const id = try layoutId(arena, d);
+        try std.testing.expect(std.zig.isValidId(id));
+    }
+}
+
+test "pageWraps applies ancestor layouts outermost-first" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const layouts = [_]Layout{
+        .{ .dir = "pages", .rel = "pages/_layout.zig", .id = "lay_root" },
+        .{ .dir = "pages/item", .rel = "pages/item/_layout.zig", .id = "lay_item" },
+        .{ .dir = "pages/other", .rel = "pages/other/_layout.zig", .id = "lay_other" },
+    };
+    // Root page: only the root layout.
+    const idx = try pageWraps(arena, "pages/index.zig", &layouts);
+    try std.testing.expectEqual(@as(usize, 1), idx.len);
+    try std.testing.expectEqual(@as(usize, 0), idx[0]);
+    // Nested page: root + its own dir layout, root first.
+    const item = try pageWraps(arena, "pages/item/[id].zig", &layouts);
+    try std.testing.expectEqual(@as(usize, 2), item.len);
+    try std.testing.expectEqual(@as(usize, 0), item[0]);
+    try std.testing.expectEqual(@as(usize, 1), item[1]);
+    // Deeper page under item/: same two layouts.
+    const deep = try pageWraps(arena, "pages/item/sub/x.zig", &layouts);
+    try std.testing.expectEqual(@as(usize, 2), deep.len);
+    // Sibling dir: root + other, NOT item.
+    const other = try pageWraps(arena, "pages/other/y.zig", &layouts);
+    try std.testing.expectEqual(@as(usize, 2), other.len);
+    try std.testing.expectEqual(@as(usize, 2), other[1]);
+    // Boundary: "pages/item2" must not match "pages/item".
+    const boundary = try pageWraps(arena, "pages/item2/z.zig", &layouts);
+    try std.testing.expectEqual(@as(usize, 1), boundary.len);
 }

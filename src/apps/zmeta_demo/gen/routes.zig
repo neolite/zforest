@@ -9,6 +9,7 @@ const zmeta = @import("../../../zmeta/root.zig");
 const index_page = @import("../pages/index.zig");
 const item_page = @import("../pages/item/[id].zig");
 const structure_page = @import("../pages/structure.zig");
+const lay_root = @import("../pages/_layout.zig");
 
 /// Typed route — one tag per page file. Dynamic `[name]`
 /// segments carry the page's `params` struct as payload.
@@ -84,13 +85,15 @@ pub fn prepare(s: anytype, env: *const zmeta.Env) !void {
 }
 
 /// View dispatch: Deps.view delegates here. Each page's
-/// `view(a, s, params, env) forest.Node` becomes one node.
+/// `view(a, s, params, env) forest.Node` becomes one node,
+/// wrapped by every applicable `_layout.zig` (outermost
+/// first — `pages/_layout.zig` wraps all pages).
 pub fn viewNodes(a: std.mem.Allocator, s: anytype, env: *const zmeta.Env) []const forest.Node {
     const nodes = a.alloc(forest.Node, 1) catch @panic("OOM");
     nodes[0] = switch (s.deps.route) {
-        .index => |p| index_page.view(a, s, p, env),
-        .item => |p| item_page.view(a, s, p, env),
-        .structure => |p| structure_page.view(a, s, p, env),
+        .index => |p| lay_root.layout(a, s, env, index_page.view(a, s, p, env)),
+        .item => |p| lay_root.layout(a, s, env, item_page.view(a, s, p, env)),
+        .structure => |p| lay_root.layout(a, s, env, structure_page.view(a, s, p, env)),
     };
     return nodes;
 }

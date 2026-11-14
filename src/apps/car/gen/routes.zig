@@ -70,7 +70,9 @@ pub fn prepare(s: anytype, env: *const zmeta.Env) !void {
 }
 
 /// View dispatch: Deps.view delegates here. Each page's
-/// `view(a, s, params, env) forest.Node` becomes one node.
+/// `view(a, s, params, env) forest.Node` becomes one node,
+/// wrapped by every applicable `_layout.zig` (outermost
+/// first — `pages/_layout.zig` wraps all pages).
 pub fn viewNodes(a: std.mem.Allocator, s: anytype, env: *const zmeta.Env) []const forest.Node {
     const nodes = a.alloc(forest.Node, 1) catch @panic("OOM");
     nodes[0] = switch (s.deps.route) {
