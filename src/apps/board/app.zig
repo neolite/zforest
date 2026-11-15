@@ -11,21 +11,25 @@
 //! zmeta app dir: `app.zig` holds `BoardDeps` (the Deps contract) + the
 //! hand-declared `Session` (groups.zig needs `scopeForRoute`/
 //! `scopeVersion` as statics — see the comment above `Session`),
-//! `model.zig` the shared BoardModel, `boardview.zig` the domain Route/
-//! ViewEnv + components, `groups.zig` the render-group registry,
-//! `pages/` the file routes, `actions.zig` the manifest, `gen/` the
-//! checked-in codegen.
+//! `model.zig` the shared BoardModel, `components.zig` the domain
+//! Route/ViewEnv + shared components, `groups.zig` the render-group
+//! registry, `pages/` the file routes (+ `_layout.zig` chrome),
+//! `actions.zig` the manifest, `gen/` the checked-in codegen.
 //!
 //! Routing split: `gen/routes.zig` owns path parsing + typed params;
 //! `pageOf` maps the generated `routes.Route` onto the domain
-//! `boardview.Route` the view/group layers key on (slug → board index).
+//! `components.Route` the view/group layers key on (slug → board
+//! index). Every view build — SSR, patch diff, SSE snapshot, and the
+//! render groups' own seed/render — goes through the generated
+//! `routes.viewNodes` dispatch: sessions pass `*Session`, groups a
+//! `GroupSession` stand-in (see groups.zig).
 const std = @import("std");
 const zefx = @import("zefx");
 const forest = @import("forest");
 const zmeta = @import("zmeta.zig");
 const model = @import("model.zig");
 const groups = @import("groups.zig");
-const boardview = @import("view.zig");
+const components = @import("components.zig");
 const routes = @import("gen/routes.zig");
 const actions = @import("gen/actions.zig");
 const History = @import("../../server/history.zig").History;
@@ -50,7 +54,7 @@ pub const auth_cookie_name = "zfxa";
 /// existence is the page `prepare` gate. The comment permalink keeps
 /// only the comment id (it is authoritative; `post` derives from it).
 /// `/login` + `/register` are auth pages — they carry no board route.
-fn pageOf(r: routes.Route) ?boardview.Route {
+fn pageOf(r: routes.Route) ?components.Route {
     return switch (r) {
         .index => .home,
         .b => |p| if (model.boardIndex(p.slug)) |i| .{ .board = i } else null,
@@ -84,13 +88,13 @@ pub const BoardDeps = struct {
     /// (skeleton-owned, feeds `Env.route`).
     route: routes.Route = .{ .index = .{} },
     /// Domain route — `pageOf`'s mapping of `route` onto the
-    /// `boardview.Route` the view/render-group layers key on
+    /// `components.Route` the view/render-group layers key on
     /// (slug → board index, comment permalink → comment id).
-    page: boardview.Route = .home,
+    page: components.Route = .home,
     /// Comment id the inline reply form is mounted under (per-session).
     reply_to: ?u64 = null,
     /// Top-level comment sort preference (per-session, group-key input).
-    sort: boardview.Sort = .new,
+    sort: components.Sort = .new,
     /// zfxu cookie value — the anonymous poster identity ("" = anonymous).
     user_token: []u8 = &.{},
     /// zfxa-resolved account id (null = anonymous). The account NAME is
@@ -513,7 +517,8 @@ pub const BoardDeps = struct {
         }
         _ = s.render_arena.reset(.retain_capacity);
         const a = s.render_arena.allocator();
-        forest.diff(a, boardview.buildView(a, viewEnv(s)), &s.dom, &s.log);
+        const env = s.viewEnv();
+        forest.diff(a, routes.viewNodes(a, s, &env), &s.dom, &s.log);
         s.log.revision = s.seq.get();
     }
 
@@ -522,20 +527,22 @@ pub const BoardDeps = struct {
     pub fn writeView(s: *Session, writer: anytype) !void {
         _ = s.render_arena.reset(.retain_capacity);
         const a = s.render_arena.allocator();
-        try forest.writeHtml(a, boardview.buildView(a, viewEnv(s)), writer);
+        const env = s.viewEnv();
+        try forest.writeHtml(a, routes.viewNodes(a, s, &env), writer);
     }
 
     /// `Deps.buildViewNodes` — the session's current view nodes for the
     /// SSE snapshot writer (`forest.writeSnapshotOps` serializes them).
-    /// Stamps `seen_seq` through `viewEnv().seen` exactly like the
+    /// Stamps `seen_seq` through `viewEnv`'s `seen` exactly like the
     /// hand-rolled version — the §4.4 cursor split is preserved:
     /// session-side builds write the SESSION cursor, and only the
     /// render group's own seed/render builds (which call
-    /// `boardview.buildView` with the GROUP's ViewEnv,
+    /// `routes.viewNodes` with the GROUP's `GroupDeps`,
     /// `seen = &g.last_rendered_seq`) write the group cursor. Session
     /// builds never touch `last_rendered_seq`.
     pub fn buildViewNodes(s: *Session, a: std.mem.Allocator) []const forest.Node {
-        return boardview.buildView(a, viewEnv(s));
+        const env = s.viewEnv();
+        return routes.viewNodes(a, s, &env);
     }
 
     /// `Deps.seedDom` — solo-path helper: render + drop the patch log.
@@ -550,11 +557,33 @@ pub const BoardDeps = struct {
     /// `Deps.view` — the contract view entry. Board overrides every
     /// skeleton default that would call it, so this is the canonical
     /// wrapper kept for contract completeness (and any future default
-    /// path): rebuild the board `ViewEnv` from `s.deps` — `Env` stays
-    /// the thin `{route}` v0 slice and is ignored here.
+    /// path): the generated dispatch over the session's typed route.
     pub fn view(a: std.mem.Allocator, s: *Session, env: *const zmeta.Env) []const forest.Node {
-        _ = env;
-        return boardview.buildView(a, viewEnv(s));
+        return routes.viewNodes(a, s, env);
+    }
+
+    /// `s.deps.viewEnv()` — the board `ViewEnv` pages/layouts read via
+    /// the generated dispatch: domain route + per-session view inputs
+    /// + the `seen_seq` cursor. Stamps `seen_seq` here because every
+    /// call IS a view build (the old `buildView` stamped it at the
+    /// top — same coverage, now at env construction). The §4.4 split:
+    /// the render group's own seed/render builds bypass this entirely
+    /// (`GroupDeps.viewEnv` in groups.zig stamps `last_rendered_seq`
+    /// instead) — session builds never touch the group cursor.
+    pub fn viewEnv(d: *BoardDeps) components.ViewEnv {
+        d.seen_seq = model.get().global_seq.load(.seq_cst);
+        return .{
+            .route = d.page,
+            .reply_to = d.reply_to,
+            .sort = d.sort,
+            // Auth display name ("@acct" / "Anon#N") + the account id
+            // that gates own-content delete buttons — the same inputs
+            // the render-group key carries, so group members render
+            // identically.
+            .name = authNameInto(d, &d.name_buf),
+            .account_id = d.account_id,
+            .seen = &d.seen_seq,
+        };
     }
 };
 
@@ -686,7 +715,7 @@ pub const Session = struct {
     /// permalinks read their whole post's scope: a reply anywhere in
     /// the thread re-renders them (over-broad but correct).
     /// Static: `groups.zig` calls it as `Session.scopeForRoute`.
-    pub fn scopeForRoute(route: boardview.Route) u64 {
+    pub fn scopeForRoute(route: components.Route) u64 {
         return switch (route) {
             .home => model.SCOPE_HOME,
             .board => |i| model.scopeBoard(i),
@@ -774,13 +803,13 @@ fn setSessionAuth(s: *Session, id: u64, token: []const u8) void {
 /// else the resolved anonymous name ("Anon#N" / "anon"). Written
 /// into `buf` (caller-owned scratch; the result is consumed by the
 /// immediately-following view build or group join, never retained).
-fn authNameInto(s: *Session, buf: []u8) []const u8 {
-    if (s.deps.account_id) |id| {
+fn authNameInto(d: *BoardDeps, buf: []u8) []const u8 {
+    if (d.account_id) |id| {
         if (model.get().accountName(id)) |n| {
             return std.fmt.bufPrint(buf, "@{s}", .{n}) catch "anon";
         }
     }
-    return boardview.nameOf(s.deps.user_token);
+    return components.nameOf(d.user_token);
 }
 
 /// Every POST needs a resolvable identity: mint on first contact, or
@@ -809,7 +838,7 @@ fn groupKey(s: *Session, name_buf: []u8) groups.Key {
     return .{
         .route = s.deps.page,
         .reply_to = s.deps.reply_to,
-        .name = authNameInto(s, name_buf),
+        .name = authNameInto(&s.deps, name_buf),
         .sort = s.deps.sort,
         .account_id = s.deps.account_id,
     };
@@ -856,26 +885,6 @@ fn ensureGroupCurrent(s: *Session) void {
     const g = s.deps.group orelse return;
     g.render(); // no-op when last_rendered_seq == global_seq
     g.publish(); // no-op when nothing pending
-}
-
-/// The board `ViewEnv` for session-side builds — `seen` is the
-/// session's own `seen_seq` cursor. The §4.4 split: only Dom-syncing
-/// builds stamp a cursor, and the render group's own seed/render builds
-/// go through `boardview.buildView` with the GROUP's ViewEnv
-/// (`seen = &g.last_rendered_seq`) instead — session builds never touch
-/// the group cursor. `pub`: page files delegate their `view` here.
-pub fn viewEnv(s: *Session) boardview.ViewEnv {
-    return .{
-        .route = s.deps.page,
-        .reply_to = s.deps.reply_to,
-        .sort = s.deps.sort,
-        // Auth display name ("@acct" / "Anon#N") + the account id that
-        // gates own-content delete buttons — the same inputs the
-        // render-group key carries, so group members render identically.
-        .name = authNameInto(s, &s.deps.name_buf),
-        .account_id = s.deps.account_id,
-        .seen = &s.deps.seen_seq,
-    };
 }
 
 /// ping reducer — bumps the revision in the pure phase (registered by
@@ -954,7 +963,7 @@ test "route parsing covers home/board/thread/comment and rejects junk" {
     try std.testing.expectEqual(@as(u64, 7), cm.t_c.post);
     try std.testing.expectEqual(@as(u64, 9), cm.t_c.comment);
 
-    // Domain layer: generated → boardview.Route (slug → board index).
+    // Domain layer: generated → components.Route (slug → board index).
     const home_d = pageOf(home).?;
     try std.testing.expect(home_d == .home);
     const bd_d = pageOf(bd).?;
@@ -1516,7 +1525,7 @@ test "sortTops: newest-first default, top orders by likes then recency" {
     try std.testing.expectEqual(@as(usize, 3), tops.len);
 
     // .new reverses the ascending index order → newest id first.
-    const newest = boardview.sortTops(alloc, mm, tops, .new);
+    const newest = components.sortTops(alloc, mm, tops, .new);
     defer alloc.free(newest);
     try std.testing.expectEqual(@as(usize, 3), newest.len);
     try std.testing.expectEqual(c_new, mm.comments.items[newest[0]].id);
@@ -1527,7 +1536,7 @@ test "sortTops: newest-first default, top orders by likes then recency" {
     // keep newest-first order.
     _ = try mm.toggleLike(.comment, c_old, "u1");
     _ = try mm.toggleLike(.comment, c_old, "u2");
-    const top = boardview.sortTops(alloc, mm, tops, .top);
+    const top = components.sortTops(alloc, mm, tops, .top);
     defer alloc.free(top);
     try std.testing.expectEqual(c_old, mm.comments.items[top[0]].id);
     try std.testing.expectEqual(c_new, mm.comments.items[top[1]].id);
@@ -1584,7 +1593,7 @@ test "like/sort actions: per-account votes, sort re-keys the group" {
     try std.testing.expect(a.deps.attached);
     const epoch_before = a.deps.membership_epoch;
     try a.dispatch("sort", "top", null, null);
-    try std.testing.expectEqual(boardview.Sort.top, a.deps.sort);
+    try std.testing.expectEqual(components.Sort.top, a.deps.sort);
     try std.testing.expectError(error.InvalidAction, a.dispatch("sort", "bogus", null, null));
     // syncMembership runs on render; force one via publishPending path
     // is implicit in tests that call render — call it directly.
@@ -1594,11 +1603,11 @@ test "like/sort actions: per-account votes, sort re-keys the group" {
     try std.testing.expect(std.mem.indexOf(u8, a.deps.group.?.key_string, "top") != null);
     // The stored Key (not just the string) must carry the sort — the
     // group's viewEnv renders from it.
-    try std.testing.expectEqual(boardview.Sort.top, a.deps.group.?.key.sort);
+    try std.testing.expectEqual(components.Sort.top, a.deps.group.?.key.sort);
     try a.dispatch("sort", "new", null, null);
     syncMembership(a);
-    try std.testing.expectEqual(boardview.Sort.new, a.deps.sort);
-    try std.testing.expectEqual(boardview.Sort.new, a.deps.group.?.key.sort);
+    try std.testing.expectEqual(components.Sort.new, a.deps.sort);
+    try std.testing.expectEqual(components.Sort.new, a.deps.group.?.key.sort);
     try std.testing.expect(std.mem.indexOf(u8, a.deps.group.?.key_string, "new") != null);
 }
 

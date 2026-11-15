@@ -1690,3 +1690,59 @@ list (old rows orphaned in the db — demo-grade). `zforest [port]
 [bind-ip] [db-path]`, default `zforest-todos.db`; `:memory:` opts back
 into ephemeral. The zforest exe now links sqlite (build.zig
 `addSqlite`), same as zboard.
+
+## zboard view layer → zmeta file-routing convention (done)
+
+Follow-up to the `src/apps/` migration: the last hand-rolled piece —
+`src/apps/board/view.zig` (652 lines holding the domain `Route`,
+`Sort`, `ViewEnv`, every shared component, all five page views and
+the `buildView` dispatch) — is gone. The view layer now sits where
+the zmeta convention expects it:
+
+- `pages/_layout.zig` — root layout exporting
+  `layout(a, s, env, inner)`: the old `buildView` chrome wrapper
+  (sidebar board list + auth-aware `#who` chip) around `.bmain`.
+  Generated `viewNodes` wraps every route arm with it, so SSR,
+  patch diffs and SSE snapshots all see the wrapped tree.
+- `pages/{index,b/[slug],t/[post]/index,t/[post]/c/[comment],
+  login,register}.zig` — each exports `params` + `view(a, s, p,
+  env)` with the route's markup inline, delegating shared pieces to
+  `components.zig`. `prepare` gates (dangling post/comment ids →
+  `error.NotFound`) unchanged.
+- `components.zig` (489 lines) — domain `Route`/`Sort`/`ViewEnv`
+  plus the shared-only code: `postCard`, `postForm`,
+  `commentForm`, `commentNode`, `crumbsView`, `notFoundView`,
+  `authField`/`authPage`, `sortTops`/`sortBar`, href/name/u64str
+  helpers.
+
+**View-state access moved to `s.deps.viewEnv()`.** Pages/layouts
+can't take a `ViewEnv` param (the generated signature is fixed), so
+`BoardDeps` gained a `viewEnv()` method returning
+`components.ViewEnv` — it stamps `seen_seq` exactly where the old
+`buildView` did (every call IS a view build). The §4.4 cursor split
+is preserved: session builds stamp `seen_seq`, group builds stamp
+`last_rendered_seq`.
+
+**Render groups render through the same generated dispatch.**
+`groups.zig` previously called `boardview.buildView` directly; it
+now builds a `GroupSession` stand-in (`{ deps: GroupDeps }`) whose
+`GroupDeps` carries the wire `routes.Route` (derived from the domain
+key route via `wireRoute` — `.board` re-resolves the index to its
+slug, `.comment` looks the post id up from the comment), the domain
+route, the key's reply/sort/name/account inputs, and
+`seen = &last_rendered_seq`, then calls `routes.viewNodes`. Pages
+only ever read `s.deps`, so the stand-in is sufficient; the
+fabricated `zmeta.Env.route` is the canonical `routes.href`.
+
+`BoardDeps.view`/`writeView`/`buildViewNodes`/`render` all call
+`routes.viewNodes` now — generated dispatch is the single view
+entry. Domain `Route`/`groupKey`/`scopeForRoute` semantics are
+untouched (`SCOPE_STATIC` for login/register intact).
+
+Verified: `zig build gen` + `zig build test` + `zig build` green;
+live smoke on a seeded db — SSR HTML byte-identical to the
+pre-refactor build on `/`, `/b/b`, `/b/tech`, `/t/1`, `/t/3/c/5`,
+`/login`, `/register`, anon AND authed (only the per-session CSRF
+meta differs), SSE snapshot ops identical, and a cross-session
+comment POST produced the expected fine-grained `patch` on a
+watching client's `/events` stream.

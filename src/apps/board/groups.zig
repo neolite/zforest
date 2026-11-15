@@ -21,8 +21,11 @@
 const std = @import("std");
 const forest = @import("forest");
 const History = @import("../../server/history.zig").History;
+const zmeta = @import("zmeta.zig");
 const app = @import("app.zig");
-const view = @import("view.zig");
+const model = @import("model.zig");
+const components = @import("components.zig");
+const routes = @import("gen/routes.zig");
 
 /// Immutable group-key inputs. `name` is borrowed only for the duration
 /// of `join`/`keyStringInto`; the group stores its own copy as a suffix
@@ -31,7 +34,7 @@ const view = @import("view.zig");
 /// own-content delete buttons in the view, so it MUST be a key input
 /// (two accounts rendering the same page still diverge on deletes).
 pub const Key = struct {
-    route: view.Route,
+    route: components.Route,
     reply_to: ?u64,
     /// Resolved auth display name ("@<account>" / "Anon#N" / "anon") —
     /// NOT the user token: sessions with identical rendered identity
@@ -40,10 +43,72 @@ pub const Key = struct {
     /// needs the numeric id for ownership checks).
     name: []const u8,
     /// Top-level comment sort — per-session view input like reply_to.
-    sort: view.Sort = .new,
+    sort: components.Sort = .new,
     /// Viewer account id (null = anonymous) — auth group dimension.
     account_id: ?u64 = null,
 };
+
+/// The deps a render group hands the generated view dispatch: the
+/// session-shaped stand-in `routes.viewNodes` needs (`s.deps.route`
+/// for the switch, `s.deps.viewEnv()` for pages/layouts). Carries the
+/// group key's view inputs verbatim — the group's `ViewEnv` IS the
+/// key minus the wire-route dispatch detail. `seen` points at the
+/// group's `last_rendered_seq`: `viewEnv` stamps it exactly like
+/// `BoardDeps.viewEnv` stamps the session's `seen_seq`, preserving
+/// the §4.4 cursor split (group builds write ONLY the group cursor).
+const GroupDeps = struct {
+    /// Wire route for `routes.viewNodes` dispatch — derived from the
+    /// domain key route (`wireRoute` below).
+    route: routes.Route,
+    /// Domain route — what `ViewEnv.route`/nav state key on.
+    page: components.Route,
+    reply_to: ?u64,
+    sort: components.Sort,
+    name: []const u8,
+    account_id: ?u64,
+    /// `&RenderGroup.last_rendered_seq` — the group's render cursor.
+    seen: *u64,
+
+    /// The group's `ViewEnv` — same fields `BoardDeps.viewEnv`
+    /// produces, sourced from the immutable key instead of session
+    /// state. Stamps `seen` because every call IS a view build.
+    pub fn viewEnv(self: *GroupDeps) components.ViewEnv {
+        self.seen.* = model.get().global_seq.load(.seq_cst);
+        return .{
+            .route = self.page,
+            .reply_to = self.reply_to,
+            .sort = self.sort,
+            .name = self.name,
+            .account_id = self.account_id,
+            .seen = self.seen,
+        };
+    }
+};
+
+/// Minimal session stand-in for `routes.viewNodes(a, s, env)` — the
+/// generated dispatch only reads `s.deps`.
+const GroupSession = struct {
+    deps: GroupDeps,
+};
+
+/// Domain route → generated wire route, for the group's viewNodes
+/// dispatch. `/b/:slug` re-resolves the board INDEX back to its slug
+/// through the static board table; the comment permalink's `post`
+/// param is view-irrelevant (the comment id is authoritative) so a
+/// deleted comment's post falls back to 0.
+fn wireRoute(route: components.Route) routes.Route {
+    return switch (route) {
+        .home => .{ .index = .{} },
+        .board => |i| .{ .b = .{ .slug = model.boards[i].slug } },
+        .thread => |pid| .{ .t = .{ .post = pid } },
+        .comment => |cid| blk: {
+            const post: u64 = if (model.get().comment(cid)) |c| c.post else 0;
+            break :blk .{ .t_c = .{ .post = post, .comment = cid } };
+        },
+        .login => .{ .login = .{} },
+        .register => .{ .register = .{} },
+    };
+}
 
 /// One render group: shared tracked DOM state, patch log, revisioned
 /// history ring, scratch arena, member count, and the dedup cursors.
@@ -82,15 +147,24 @@ pub const RenderGroup = struct {
     /// Scope version the Dom last diffed against.
     scope_seen: u64 = 0,
 
-    fn viewEnv(self: *RenderGroup) view.ViewEnv {
-        return .{
-            .route = self.key.route,
+    /// The group's current view through the GENERATED dispatch — the
+    /// same `routes.viewNodes` pipeline sessions use (page view +
+    /// `_layout.zig` chrome), with a `GroupSession` stand-in carrying
+    /// the key's view inputs. The fabricated `zmeta.Env.route` is the
+    /// canonical href — groups have no request path, and pages read
+    /// view state from `s.deps`, not the env.
+    fn viewNodes(self: *RenderGroup, a: std.mem.Allocator) []const forest.Node {
+        var fake: GroupSession = .{ .deps = .{
+            .route = wireRoute(self.key.route),
+            .page = self.key.route,
             .reply_to = self.key.reply_to,
             .sort = self.key.sort,
             .name = self.key.name,
             .account_id = self.key.account_id,
             .seen = &self.last_rendered_seq,
-        };
+        } };
+        var zenv = zmeta.Env{ .route = routes.href(a, fake.deps.route) };
+        return routes.viewNodes(a, &fake, &zenv);
     }
 
     /// Whether the group needs no render pass: not fork-forced and the
@@ -103,11 +177,11 @@ pub const RenderGroup = struct {
 
     /// Seed a fresh group's Dom to the current view WITHOUT publishing:
     /// diffing against an empty Dom emits creates that are discarded —
-    /// tracked state only. `buildView` stamps `last_rendered_seq`.
+    /// tracked state only. `viewNodes` stamps `last_rendered_seq`.
     fn seed(self: *RenderGroup) void {
         _ = self.arena.reset(.retain_capacity);
         const a = self.arena.allocator();
-        forest.diff(a, view.buildView(a, self.viewEnv()), &self.dom, &self.log);
+        forest.diff(a, self.viewNodes(a), &self.dom, &self.log);
         self.log.clear();
         self.scope_seen = app.Session.scopeVersion(self.scope);
     }
@@ -122,7 +196,7 @@ pub const RenderGroup = struct {
         const seen = app.Session.scopeVersion(self.scope);
         _ = self.arena.reset(.retain_capacity);
         const a = self.arena.allocator();
-        forest.diff(a, view.buildView(a, self.viewEnv()), &self.dom, &self.log);
+        forest.diff(a, self.viewNodes(a), &self.dom, &self.log);
         self.rev += 1;
         self.log.revision = self.rev;
         self.scope_seen = seen;
@@ -157,7 +231,7 @@ var next_incarnation: u64 = 1;
 /// "anon" names) so the separator cannot appear inside a field — the
 /// encoding is injective for every reachable key. `buf` must hold
 /// ~224 bytes; the result borrows `buf`.
-pub fn keyStringInto(buf: []u8, route: view.Route, reply_to: ?u64, name: []const u8, sort: view.Sort, account_id: ?u64) []const u8 {
+pub fn keyStringInto(buf: []u8, route: components.Route, reply_to: ?u64, name: []const u8, sort: components.Sort, account_id: ?u64) []const u8 {
     var rbuf: [48]u8 = undefined;
     const rpart = switch (route) {
         .home => "home",

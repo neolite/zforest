@@ -12,6 +12,7 @@ const login_page = @import("../pages/login.zig");
 const register_page = @import("../pages/register.zig");
 const t_page = @import("../pages/t/[post]/index.zig");
 const t_c_page = @import("../pages/t/[post]/c/[comment].zig");
+const lay_root = @import("../pages/_layout.zig");
 
 /// Typed route — one tag per page file. Dynamic `[name]`
 /// segments carry the page's `params` struct as payload.
@@ -120,12 +121,12 @@ pub fn prepare(s: anytype, env: *const zmeta.Env) !void {
 pub fn viewNodes(a: std.mem.Allocator, s: anytype, env: *const zmeta.Env) []const forest.Node {
     const nodes = a.alloc(forest.Node, 1) catch @panic("OOM");
     nodes[0] = switch (s.deps.route) {
-        .index => |p| index_page.view(a, s, p, env),
-        .b => |p| b_page.view(a, s, p, env),
-        .login => |p| login_page.view(a, s, p, env),
-        .register => |p| register_page.view(a, s, p, env),
-        .t => |p| t_page.view(a, s, p, env),
-        .t_c => |p| t_c_page.view(a, s, p, env),
+        .index => |p| lay_root.layout(a, s, env, index_page.view(a, s, p, env)),
+        .b => |p| lay_root.layout(a, s, env, b_page.view(a, s, p, env)),
+        .login => |p| lay_root.layout(a, s, env, login_page.view(a, s, p, env)),
+        .register => |p| lay_root.layout(a, s, env, register_page.view(a, s, p, env)),
+        .t => |p| lay_root.layout(a, s, env, t_page.view(a, s, p, env)),
+        .t_c => |p| lay_root.layout(a, s, env, t_c_page.view(a, s, p, env)),
     };
     return nodes;
 }
