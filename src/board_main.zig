@@ -48,6 +48,8 @@ pub fn main(init: std.process.Init) !void {
 test {
     _ = @import("db.zig");
     _ = @import("apps/board/model.zig");
+    _ = @import("apps/board/accounts.zig");
+    _ = @import("apps/board/auth.zig");
     _ = @import("apps/board/markdown.zig");
     _ = @import("apps/board/app.zig");
     _ = @import("apps/board/seed.zig");

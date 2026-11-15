@@ -1746,3 +1746,40 @@ pre-refactor build on `/`, `/b/b`, `/b/tech`, `/t/1`, `/t/3/c/5`,
 meta differs), SSE snapshot ops identical, and a cross-session
 comment POST produced the expected fine-grained `patch` on a
 watching client's `/events` stream.
+
+## zboard: split model.zig → accounts.zig, app.zig → auth.zig (done)
+
+Pure refactor, zero behavior change — the two oversized board files
+split along their existing `// ── accounts`/`// ── auth` section
+boundaries:
+
+- `accounts.zig` (new, ~330 lines) — everything that reads/writes the
+  `accounts` table: name/password validation, PBKDF2-HMAC-SHA256
+  hash/verify, `registerAccount`/`verifyAccount`,
+  `attachAuthToken`/`detachAuthToken`, `accountByAuthToken`,
+  `accountName`, the `Account` row type, the account consts, and the
+  accounts half of `load`/`deinit` (`loadAccounts`/`deinitAccounts`,
+  called from `BoardModel.load`/`deinit`). The `accounts` table DDL
+  stays inside model.zig's single `schema` blob — splitting CREATE
+  TABLE statements across files was judged messier than one schema
+  const. `model.zig` keeps thin `m.<op>` delegates plus re-exported
+  consts/`Account` so every existing call site (`components.zig`'s
+  `accountName`, app/auth handlers, tests) is unchanged; `dbErr`,
+  `nowSeconds`, `TmpDb`/`tmpDbPaths`/`cleanTmpDb` went `pub` for the
+  new file. The two account-named tests moved; the delete-cascade
+  tests stayed (they test `deletePost`/`deleteComment`, which remain
+  in model.zig — accounts are only their fixtures).
+- `auth.zig` (new, ~380 lines) — the auth action handler bodies
+  (`onRegister`/`onLogin`/`onLogout`/`onDeletePost`/`onDeleteComment`),
+  `zfxa` cookie resolution (`resolveAuth`, called from
+  `Deps.readCookies` — the `zfxu` anon half stays), `mintAuthToken`/
+  `setSessionAuth`, and `authNameInto` (the "@account"/"Anon#N"
+  display name used by `viewEnv`/`groupKey`). `BoardDeps` keeps thin
+  `on_<name>` forwards because generated `actions.dispatch` calls
+  `Deps.on_<name>` decls; `account_id`/`out_cookie_buf2`/`name_buf`
+  deps fields and `Session.out_cookie2` stay (viewEnv/group keys and
+  http.zig's `@hasDecl` probe read them). The three session auth
+  tests moved; `fieldStr`/`testModel`/`fieldsOf`/`serveBoth` went
+  `pub` for auth.zig's tests.
+
+Verified: `zig fmt` + `zig build test` + `zig build` green.
