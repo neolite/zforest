@@ -1632,3 +1632,24 @@ post takes all its comments + likes, a comment takes its reply
 subtree + likes — then rebuilds every derived index (they store
 `items` positions, so any removal invalidates them all; deletes are
 rare enough that O(rows) beats surgical index surgery).
+
+## zboard: markdown post/comment text (done)
+
+`src/apps/board/markdown.zig` renders user text to `forest.Node`s —
+approach (a) from the transport notes: literal bytes stay in text/
+element nodes so `writeHtml` escapes them, and `forest.raw` is never
+touched. The subset is deliberately small (documented in the file
+header): inline `` `code` ``, `**bold**`, `*italic*`/`_italic_`
+(underscore keeps word-internal uses literal), `[text](url)` with an
+http/https scheme whitelist; block paragraphs (blank-line separated,
+single newlines preserved via the container's `pre-wrap`), `>` quote
+runs → `<blockquote>`, ```` ``` ```` fences → `<pre><code>`.
+Everything else —
+raw HTML, `javascript:` urls, `__`, headings — stays literal. Cost is
+one O(n) indexOf-scan per nesting level (depth-capped) in the render
+arena over ≤2000-char posts; no caching since nodes only exist for
+the keyed row's create/snapshot serialization. `forest.Tag` gained
+`code`/`blockquote` (+ `h.code`/`h.blockquote` entry points);
+`.ptext`/`.ctext` now take `.children` of parsed nodes instead of a
+single `.text` leaf — plain posts emit the identical single text
+node, so existing Dom state is unaffected.

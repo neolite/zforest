@@ -7,6 +7,7 @@
 const std = @import("std");
 const forest = @import("forest");
 const model = @import("model.zig");
+const markdown = @import("markdown.zig");
 const routes = @import("gen/routes.zig");
 
 /// Request routes: "/" home, "/b/<slug>", "/t/<post>", "/t/<post>/c/<comment>",
@@ -149,7 +150,8 @@ fn navView(a: std.mem.Allocator, env: ViewEnv) forest.Node {
     return forest.el(a, .div, .{ .class = "bnav" }, links.toOwnedSlice(a) catch @panic("OOM"));
 }
 
-/// Post card: #id, board, Anon, time, pre-wrap text, thread link with a
+/// Post card: #id, board, Anon, time, markdown-rendered text (see
+/// markdown.zig — the subset is documented there), thread link with a
 /// live comment count (diffed in place via `lid`).
 /// `"c<id>"`/`"p<id>"` — the `data-arg` payload of like buttons.
 fn likeArg(a: std.mem.Allocator, prefix: u8, id: u64) []const u8 {
@@ -187,7 +189,7 @@ fn postCard(a: std.mem.Allocator, env: ViewEnv, p: *const model.Post, show_link:
         forest.text(" · "),
         forest.el(a, .span, .{ .class = "ts" }, fmtTs(a, p.ts)),
     })) catch @panic("OOM");
-    kids.append(a, forest.el(a, .div, .{ .class = "ptext" }, p.text)) catch @panic("OOM");
+    kids.append(a, forest.el(a, .div, .{ .class = "ptext" }, markdown.render(a, p.text))) catch @panic("OOM");
     if (show_link or own) {
         var acts: std.ArrayListUnmanaged(forest.Node) = .empty;
         if (show_link) {
@@ -374,7 +376,7 @@ fn commentNode(a: std.mem.Allocator, env: ViewEnv, c: *const model.Comment, post
 
     var kids: std.ArrayListUnmanaged(forest.Node) = .empty;
     kids.append(a, forest.el(a, .div, .{ .class = "cmeta" }, meta_kids.toOwnedSlice(a) catch @panic("OOM"))) catch @panic("OOM");
-    kids.append(a, forest.el(a, .div, .{ .class = "ctext" }, c.text)) catch @panic("OOM");
+    kids.append(a, forest.el(a, .div, .{ .class = "ctext" }, markdown.render(a, c.text))) catch @panic("OOM");
     // Inline reply form mounts between the text and the children list.
     kids.append(a, forest.when(a, .{ .id = rep_id }, replying, replyForm(a, env, post_str, num))) catch @panic("OOM");
 

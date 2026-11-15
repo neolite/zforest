@@ -161,6 +161,36 @@ footer { margin-top: .9rem; color: var(--muted); font-size: .85rem; }
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
+/* markdown subset (apps/board/markdown.zig) */
+.app-board .ptext a, .app-board .ctext a { color: var(--accent); }
+.app-board .ptext code, .app-board .ctext code {
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: .88em;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: .3rem;
+  padding: 0 .3em;
+}
+.app-board .ptext pre, .app-board .ctext pre {
+  margin: .5em 0;
+  padding: .6em .8rem;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: .45rem;
+  overflow-x: auto;
+}
+.app-board .ptext pre code, .app-board .ctext pre code {
+  background: none;
+  border: 0;
+  padding: 0;
+  font-size: .85rem;
+}
+.app-board .ptext blockquote, .app-board .ctext blockquote {
+  margin: .5em 0;
+  padding-left: .8rem;
+  border-left: 3px solid var(--line);
+  color: var(--muted);
+}
 .app-board .post .actions { margin-top: .35rem; font-size: .85rem; }
 .app-board .post .actions a { color: var(--accent); text-decoration: none; }
 .app-board .post .actions a:hover { text-decoration: underline; }

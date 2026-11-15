@@ -367,10 +367,16 @@ pub fn base(alloc: std.mem.Allocator) Builder(.base) {
 pub fn body(alloc: std.mem.Allocator) Builder(.body) {
     return .{ .a = alloc };
 }
+pub fn blockquote(alloc: std.mem.Allocator) Builder(.blockquote) {
+    return .{ .a = alloc };
+}
 pub fn br(alloc: std.mem.Allocator) Builder(.br) {
     return .{ .a = alloc };
 }
 pub fn button(alloc: std.mem.Allocator) Builder(.button) {
+    return .{ .a = alloc };
+}
+pub fn code(alloc: std.mem.Allocator) Builder(.code) {
     return .{ .a = alloc };
 }
 pub fn col(alloc: std.mem.Allocator) Builder(.col) {
