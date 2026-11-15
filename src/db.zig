@@ -1,7 +1,8 @@
 //! Thin typed wrapper over the vendored sqlite3 amalgamation
 //! (vendor/sqlite3, SQLite 3.54.1). Zig 0.17 has no `@cImport`, so the
-//! small C API surface we use is declared here by hand. Only linked into
-//! the `zboard` exe and its test target — the todo exe never touches C.
+//! small C API surface we use is declared here by hand. Linked into the
+//! `zboard` and `zforest` exes (board model + todo store) and their
+//! test targets — zmon/zcar/zmeta-demo never touch C.
 const std = @import("std");
 
 // ── sqlite3 C API subset (from vendor/sqlite3/sqlite3.h) ────────────

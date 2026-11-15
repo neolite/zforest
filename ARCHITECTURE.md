@@ -1653,3 +1653,40 @@ the keyed row's create/snapshot serialization. `forest.Tag` gained
 `.ptext`/`.ctext` now take `.children` of parsed nodes instead of a
 single `.text` leaf — plain posts emit the identical single text
 node, so existing Dom state is unaffected.
+## zforest: client-keyed todo persistence (done)
+
+Last app-roadmap item. Todos now write through to SQLite
+(`src/apps/todo/store.zig`, a small `TodoStore` over the shared
+`src/db.zig` wrapper — schema `todos(client_id, id, ord, text, done)`,
+PK `(client_id, id)`, WAL pragma, board/model.zig conventions at demo
+scale: one prepared statement per call, no debounce).
+
+**Keyed by client, not session.** Sessions are evicted (32-cap FIFO)
+and the process restarts — persisting per-session would lose data on
+both. Instead a `ztd` cookie (board's `zfxu` pattern: random token,
+minted into the existing one-shot `Session.out_cookie` on first POST,
+picked up by `Deps.readCookies` on every GET/POST) is the persistence
+key. `main.zig` installs `store.shared` before `serve()`; `null`
+disables persistence entirely (the old in-memory demo — every existing
+test runs that way unchanged).
+
+**Lazy load + write-through.** `ensureLoaded` runs once per session on
+first contact — `readCookies` when a `ztd` cookie is present, or the
+`dispatch` wrapper after minting — SELECTing the client's rows into
+the SAME `ArrayListUnmanaged(Todo)` the view/diff already uses (order
+= `ord, id`; `next_id` restored as max(id)+1; `remaining` recounted so
+the footer is right in SSR). Every model mutation then writes through
+in `applyMutation` — INSERT/UPDATE done/UPDATE text/DELETE — so memory
+and db never diverge. `ord` mirrors `id` (no reorder exists; the
+column is forward-compat for drag&drop).
+
+**Consequences.** Two tabs of one browser share the `ztd` cookie →
+shared todos (they already shared the `(token, "/")` session anyway).
+Session eviction/restart reloads from db. Two sessions holding the
+same `client_id` concurrently would be last-writer-wins per row —
+accepted (route-keying makes it near-impossible: one browser has one
+`/` session at a time). Losing the `ztd` cookie = new identity = fresh
+list (old rows orphaned in the db — demo-grade). `zforest [port]
+[bind-ip] [db-path]`, default `zforest-todos.db`; `:memory:` opts back
+into ephemeral. The zforest exe now links sqlite (build.zig
+`addSqlite`), same as zboard.

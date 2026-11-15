@@ -5,7 +5,7 @@ const sqlite_flags = [_][]const u8{ "-DSQLITE_THREADSAFE=1", "-DSQLITE_OMIT_LOAD
 
 /// Attach the vendored sqlite3 amalgamation (SQLite 3.54.1) to a module:
 /// link libc, compile sqlite3.c with the documented flags. Only modules
-/// that actually link the db get this — the todo exe never sees C.
+/// that actually link the db get this — zmon/zcar/zmeta-demo never see C.
 fn addSqlite(m: *std.Build.Module, b: *std.Build) void {
     m.link_libc = true;
     m.addIncludePath(b.path("vendor/sqlite3"));
@@ -40,6 +40,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &app_imports,
     });
+    // The todo app persists to sqlite (apps/todo/store.zig → db.zig).
+    addSqlite(exe_mod, b);
     const exe = b.addExecutable(.{ .name = "zforest", .root_module = exe_mod });
 
     b.installArtifact(exe);
@@ -157,9 +159,8 @@ pub fn build(b: *std.Build) void {
     const forest_tests = b.addTest(.{ .root_module = forest_mod });
     const run_forest_tests = b.addRunArtifact(forest_tests);
 
-    // exe tests pull db.zig/model.zig via main.zig's test block — the
-    // amalgamation is compiled into this test binary only, never into the
-    // zforest exe artifact.
+    // exe tests pull db.zig/model.zig/store.zig via main.zig's test
+    // block — the amalgamation is compiled into this test binary only.
     const exe_test_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,

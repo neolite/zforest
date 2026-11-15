@@ -4,7 +4,8 @@ Server-driven UIs in Zig: the `zefx` reactive graph core plus `forest`, a
 fine-grained DOM patch layer, served by a minimal `std.http` server with a
 vanilla JS patch client. Four apps share the transport:
 
-- **`zforest`** — the Todo demo (per-session model, no database).
+- **`zforest`** — the Todo demo (per-session view state; todos persist
+  to SQLite keyed by a `ztd` client cookie).
 - **`zboard`** — an anonymous message board (static boards, threads,
   nested tree comments) over a shared SQLite-backed model.
 - **`zmon`** — a live ops dashboard (mock request stream, windowed
@@ -34,7 +35,7 @@ zig build run-board 8081 127.0.0.1 board.db  # board on :8081, file db
 zig build run-mon 8082 127.0.0.1             # dashboard on :8082
 zig build run-car 8083 127.0.0.1             # booking demo on :8083
 zig build run-demo 8084 127.0.0.1            # zmeta demo on :8084
-./zig-out/bin/zforest [port] [bind-ip]
+./zig-out/bin/zforest [port] [bind-ip] [db-path]  # db-path default "zforest-todos.db"
 ./zig-out/bin/zboard   [port] [bind-ip] [db-path]   # db-path default ":memory:"
 ./zig-out/bin/zmon     [port] [bind-ip]
 ./zig-out/bin/zcar     [port] [bind-ip]
@@ -75,6 +76,18 @@ paths and dangling ids return 404.
 
 File databases persist everything: `zboard 8081 127.0.0.1 board.db`
 restarts with posts/comments/users intact (`:memory:` is ephemeral).
+
+## zforest (todo)
+
+`zig build run` serves the TodoMVC app on `127.0.0.1:8080` with todos
+persisted to `zforest-todos.db` in the cwd (`zforest [port] [bind-ip]
+[db-path]`; `:memory:` opts back into the ephemeral demo). Persistence
+is keyed by a `ztd` client cookie — minted on the first `POST /action`
+— not by the session cookie, so todos survive session eviction (32-cap
+FIFO), server restarts, and are shared by tabs of the same browser.
+Rows write through on every mutation; a session lazy-loads its client's
+rows on first contact. `src/apps/todo/store.zig` holds the `TodoStore`
+(schema + prepared statements); `src/db.zig` is shared with zboard.
 
 ## How it works
 
@@ -156,18 +169,17 @@ restarts with posts/comments/users intact (`:memory:` is ephemeral).
 ## Roadmap
 
 Shipped: reactive core (`zefx`), declarative view + SSR + snapshot, SSE
-patch transport, keyed lists, `when` branches, delegated events, three
-apps (todo + SQLite board + `zmon` live dashboard), route-keyed
-sessions, cross-tab fan-out, **fine-grained live bindings**
+patch transport, keyed lists, `when` branches, delegated events, four
+apps (todo + SQLite board + `zmon` live dashboard + `zcar` booking),
+route-keyed sessions, cross-tab fan-out, **fine-grained live bindings**
 (`forest.bindTree`: store → leaf patch ops with no view rebuild —
-zmon's cards and status pill update per-store-notification).
+zmon's cards and status pill update per-store-notification),
+**client-keyed todo persistence** (`ztd` cookie → SQLite write-through,
+survives eviction/restart), board accounts + markdown (ADR-0001).
 
 Next, roughly in order:
 
-- **Todo persistence** — SQLite per session so restarts/evictions stop
-  wiping lists (board already persists).
-- **Board moderation** — post/comment edit + delete, maybe tripcodes.
-- **Markdown** — server-side render for post/comment bodies.
+- **Board moderation** — post/comment edit + delete.
 - **Todo polish** — drag&drop reorder (model needs an order field).
 - **Live-mode structure** — reactive keyed lists and multi-key
   variants; per-item reactive cells still deferred (see
