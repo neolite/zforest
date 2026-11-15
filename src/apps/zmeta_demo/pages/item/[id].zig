@@ -29,6 +29,10 @@ pub fn view(a: std.mem.Allocator, s: anytype, p: params, env: *const zmeta.Env) 
         h.p(a).id("iid").child(h.f(a, "item #{d}", .{p.id})).node(),
         h.button(a).id("like-btn").on(.click, actions.act.like).arg(arg).child("like").node(),
         h.p(a).id("likes").text(likes_text).node(),
+        // `hits` counts THIS route-session's page loads — the root
+        // `_middleware.zig` bumped it during prepare, before the
+        // page's own prepare gate above ran.
+        h.p(a).id("hits").text(h.f(a, "page loads: {d}", .{s.deps.hits})).node(),
         h.p(a).child(h.a(a).href(routes.href(a, .{ .index = .{} })).child("← home")).node(),
     });
 }

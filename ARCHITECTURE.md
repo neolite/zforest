@@ -1783,3 +1783,44 @@ boundaries:
   `pub` for auth.zig's tests.
 
 Verified: `zig fmt` + `zig build test` + `zig build` green.
+
+## zmeta: `_middleware.zig` + `Deps.beforeAction` (done)
+
+The Next-style middleware surface from meta-framework.md §2.8,
+landed as two small pieces:
+
+**`pages/**/_middleware.zig`** — a third reserved underscore file
+next to `_layout.zig` (other `_` names still rejected). Same
+directory scoping and applicability rule as layouts (the page's dir
+or an ancestor, `/`-boundary checked, outermost-first) — gen.zig now
+treats layouts/middleware as one `ScopedFile` shape sorted by the
+shared `scopedFileLessThan`, with `pageWraps` computing both index
+lists per page. Contract:
+`pub fn middleware(s, env: *const zmeta.Env) !void`. The generated
+`prepare` dispatch calls each applicable middleware BEFORE the page's
+own `prepare` (block-form switch arms only when middleware applies —
+apps without `_middleware.zig` emit the same single-line arms as
+before). Any error → `servePage` 404 through the same catch as
+prepare errors. `env` stays immutable; middleware passes data via
+`s.deps` fields. v1 scope is PAGES only — `pages/api/` endpoints
+dispatch through `api()` and never run middleware (documented in
+gen.zig + docs). zmeta_demo's root middleware counts page loads into
+`DemoDeps.hits`, shown on `/` and `/item/:id` (per-route sessions —
+each route's first load reads 1).
+
+**`Deps.beforeAction`** — optional `@hasDecl` hook in
+`SessionMethods.dispatch`, called before `Deps.dispatch` with the
+same `(action, arg, value, fields)` payload; errors propagate like
+dispatch errors → `statusOf`. Seam for rate limiting/logging/auth
+prechecks on `POST /action`. No `afterAction` — `publishPending`
+covers post-dispatch. Board's aliased `Skel.dispatch` picks it up for
+free; absent = no-op everywhere else.
+
+The transport-level `beforeRequest` (pre-session-lookup redirect/
+rewrite in `handle`) remains deferred — `validPath` + the prepare
+chain cover demonstrated needs.
+
+Tests: gen.zig gains `classifyFile`/`middlewareId`/middleware
+`pageWraps`/`emitRoutes` ordering cases; session.zig gains a
+`beforeAction` veto test. Verified: `zig fmt`, `zig build gen`,
+`zig build test`, `zig build` green + live smoke on the demo.

@@ -72,6 +72,13 @@
 //!       declares only this (the zmon shape).
 //!     `fn readCookies(s, cookie_hdr: ?[]const u8) void` — auxiliary-
 //!       cookie pickup before dispatch/page render (board's `zfxu`).
+//!     `fn beforeAction(s, action, arg, value, fields) !void` —
+//!       pre-dispatch hook run BEFORE `Deps.dispatch` on every
+//!       `POST /action` (rate limiting, logging, auth prechecks).
+//!       Any error propagates exactly like a dispatch error →
+//!       `server.statusOf` (NotFound → 404, else 400). Absent = no-op;
+//!       there is deliberately no `afterAction` — `publishPending`
+//!       already covers post-dispatch work.
 //!     `fn pageLive(s) bool` — per-route live-island flag; generated
 //!       `routes.isLive` forwards page files' `pub const live = true`.
 //!       True → servePage builds the view once + bindTree; render()
@@ -357,7 +364,9 @@ fn SessionMethods(comptime Deps: type) type {
         /// Whitelisted action entry — the DOM event protocol (`action`
         /// is the `data-on-<event>` value, `arg` the `data-arg` payload,
         /// `value` a change event's new value, `fields` a submitted
-        /// form's named inputs). Delegates to `Deps.dispatch`.
+        /// form's named inputs). Runs the optional `Deps.beforeAction`
+        /// pre-dispatch hook first (errors map via `statusOf` like
+        /// dispatch errors), then delegates to `Deps.dispatch`.
         pub fn dispatch(
             self: anytype,
             action: []const u8,
@@ -365,6 +374,9 @@ fn SessionMethods(comptime Deps: type) type {
             value: ?[]const u8,
             fields: ?*const std.json.ObjectMap,
         ) !void {
+            if (@hasDecl(Deps, "beforeAction")) {
+                try Deps.beforeAction(self, action, arg, value, fields);
+            }
             return Deps.dispatch(self, action, arg, value, fields);
         }
 
@@ -829,6 +841,70 @@ test "skeleton session: servePage emits HTML, dispatch+flush emits patch ops" {
     // csrf round-trip like SessionStore.create/setCsrf.
     s.setCsrf(try alloc.dupe(u8, "token"));
     try std.testing.expectEqualStrings("token", s.csrf_token);
+}
+
+/// Minimal Deps exercising the optional `beforeAction` hook: counts
+/// calls, vetoes the "deny" action before `Deps.dispatch` sees it.
+const HookSession = Session(HookDeps);
+
+const HookDeps = struct {
+    calls: u64 = 0,
+    dispatched: u64 = 0,
+
+    pub fn init(s: *HookSession) HookDeps {
+        _ = s;
+        return .{};
+    }
+
+    pub fn beforeAction(
+        s: *HookSession,
+        action: []const u8,
+        arg: ?[]const u8,
+        value: ?[]const u8,
+        fields: ?*const std.json.ObjectMap,
+    ) !void {
+        _ = arg;
+        _ = value;
+        _ = fields;
+        s.deps.calls += 1;
+        if (std.mem.eql(u8, action, "deny")) return error.NotFound;
+    }
+
+    pub fn dispatch(
+        s: *HookSession,
+        action: []const u8,
+        arg: ?[]const u8,
+        value: ?[]const u8,
+        fields: ?*const std.json.ObjectMap,
+    ) !void {
+        _ = action;
+        _ = arg;
+        _ = value;
+        _ = fields;
+        s.deps.dispatched += 1;
+    }
+
+    pub fn view(a: std.mem.Allocator, s: *HookSession, env: *const Env) []const forest.Node {
+        _ = s;
+        _ = env;
+        return a.alloc(forest.Node, 0) catch @panic("OOM");
+    }
+};
+
+test "beforeAction runs before dispatch; its errors propagate" {
+    const alloc = std.testing.allocator;
+    const s = HookSession.create(alloc, std.testing.io);
+    defer s.deinit();
+
+    try s.dispatch("ok", null, null, null);
+    try std.testing.expectEqual(@as(u64, 1), s.deps.calls);
+    try std.testing.expectEqual(@as(u64, 1), s.deps.dispatched);
+
+    // A beforeAction error aborts before Deps.dispatch — the server
+    // maps it through statusOf exactly like a dispatch error.
+    try std.testing.expectError(error.NotFound, s.dispatch("deny", null, null, null));
+    try std.testing.expectEqual(@as(u64, 2), s.deps.calls);
+    try std.testing.expectEqual(@as(u64, 1), s.deps.dispatched);
 }
 
 /// Shared-model Deps declaring the full render-group hook set — the

@@ -101,8 +101,11 @@ fn preparePage(comptime Page: type, s: anytype, p: anytype, env: *const zmeta.En
     if (@hasDecl(Page, "prepare")) try Page.prepare(s, p, env);
 }
 
-/// Route-param gate: Deps.prepare delegates here. Any page
-/// `prepare` error → servePage 404s before view work.
+/// Route gate: Deps.prepare delegates here. Applicable
+/// `_middleware.zig` files run outermost-first, then the
+/// page's own `prepare`; any error → servePage 404s before
+/// view work. Api endpoints (`pages/api/`) skip this
+/// dispatch entirely.
 pub fn prepare(s: anytype, env: *const zmeta.Env) !void {
     switch (s.deps.route) {
         .index => |p| try preparePage(index_page, s, p, env),

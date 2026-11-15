@@ -13,13 +13,23 @@
 //!   pages/docs/[...rest].zig    → route "/docs/*" (catch-all, last only)
 //!   pages/_layout.zig           → root layout wrapping EVERY page
 //!   pages/item/_layout.zig      → layout wrapping pages under pages/item/
+//!   pages/_middleware.zig       → root middleware gating EVERY page
+//!   pages/item/_middleware.zig  → middleware gating pages under pages/item/
 //!
 //! A `_layout.zig` file is NOT a route: it must export
 //! `pub fn layout(a, s, env, inner: forest.Node) forest.Node` — the
 //! generated view dispatch wraps each page's node with every layout
 //! whose directory is the page's directory or an ancestor (root
-//! `pages/_layout.zig` first/outermost). Other `_`-prefixed files are
-//! rejected — underscore is reserved for framework files.
+//! `pages/_layout.zig` first/outermost). A `_middleware.zig` file is
+//! NOT a route either: it must export
+//! `pub fn middleware(s, env: *const zmeta.Env) !void` — the generated
+//! `prepare` dispatch calls every middleware whose directory is the
+//! page's directory or an ancestor (outermost-first, BEFORE the page's
+//! own `prepare`); any error → servePage 404s, same as prepare.
+//! `pages/api/` endpoints never run middleware (v1 scope: pages
+//! only). Env is immutable — middleware passes data through app-owned
+//! `s.deps` fields. Other `_`-prefixed files are rejected — underscore
+//! is reserved for framework files.
 //!
 //! Every page file MUST declare `pub const params = struct { ... };`
 //! (empty `struct {}` for static routes) — field names must match the
@@ -104,19 +114,26 @@ const Page = struct {
     /// Indices into the app's layout list, outermost first — the
     /// generated view wraps `page.view` with each in turn.
     wraps: []const usize = &.{},
+    /// Indices into the app's middleware list, outermost first — the
+    /// generated `prepare` dispatch calls each before the page's own
+    /// `prepare`. Same applicability rule as `wraps`.
+    middleware: []const usize = &.{},
     /// `pages/api/` endpoint — not a page route; dispatched through
     /// `parseApi`/`api` instead of `parseRoute`/`viewNodes`.
     is_api: bool = false,
 };
 
-/// A `pages/**/_layout.zig` file: `dir` is its directory relative to
-/// the app dir ("pages", "pages/item", ...), `id` the sanitized const
-/// name used in generated imports.
-const Layout = struct {
+/// A directory-scoped `pages/` framework file — `_layout.zig`
+/// (view wrapping) or `_middleware.zig` (prepare-time gate): `dir` is
+/// its directory relative to the app dir ("pages", "pages/item",
+/// ...), `id` the sanitized const name used in generated imports.
+const ScopedFile = struct {
     dir: []const u8,
     rel: []const u8,
     id: []const u8,
 };
+const Layout = ScopedFile;
+const Middleware = ScopedFile;
 
 // ─────────────────────────────────────────────
 // entry point
@@ -175,26 +192,35 @@ fn genApp(io: Io, arena: Allocator, app_dir: []const u8) !void {
     const scanned = try scanPages(io, arena, app_dir);
     if (scanned.len == 0) return error.FileNotFound;
 
-    // Partition the scan: `_layout.zig` files are layouts, other
-    // `_`-prefixed files are reserved and rejected, the rest are pages.
+    // Partition the scan: `_layout.zig`/`_middleware.zig` files are
+    // directory-scoped framework files, other `_`-prefixed files are
+    // reserved and rejected, the rest are pages.
     var page_rels: std.ArrayList([]const u8) = .empty;
     var layouts: std.ArrayList(Layout) = .empty;
+    var middlewares: std.ArrayList(Middleware) = .empty;
     for (scanned) |rel| {
-        const base = std.fs.path.basename(rel);
-        if (std.mem.startsWith(u8, base, "_")) {
-            if (std.mem.eql(u8, base, "_layout.zig")) {
+        switch (classifyFile(rel)) {
+            .layout => {
                 const dir = std.fs.path.dirname(rel).?;
                 try layouts.append(arena, .{
                     .dir = dir,
                     .rel = rel,
                     .id = try layoutId(arena, dir),
                 });
-            } else {
-                std.debug.print("zmeta-gen: {s}: '{s}' — underscore prefix is reserved for _layout.zig\n", .{ app_dir, rel });
+            },
+            .middleware => {
+                const dir = std.fs.path.dirname(rel).?;
+                try middlewares.append(arena, .{
+                    .dir = dir,
+                    .rel = rel,
+                    .id = try middlewareId(arena, dir),
+                });
+            },
+            .reserved => {
+                std.debug.print("zmeta-gen: {s}: '{s}' — underscore prefix is reserved for _layout.zig/_middleware.zig\n", .{ app_dir, rel });
                 return error.ReservedFile;
-            }
-        } else {
-            try page_rels.append(arena, rel);
+            },
+            .page => try page_rels.append(arena, rel),
         }
     }
 
@@ -211,22 +237,18 @@ fn genApp(io: Io, arena: Allocator, app_dir: []const u8) !void {
     }
     if (real_page_rels.items.len == 0 and api_rels.items.len == 0) return error.FileNotFound;
 
-    // Sort layouts outermost-first (shallowest dir, then lexicographic)
-    // so `wraps` indices compose root → leaf.
-    std.mem.sort(Layout, layouts.items, {}, struct {
-        fn lt(_: void, a: Layout, b: Layout) bool {
-            const da = std.mem.count(u8, a.dir, "/");
-            const db = std.mem.count(u8, b.dir, "/");
-            if (da != db) return da < db;
-            return std.mem.order(u8, a.dir, b.dir) == .lt;
-        }
-    }.lt);
+    // Sort scoped files outermost-first (shallowest dir, then
+    // lexicographic) so `wraps`/`middleware` indices compose
+    // root → leaf. Layouts and middleware share the rule.
+    std.mem.sort(Layout, layouts.items, {}, scopedFileLessThan);
+    std.mem.sort(Middleware, middlewares.items, {}, scopedFileLessThan);
 
     var parsed = try arena.alloc(Page, real_page_rels.items.len);
     for (real_page_rels.items, 0..) |rel, i| {
         const src = try readAppFile(io, arena, app_dir, rel);
         parsed[i] = try buildPage(arena, rel, src, false);
         parsed[i].wraps = try pageWraps(arena, rel, layouts.items);
+        parsed[i].middleware = try pageWraps(arena, rel, middlewares.items);
     }
     try checkConflicts(parsed);
     std.mem.sort(Page, parsed, {}, pageLessThan);
@@ -240,7 +262,7 @@ fn genApp(io: Io, arena: Allocator, app_dir: []const u8) !void {
     std.mem.sort(Page, apis, {}, pageLessThan);
 
     const zmeta_path = try zmetaImportPath(io, arena, app_dir);
-    const routes_src = try emitRoutes(arena, zmeta_path, parsed, apis, layouts.items);
+    const routes_src = try emitRoutes(arena, zmeta_path, parsed, apis, layouts.items, middlewares.items);
     const actions_src = try emitActions(io, arena, app_dir);
 
     const gen_rel = try std.fmt.allocPrint(arena, "{s}/gen", .{app_dir});
@@ -288,13 +310,37 @@ fn readAppFile(io: Io, arena: Allocator, app_dir: []const u8, rel: []const u8) !
     return Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20));
 }
 
-/// Sanitized const name for a layout's directory: "pages" → "root",
-/// "pages/item" → "item", "pages/t/[post]" → "t__post_" — always a
-/// valid Zig identifier, unique per directory.
-fn layoutId(arena: Allocator, dir: []const u8) GenError![]const u8 {
+/// What a scanned `pages/**` file is: a route page, a `_layout.zig`
+/// layout, a `_middleware.zig` middleware, or a rejected reserved
+/// `_`-prefixed file.
+const FileKind = enum { page, layout, middleware, reserved };
+
+fn classifyFile(rel: []const u8) FileKind {
+    const base = std.fs.path.basename(rel);
+    if (!std.mem.startsWith(u8, base, "_")) return .page;
+    if (std.mem.eql(u8, base, "_layout.zig")) return .layout;
+    if (std.mem.eql(u8, base, "_middleware.zig")) return .middleware;
+    return .reserved;
+}
+
+/// Outermost-first order for scoped files: shallowest directory
+/// first, then lexicographic — shared by layouts and middleware.
+fn scopedFileLessThan(_: void, a: ScopedFile, b: ScopedFile) bool {
+    const da = std.mem.count(u8, a.dir, "/");
+    const db = std.mem.count(u8, b.dir, "/");
+    if (da != db) return da < db;
+    return std.mem.order(u8, a.dir, b.dir) == .lt;
+}
+
+/// Sanitized const name for a scoped file's directory: "pages" →
+/// "<prefix>root", "pages/item" → "<prefix>item",
+/// "pages/t/[post]" → "<prefix>t__post_" — always a valid Zig
+/// identifier, unique per directory. `lay_` for layouts, `mw_` for
+/// middleware so both can be imported into the same generated file.
+fn scopedId(arena: Allocator, dir: []const u8, comptime prefix: []const u8) GenError![]const u8 {
     const suffix = if (std.mem.eql(u8, dir, "pages")) "root" else dir["pages/".len..];
     var buf: std.ArrayList(u8) = .empty;
-    try buf.appendSlice(arena, "lay_");
+    try buf.appendSlice(arena, prefix);
     for (suffix) |c| {
         if (std.ascii.isAlphanumeric(c) or c == '_') {
             try buf.append(arena, std.ascii.toLower(c));
@@ -305,22 +351,31 @@ fn layoutId(arena: Allocator, dir: []const u8) GenError![]const u8 {
     return buf.items;
 }
 
+fn layoutId(arena: Allocator, dir: []const u8) GenError![]const u8 {
+    return scopedId(arena, dir, "lay_");
+}
+
+fn middlewareId(arena: Allocator, dir: []const u8) GenError![]const u8 {
+    return scopedId(arena, dir, "mw_");
+}
+
 /// The directory a page file lives in, app-dir-relative:
 /// "pages/index.zig" → "pages", "pages/item/[id].zig" → "pages/item".
 fn pageDir(rel: []const u8) []const u8 {
     return std.fs.path.dirname(rel).?;
 }
 
-/// A layout applies to a page when the layout's directory is the
-/// page's directory or an ancestor of it ("pages/item" layout wraps
-/// "pages/item/[id].zig" but not "pages/index.zig"). `layouts` must
-/// already be sorted outermost-first; the result keeps that order.
-fn pageWraps(arena: Allocator, rel: []const u8, layouts: []const Layout) GenError![]const usize {
+/// A scoped file (layout or middleware) applies to a page when its
+/// directory is the page's directory or an ancestor of it
+/// ("pages/item" applies to "pages/item/[id].zig" but not
+/// "pages/index.zig"). `files` must already be sorted outermost-first;
+/// the result keeps that order.
+fn pageWraps(arena: Allocator, rel: []const u8, files: []const ScopedFile) GenError![]const usize {
     const dir = pageDir(rel);
     var out: std.ArrayList(usize) = .empty;
-    for (layouts, 0..) |l, i| {
-        const applies = std.mem.eql(u8, dir, l.dir) or
-            (dir.len > l.dir.len and std.mem.startsWith(u8, dir, l.dir) and dir[l.dir.len] == '/');
+    for (files, 0..) |f, i| {
+        const applies = std.mem.eql(u8, dir, f.dir) or
+            (dir.len > f.dir.len and std.mem.startsWith(u8, dir, f.dir) and dir[f.dir.len] == '/');
         if (applies) try out.append(arena, i);
     }
     return out.items;
@@ -600,7 +655,7 @@ fn pageLessThan(_: void, a: Page, b: Page) bool {
 // emission: routes.zig
 // ─────────────────────────────────────────────
 
-fn emitRoutes(arena: Allocator, zmeta_path: []const u8, pages: []const Page, apis: []const Page, layouts: []const Layout) ![]const u8 {
+fn emitRoutes(arena: Allocator, zmeta_path: []const u8, pages: []const Page, apis: []const Page, layouts: []const Layout, middlewares: []const Middleware) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     const w = &out.writer;
 
@@ -638,6 +693,24 @@ fn emitRoutes(arena: Allocator, zmeta_path: []const u8, pages: []const Page, api
     for (used_ids.items) |wi| {
         const l = layouts[wi];
         try w.print("const {s} = @import(\"../{s}\");\n", .{ l.id, l.rel });
+    }
+    // Middleware imports — only the ones some page actually gates on.
+    var mw_used = std.AutoHashMap(usize, void).init(arena);
+    defer mw_used.deinit();
+    for (pages) |p| {
+        for (p.middleware) |mi| try mw_used.put(mi, {});
+    }
+    var mw_used_ids: std.ArrayList(usize) = .empty;
+    var mw_kit = mw_used.keyIterator();
+    while (mw_kit.next()) |k| try mw_used_ids.append(arena, k.*);
+    std.mem.sort(usize, mw_used_ids.items, {}, struct {
+        fn lt(_: void, a: usize, b: usize) bool {
+            return a < b;
+        }
+    }.lt);
+    for (mw_used_ids.items) |mi| {
+        const m = middlewares[mi];
+        try w.print("const {s} = @import(\"../{s}\");\n", .{ m.id, m.rel });
     }
     try w.writeAll("\n");
 
@@ -763,20 +836,34 @@ fn emitRoutes(arena: Allocator, zmeta_path: []const u8, pages: []const Page, api
     }
     try w.writeAll("    };\n}\n\n");
 
-    // prepare dispatch — optional per-page `prepare(s, p, env)`.
+    // prepare dispatch — applicable `_middleware.zig` files run
+    // first (outermost-first), then the optional per-page
+    // `prepare(s, p, env)`. Page routes only: `pages/api/` endpoints
+    // dispatch through `api()` and never see middleware.
     try w.writeAll(
         \\fn preparePage(comptime Page: type, s: anytype, p: anytype, env: *const zmeta.Env) !void {
         \\    if (@hasDecl(Page, "prepare")) try Page.prepare(s, p, env);
         \\}
         \\
-        \\/// Route-param gate: Deps.prepare delegates here. Any page
-        \\/// `prepare` error → servePage 404s before view work.
+        \\/// Route gate: Deps.prepare delegates here. Applicable
+        \\/// `_middleware.zig` files run outermost-first, then the
+        \\/// page's own `prepare`; any error → servePage 404s before
+        \\/// view work. Api endpoints (`pages/api/`) skip this
+        \\/// dispatch entirely.
         \\pub fn prepare(s: anytype, env: *const zmeta.Env) !void {
         \\    switch (s.deps.route) {
         \\
     );
     for (pages) |p| {
-        try w.print("        .{s} => |p| try preparePage({s}_page, s, p, env),\n", .{ p.tag, p.tag });
+        if (p.middleware.len == 0) {
+            try w.print("        .{s} => |p| try preparePage({s}_page, s, p, env),\n", .{ p.tag, p.tag });
+        } else {
+            try w.print("        .{s} => |p| {{\n", .{p.tag});
+            for (p.middleware) |mi| {
+                try w.print("            try {s}.middleware(s, env);\n", .{middlewares[mi].id});
+            }
+            try w.print("            try preparePage({s}_page, s, p, env);\n        }},\n", .{p.tag});
+        }
     }
     try w.writeAll(
         \\    }
@@ -1417,4 +1504,117 @@ test "pageWraps applies ancestor layouts outermost-first" {
     // Boundary: "pages/item2" must not match "pages/item".
     const boundary = try pageWraps(arena, "pages/item2/z.zig", &layouts);
     try std.testing.expectEqual(@as(usize, 1), boundary.len);
+}
+
+test "classifyFile sorts pages vs scoped framework files" {
+    try std.testing.expectEqual(FileKind.page, classifyFile("pages/index.zig"));
+    try std.testing.expectEqual(FileKind.page, classifyFile("pages/item/[id].zig"));
+    try std.testing.expectEqual(FileKind.page, classifyFile("pages/api/ping.zig"));
+    try std.testing.expectEqual(FileKind.layout, classifyFile("pages/_layout.zig"));
+    try std.testing.expectEqual(FileKind.layout, classifyFile("pages/item/_layout.zig"));
+    try std.testing.expectEqual(FileKind.middleware, classifyFile("pages/_middleware.zig"));
+    try std.testing.expectEqual(FileKind.middleware, classifyFile("pages/item/_middleware.zig"));
+    // Any other underscore file is reserved.
+    try std.testing.expectEqual(FileKind.reserved, classifyFile("pages/_foo.zig"));
+    try std.testing.expectEqual(FileKind.reserved, classifyFile("pages/_middleware.zig.bak"));
+    try std.testing.expectEqual(FileKind.reserved, classifyFile("pages/__layout.zig"));
+}
+
+test "middlewareId sanitizes middleware dirs into valid const names" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings("mw_root", try middlewareId(arena, "pages"));
+    try std.testing.expectEqualStrings("mw_item", try middlewareId(arena, "pages/item"));
+    try std.testing.expectEqualStrings("mw_t__post_", try middlewareId(arena, "pages/t/[post]"));
+    for ([_][]const u8{ "pages", "pages/item", "pages/t/[post]" }) |d| {
+        const id = try middlewareId(arena, d);
+        try std.testing.expect(std.zig.isValidId(id));
+    }
+    // Layout and middleware ids for the same dir must differ — both
+    // are imported into the same generated routes.zig.
+    try std.testing.expect(!std.mem.eql(u8, try layoutId(arena, "pages"), try middlewareId(arena, "pages")));
+}
+
+test "pageWraps applies ancestor middleware outermost-first" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Middleware shares the layout applicability rule: same dir or an
+    // ancestor, sorted outermost-first, `/`-boundary checked.
+    const mws = [_]Middleware{
+        .{ .dir = "pages", .rel = "pages/_middleware.zig", .id = "mw_root" },
+        .{ .dir = "pages/item", .rel = "pages/item/_middleware.zig", .id = "mw_item" },
+        .{ .dir = "pages/other", .rel = "pages/other/_middleware.zig", .id = "mw_other" },
+    };
+    // Root page: only the root middleware.
+    const idx = try pageWraps(arena, "pages/index.zig", &mws);
+    try std.testing.expectEqual(@as(usize, 1), idx.len);
+    try std.testing.expectEqual(@as(usize, 0), idx[0]);
+    // Nested page: root + its own dir middleware, root first.
+    const item = try pageWraps(arena, "pages/item/[id].zig", &mws);
+    try std.testing.expectEqual(@as(usize, 2), item.len);
+    try std.testing.expectEqual(@as(usize, 0), item[0]);
+    try std.testing.expectEqual(@as(usize, 1), item[1]);
+    // Deeper page under item/: same two.
+    const deep = try pageWraps(arena, "pages/item/sub/x.zig", &mws);
+    try std.testing.expectEqual(@as(usize, 2), deep.len);
+    // Boundary: "pages/item2" must not match "pages/item".
+    const boundary = try pageWraps(arena, "pages/item2/z.zig", &mws);
+    try std.testing.expectEqual(@as(usize, 1), boundary.len);
+    try std.testing.expectEqual(@as(usize, 0), boundary[0]);
+}
+
+test "emitRoutes runs applicable middleware before page prepare" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const middlewares = [_]Middleware{
+        .{ .dir = "pages", .rel = "pages/_middleware.zig", .id = "mw_root" },
+        .{ .dir = "pages/item", .rel = "pages/item/_middleware.zig", .id = "mw_item" },
+        .{ .dir = "pages/other", .rel = "pages/other/_middleware.zig", .id = "mw_other" },
+    };
+    const pages = [_]Page{
+        .{ .rel = "pages/index.zig", .segs = &.{}, .params = &.{}, .tag = "index", .middleware = &.{0} },
+        .{
+            .rel = "pages/item/[id].zig",
+            .segs = &.{ .{ .static = "item" }, .{ .dynamic = "id" } },
+            .params = &.{.{ .name = "id", .ty = "u64" }},
+            .tag = "item",
+            .middleware = &.{ 0, 1 },
+        },
+        // No applicable middleware → single-line arm preserved.
+        .{ .rel = "pages/search.zig", .segs = &.{.{ .static = "search" }}, .params = &.{}, .tag = "search" },
+    };
+    const apis = [_]Page{
+        .{ .rel = "pages/api/ping.zig", .segs = &.{.{ .static = "ping" }}, .params = &.{}, .tag = "ping", .is_api = true },
+    };
+    const src = try emitRoutes(arena, "zmeta", &pages, &apis, &[_]Layout{}, &middlewares);
+    const s = src;
+
+    // Only the middleware some page uses is imported.
+    try std.testing.expect(std.mem.indexOf(u8, s, "const mw_root = @import(\"../pages/_middleware.zig\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "const mw_item = @import(\"../pages/item/_middleware.zig\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "mw_other") == null);
+
+    const prep = std.mem.indexOf(u8, s, "pub fn prepare").?;
+    // index arm: block form, root middleware then preparePage.
+    const idx_arm = std.mem.indexOfPos(u8, s, prep, ".index => |p| {").?;
+    const idx_mw = std.mem.indexOfPos(u8, s, idx_arm, "try mw_root.middleware(s, env);").?;
+    const idx_pp = std.mem.indexOfPos(u8, s, idx_mw, "try preparePage(index_page, s, p, env);").?;
+    try std.testing.expect(idx_mw < idx_pp);
+    // No item middleware leaks into the index arm.
+    const idx_end = std.mem.indexOfPos(u8, s, idx_arm, ".item => |p| {").?;
+    try std.testing.expect(std.mem.indexOf(u8, s[idx_arm..idx_end], "mw_item") == null);
+
+    // item arm: root THEN item middleware, then preparePage.
+    const item_arm = std.mem.indexOfPos(u8, s, prep, ".item => |p| {").?;
+    const root_call = std.mem.indexOfPos(u8, s, item_arm, "try mw_root.middleware(s, env);").?;
+    const item_call = std.mem.indexOfPos(u8, s, root_call, "try mw_item.middleware(s, env);").?;
+    const item_pp = std.mem.indexOfPos(u8, s, item_call, "try preparePage(item_page, s, p, env);").?;
+    try std.testing.expect(root_call < item_call and item_call < item_pp);
+
+    // search arm (no middleware): unchanged single-line form.
+    try std.testing.expect(std.mem.indexOf(u8, s, ".search => |p| try preparePage(search_page, s, p, env),") != null);
 }

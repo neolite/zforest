@@ -58,7 +58,7 @@ snapshot, ARCHITECTURE.md "Render groups v2").
 | Loaders | Server data before render | Synchronous in-process model reads inside `buildView`/`dispatch`; `readCookies` for request data | No fetch layer needed; `prepare` hook + env injection only (§2.5) |
 | Client-side navigation | SPA-feel transitions | Full page load → new route-session → SSR + snapshot | MPA stays default; soft-nav is a defined v1 path (§2.6) |
 | Streaming SSR / Suspense | Progressive page delivery | Single-shot `servePage`; SSE patches already stream post-load | Reject HTTP streaming; suspense analogue = `when` anchor + async completion (§2.7) |
-| Middleware | Pre-routing logic | Fixed `handle()` pipeline + `@hasDecl` hooks (`validPath`, `readCookies`, group hooks) | Current surface suffices; add a narrow `beforeRequest` only on demand (§2.8) |
+| Middleware | Pre-routing logic | `pages/**/_middleware.zig` file convention (dir-scoped, runs in generated `prepare` before the page's `prepare`) + `Deps.beforeAction` pre-dispatch hook | Landed (§2.8); transport-level `beforeRequest` still deferred |
 | Server actions / API routes | Typed server endpoints | `POST /action` → whitelisted `dispatch` → ACK `{rev}` | Already the mechanism; formalize via a typed action table (§2.9) |
 
 ## 2. Concept-by-concept
@@ -350,29 +350,44 @@ stay gated until the first snapshot confirms the stream
 SSR with per-boundary resolution order — the transport has no such
 scheduling, and the patch stream IS the resolution mechanism.
 
-### 2.8 Middleware
+### 2.8 Middleware — LANDED (file convention + action hook)
 
-The pipeline today (`handle`, http.zig:260-417): parse headers →
-`POST /action` (CSRF precheck → body read outside the lock → locked
-dispatch → publish → ACK + optional `Set-Cookie`) → static assets →
-`GET` page (`validPath` gate → session lookup/create → `servePage`).
-Optional `@hasDecl` hooks per the Session contract (http.zig:16-69):
-`validPath`, `readCookies`, `publishPending`, `streamRev`,
-`streamHistory`, `membershipEpoch`.
+Two pieces landed; the transport-level hook sketched below stays
+deferred.
 
-Mapping: Next middleware = pre-routing decision (redirect, rewrite,
-headers, auth). The equivalent here is a comptime-registered
-`beforeRequest` returning `continue | redirect(location) |
-reject(status)`, evaluated after header parse and before route
-dispatch — roughly 40 lines in `handle` plus one decl. **v0: not
-needed.** `validPath` covers route gating, `readCookies` + dispatch
-cover identity, CSRF/Origin is built in. Add the hook when a real
-app needs e.g. a global auth redirect; the surface is deliberately
-tiny and should stay that way.
+**`pages/**/_middleware.zig`** — the Next `middleware.ts` file
+convention, scoped exactly like `_layout.zig`: `pages/_middleware.zig`
+gates every page route, `pages/item/_middleware.zig` adds an inner
+gate for that subtree, multiple middleware run outermost-first. The
+generated `prepare` dispatch calls each applicable
+`pub fn middleware(s, env: *const zmeta.Env) !void` BEFORE the page's
+own `prepare`; any error → `servePage` 404s, identical to prepare
+errors (same catch site, same semantics). `env` is immutable —
+middleware passes data through app-owned `s.deps` fields, matching
+how `prepare` works today. v1 scope is PAGES only: `pages/api/`
+endpoints dispatch through `api()` and never see middleware — revisit
+if an endpoint needs the same gate. This covers the demonstrated
+need (per-directory request gates) without touching `handle()`.
 
-Rejected: per-route middleware config, edge-runtime semantics,
-response-header middleware chains — all cost without a demonstrated
-need.
+**`Deps.beforeAction`** — optional session-skeleton hook called
+before `Deps.dispatch` on every `POST /action` with the same
+`(action, arg, value, fields)` payload; `@hasDecl`-probed, absent =
+no-op. Errors propagate exactly like dispatch errors → `statusOf`
+(`NotFound` → 404, else 400). The seam for rate limiting, logging,
+and auth prechecks on the action channel. Deliberately no
+`afterAction`: `publishPending` already covers post-dispatch work.
+
+Still deferred: the transport-level `beforeRequest` hook below —
+pre-routing decisions (redirect/rewrite/headers) evaluated in
+`handle` before session lookup. `validPath` covers route gating and
+the prepare chain covers per-page gates; add `beforeRequest` only
+when an app needs a decision BEFORE a `(token, route)` session is
+minted (e.g. a global auth redirect that shouldn't create sessions).
+
+Rejected (unchanged): edge-runtime semantics, response-header
+middleware chains, per-route middleware *config* — the directory-
+scoped file convention covers the demonstrated need at the same
+cost as layouts.
 
 ### 2.9 API routes / server actions
 
@@ -658,7 +673,8 @@ contract is already stable and compile-enforced.
 
 1. `GET path` → generated `validPath` (`parseRoute`, no session on
    404) → `(token, route)` session lookup/create → `servePage`:
-   `setRoute` → generated dispatch → `page.prepare(params)` (404 on
+   `setRoute` → generated dispatch (applicable `_middleware.zig`
+   files, outermost-first, then the page's) `prepare(params)` (404 on
    error) → [shared-model: `syncMembership` + `ensureGroupCurrent`]
    → `writeView` = layouts∘page → `seedDom`.
 2. Browser: controls gated → `EventSource ?r=route` → `snapshot`

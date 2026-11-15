@@ -42,6 +42,7 @@ src/apps/<name>/
 │   ├── index.zig     "/"
 │   ├── about.zig     "/about"
 │   ├── _layout.zig   optional layout wrapping pages in its dir + below
+│   ├── _middleware.zig optional pre-prepare gate, same dir scoping
 │   ├── item/
 │   │   └── [id].zig  "/item/:id" — typed int segment
 │   ├── tag/
@@ -71,6 +72,8 @@ src/zmeta_demo_main.zig  executable entry point (flat src/ placement)
 | server actions / API routes | `actions.zig` manifest + `on_<name>` in app.zig | POST `/action` → ACK `{rev}`; SSE carries the patch |
 | hydration / RSC payload | **none** | SSR HTML + `client.js` applies serialized ops; no client tree exists |
 | `layout.tsx` | `pages/_layout.zig` | `pub fn layout(a, s, env, inner) Node`; wraps its dir + subdirs, root = `pages/_layout.zig` |
+| `middleware.ts` | `pages/_middleware.zig` | `pub fn middleware(s, env) !void`; dir-scoped like layouts, runs in `prepare` before the page's own `prepare`; pages only (not `api/`); errors → 404 |
+| action middleware | `Deps.beforeAction` in app.zig | optional pre-`dispatch` hook `(s, action, arg, value, fields) !void`; errors map like dispatch errors |
 | `next dev` | `zig build run-demo` | no watch mode yet; rebuild + rerun |
 
 ## Your first page
@@ -114,6 +117,21 @@ A `_layout.zig` in a subdirectory wraps only that subtree; layouts
 nest outermost-first (`pages/_layout.zig` → `pages/item/_layout.zig`
 → page). `_`-prefixed files are reserved — other names are rejected
 by `zig build gen`.
+
+### Middleware
+
+`pages/_middleware.zig` is the Next `middleware.ts` analogue: it runs
+inside the generated `prepare` dispatch — after `setRoute`, before the
+page's own `prepare` — once per page load. Directory scoping matches
+layouts exactly: `pages/_middleware.zig` gates every page,
+`pages/item/_middleware.zig` adds an inner gate for that subtree, and
+multiple middleware run outermost-first. `env` is immutable — pass
+data through app-owned `s.deps` fields; the demo counts page loads in
+`DemoDeps.hits` (`src/apps/zmeta_demo/pages/_middleware.zig`). API
+endpoints under `pages/api/` never run middleware. For action-level
+prechecks (rate limits, auth), declare `Deps.beforeAction` in app.zig
+instead — it runs before `Deps.dispatch` and its errors map like
+dispatch errors.
 
 ## View ergonomics
 

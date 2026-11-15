@@ -26,12 +26,14 @@ pub fn view(a: std.mem.Allocator, s: anytype, p: params, env: *const zmeta.Env) 
     _ = p;
     _ = env;
     const pings = h.f(a, "pings: {d}", .{s.deps.pings});
+    const hits = h.f(a, "page loads: {d}", .{s.deps.hits});
     const likes = h.f(a, "likes: {d}", .{app.totalLikes(s.deps)});
     return h.fragment(a, .{
         h.h1(a).id("title").child("zmeta demo").node(),
         h.p(a).id("blurb").child("file-based routes · typed params · comptime actions").node(),
         h.button(a).id("ping-btn").on(.click, actions.act.ping).child("ping").node(),
         h.p(a).id("pings").text(pings).node(),
+        h.p(a).id("hits").text(hits).node(),
         // Per-leaf island: this subtree is binder-owned after the first
         // bindIslands pass — store notifications push the ticks op with
         // no view rebuild, while the rest of the page keeps diffing.

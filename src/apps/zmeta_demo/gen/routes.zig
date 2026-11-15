@@ -16,6 +16,7 @@ const tag_page = @import("../pages/tag/[tag].zig");
 const wiki_rest_page = @import("../pages/wiki/[[...rest]].zig");
 const ping_api = @import("../pages/api/ping.zig");
 const lay_root = @import("../pages/_layout.zig");
+const mw_root = @import("../pages/_middleware.zig");
 
 /// Typed route — one tag per page file. Dynamic `[name]`
 /// segments carry the page's `params` struct as payload.
@@ -119,18 +120,45 @@ fn preparePage(comptime Page: type, s: anytype, p: anytype, env: *const zmeta.En
     if (@hasDecl(Page, "prepare")) try Page.prepare(s, p, env);
 }
 
-/// Route-param gate: Deps.prepare delegates here. Any page
-/// `prepare` error → servePage 404s before view work.
+/// Route gate: Deps.prepare delegates here. Applicable
+/// `_middleware.zig` files run outermost-first, then the
+/// page's own `prepare`; any error → servePage 404s before
+/// view work. Api endpoints (`pages/api/`) skip this
+/// dispatch entirely.
 pub fn prepare(s: anytype, env: *const zmeta.Env) !void {
     switch (s.deps.route) {
-        .index => |p| try preparePage(index_page, s, p, env),
-        .docs_rest => |p| try preparePage(docs_rest_page, s, p, env),
-        .item => |p| try preparePage(item_page, s, p, env),
-        .live => |p| try preparePage(live_page, s, p, env),
-        .search => |p| try preparePage(search_page, s, p, env),
-        .structure => |p| try preparePage(structure_page, s, p, env),
-        .tag => |p| try preparePage(tag_page, s, p, env),
-        .wiki_rest => |p| try preparePage(wiki_rest_page, s, p, env),
+        .index => |p| {
+            try mw_root.middleware(s, env);
+            try preparePage(index_page, s, p, env);
+        },
+        .docs_rest => |p| {
+            try mw_root.middleware(s, env);
+            try preparePage(docs_rest_page, s, p, env);
+        },
+        .item => |p| {
+            try mw_root.middleware(s, env);
+            try preparePage(item_page, s, p, env);
+        },
+        .live => |p| {
+            try mw_root.middleware(s, env);
+            try preparePage(live_page, s, p, env);
+        },
+        .search => |p| {
+            try mw_root.middleware(s, env);
+            try preparePage(search_page, s, p, env);
+        },
+        .structure => |p| {
+            try mw_root.middleware(s, env);
+            try preparePage(structure_page, s, p, env);
+        },
+        .tag => |p| {
+            try mw_root.middleware(s, env);
+            try preparePage(tag_page, s, p, env);
+        },
+        .wiki_rest => |p| {
+            try mw_root.middleware(s, env);
+            try preparePage(wiki_rest_page, s, p, env);
+        },
     }
 }
 

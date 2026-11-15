@@ -53,6 +53,9 @@ pub const DemoDeps = struct {
 
     /// Per-session model state.
     pings: u64 = 0,
+    /// Page-load counter — bumped by `pages/_middleware.zig` on every
+    /// servePage (prepare runs once per navigation, not per patch).
+    hits: u64 = 0,
     /// Per-item like counts (item id → count).
     likes: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     /// Live-island counter — a real zefx Store so `.text(ticks)`
