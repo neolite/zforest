@@ -53,10 +53,19 @@ src/apps/<name>/
 │       └── api/ping.zig   "/api/ping" — JSON endpoint, no view
 ├── actions.zig       action-name manifest (one per line-ish list)
 ├── app.zig           Deps: model, on_<action> handlers, prepare/view glue
+├── entities/         optional FSD slice — domain state leaf (zboard ref)
+├── features/         optional FSD slice — session-bound features
+├── shared/           optional FSD slice — shared view components/helpers
 └── gen/              GENERATED — routes.zig + actions.zig (checked in)
 src/zmeta/            the framework: session.zig, h.zig, gen.zig, env.zig
 src/zmeta_demo_main.zig  executable entry point (flat src/ placement)
 ```
+
+Layer dirs are created on demand as the app grows — `entities/`
+holds domain state, `features/` session-bound behavior, `shared/`
+reusable view pieces (meta-framework.md §5.6 has the import rules;
+zboard is the reference). Codegen only scans `pages/`, so slices
+never affect `gen/` output.
 
 ## Core concepts (Next.js → zmeta)
 

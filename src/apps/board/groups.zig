@@ -23,8 +23,8 @@ const forest = @import("forest");
 const History = @import("../../server/history.zig").History;
 const zmeta = @import("zmeta.zig");
 const app = @import("app.zig");
-const model = @import("model.zig");
-const components = @import("components.zig");
+const model = @import("entities/model.zig");
+const components = @import("shared/components.zig");
 const routes = @import("gen/routes.zig");
 
 /// Immutable group-key inputs. `name` is borrowed only for the duration

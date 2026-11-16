@@ -7,11 +7,19 @@
 //! input so groups render without a session (see groups.zig). Route
 //! *parsing* lives in `gen/routes.zig`; `pageOf` in app.zig maps
 //! generated routes onto the domain `Route`.
+//!
+//! FSD note: this is the `shared/` layer, which in zmeta-FSD may
+//! import `entities/` — these are domain-bound view components that
+//! render `model.Post`/`model.Comment` rows (docs/meta-framework.md
+//! §5.6). `markdown.zig` beside it is the pure-helper half. The
+//! `../gen/routes.zig` import is href-builders only (`routes.href`)
+//! — the one sanctioned shared→app-root edge; gen imports pages, so
+//! Zig's lazy `@import` resolves the resulting file cycle.
 const std = @import("std");
 const forest = @import("forest");
-const model = @import("model.zig");
+const model = @import("../entities/model.zig");
 const markdown = @import("markdown.zig");
-const routes = @import("gen/routes.zig");
+const routes = @import("../gen/routes.zig");
 
 /// Request routes: "/" home, "/b/<slug>", "/t/<post>", "/t/<post>/c/<comment>",
 /// "/login", "/register" (auth pages — static, no model rows). This is

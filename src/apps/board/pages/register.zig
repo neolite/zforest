@@ -4,7 +4,7 @@
 const std = @import("std");
 const forest = @import("forest");
 const zmeta = @import("../zmeta.zig");
-const components = @import("../components.zig");
+const components = @import("../shared/components.zig");
 
 /// Route params — static route, empty struct (required by the contract).
 pub const params = struct {};

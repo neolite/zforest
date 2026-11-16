@@ -38,6 +38,6 @@ test {
     _ = @import("apps/todo/app.zig");
     _ = @import("apps/todo/store.zig");
     _ = @import("db.zig");
-    _ = @import("apps/board/model.zig");
+    _ = @import("apps/board/entities/model.zig");
     _ = @import("apps/board/app.zig");
 }

@@ -1,7 +1,7 @@
 //! Todo persistence store — SQLite write-through keyed by the `ztd`
 //! client cookie, NOT the session: sessions are evicted (32-cap FIFO)
 //! and the process restarts, but a browser's todos survive both.
-//! Mirrors board/model.zig conventions (schema exec + a prepared
+//! Mirrors board/entities/model.zig conventions (schema exec + a prepared
 //! statement per call) at demo scale — one row per todo, no debounce.
 //!
 //! `shared` is the installed store (main.zig sets it before serve(),
@@ -35,7 +35,7 @@ const schema =
 
 /// The installed store, or null when persistence is off. All access is
 /// serialized by the server's session mutex (same contract as
-/// board/model.zig's `shared`).
+/// board/entities/model.zig's `shared`).
 pub var shared: ?*TodoStore = null;
 
 pub const TodoStore = struct {

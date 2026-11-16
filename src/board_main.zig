@@ -1,6 +1,6 @@
 const std = @import("std");
 const server = @import("server/http.zig");
-const board_model = @import("apps/board/model.zig");
+const board_model = @import("apps/board/entities/model.zig");
 const board_app = @import("apps/board/app.zig");
 const board_seed = @import("apps/board/seed.zig");
 
@@ -47,10 +47,10 @@ pub fn main(init: std.process.Init) !void {
 
 test {
     _ = @import("db.zig");
-    _ = @import("apps/board/model.zig");
-    _ = @import("apps/board/accounts.zig");
-    _ = @import("apps/board/auth.zig");
-    _ = @import("apps/board/markdown.zig");
+    _ = @import("apps/board/entities/model.zig");
+    _ = @import("apps/board/entities/accounts.zig");
+    _ = @import("apps/board/features/auth.zig");
+    _ = @import("apps/board/shared/markdown.zig");
     _ = @import("apps/board/app.zig");
     _ = @import("apps/board/seed.zig");
 }

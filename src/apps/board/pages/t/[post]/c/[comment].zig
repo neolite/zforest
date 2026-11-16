@@ -5,8 +5,8 @@
 const std = @import("std");
 const forest = @import("forest");
 const zmeta = @import("../../../../zmeta.zig");
-const components = @import("../../../../components.zig");
-const model = @import("../../../../model.zig");
+const components = @import("../../../../shared/components.zig");
+const model = @import("../../../../entities/model.zig");
 
 /// Route params — `[post]` + `[comment]` segments → two u64 fields.
 pub const params = struct { post: u64, comment: u64 };

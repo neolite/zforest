@@ -3,7 +3,7 @@
 //! Users are `seed-*` tokens (display names still derive Anon#xx — the
 //! anonymity IS the joke); the theme lives in the text.
 const std = @import("std");
-const model = @import("model.zig");
+const model = @import("entities/model.zig");
 
 /// `parent` indexes into this post's own comment list (0-based),
 /// `null` = top-level comment.

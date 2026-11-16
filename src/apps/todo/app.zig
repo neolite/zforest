@@ -565,7 +565,7 @@ fn presentClient(s: *Session, alloc: std.mem.Allocator, client_id: []const u8) v
 }
 
 /// Scratch file-db paths, unique per test PROCESS (same rationale as
-/// board/model.zig's tmpDbPaths — test binaries run concurrently).
+/// board/entities/model.zig's tmpDbPaths — test binaries run concurrently).
 const TmpDb = struct {
     path: []u8,
     wal: []u8,

@@ -10,11 +10,17 @@
 //! deps fields (viewEnv + render-group keys read them), the `zfxa`
 //! cookie NAME constant, and `Session.out_cookie2` — the second
 //! Set-Cookie channel `server/http.zig` probes via `@hasDecl`.
+//!
+//! FSD note: this is the `features/` layer. zmeta features are
+//! session-bound — the generated `actions.dispatch` calls
+//! `Deps.on_<name>` on `*app.Session`, so this file imports the app
+//! root for the session/render contract types (the one sanctioned
+//! upward edge; docs/meta-framework.md §5.6).
 const std = @import("std");
-const app = @import("app.zig");
-const model = @import("model.zig");
-const components = @import("components.zig");
-const groups = @import("groups.zig");
+const app = @import("../app.zig");
+const model = @import("../entities/model.zig");
+const components = @import("../shared/components.zig");
+const groups = @import("../groups.zig");
 
 /// Mint a `zfxa` auth token: 16 io-random bytes as 32 lowercase hex
 /// chars — cookie-safe, unguessable, and the model stores it verbatim

@@ -161,7 +161,7 @@ footer { margin-top: .9rem; color: var(--muted); font-size: .85rem; }
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
-/* markdown subset (apps/board/markdown.zig) */
+/* markdown subset (apps/board/shared/markdown.zig) */
 .app-board .ptext a, .app-board .ctext a { color: var(--accent); }
 .app-board .ptext code, .app-board .ctext code {
   font-family: ui-monospace, Menlo, monospace;

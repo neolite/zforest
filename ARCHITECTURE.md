@@ -1824,3 +1824,45 @@ Tests: gen.zig gains `classifyFile`/`middlewareId`/middleware
 `pageWraps`/`emitRoutes` ordering cases; session.zig gains a
 `beforeAction` veto test. Verified: `zig fmt`, `zig build gen`,
 `zig build test`, `zig build` green + live smoke on the demo.
+
+## zboard: FSD layer layout (done)
+
+`src/apps/board/` adopts Feature-Sliced Design dirs as the reference
+for the zmeta convention (docs/meta-framework.md §5.6 has the full
+rules + mapping table). Pure file moves + import-path fixes — no
+behavior change; `gen/` output is path-identical (codegen only scans
+`pages/`). One adjacent fix: `gen.zig`'s href emitter now pads
+multi-arg tuples (`.{ a, b }`) so generated files are `zig fmt`-clean
+— board's `gen/routes.zig` picks up the one-line spacing change on
+regeneration (it is the only app with a multi-param route).
+
+- `entities/` — `model.zig` (shared `BoardModel`) + `accounts.zig`
+  (account ops). Leaf layer: imports only `src/` infra (`db.zig`)
+  and each other.
+- `features/` — `auth.zig` (session-auth handlers/cookie
+  resolution). Imports entities + shared + the app root's
+  session/render contract (`app.zig`, `groups.zig`) — sanctioned
+  upward edge: generated `actions.dispatch` calls `Deps.on_<name>`
+  on `*Session`, so features are structurally session-bound.
+- `shared/` — `components.zig` (domain `Route`/`Sort`/`ViewEnv` +
+  components) + `markdown.zig` (text renderer). **Deviation from
+  strict FSD** (where shared is lowest): zmeta-FSD order is
+  app→pages→features→shared→entities, so shared MAY import
+  entities for view-model types (`model.Post`/`model.Comment`) —
+  entities is the leaf instead. Shared also imports
+  `gen/routes.zig` for `routes.href` URL builders only (gen→pages→
+  shared file cycle, tolerated by Zig's lazy `@import`).
+- App root keeps `app.zig` (Deps + hand-declared Session),
+  `groups.zig` (render-group registry — session/render infra calling
+  `Session.scopeForRoute`/`scopeVersion`, NOT a domain slice),
+  `seed.zig`, `actions.zig`, `zmeta.zig`, `gen/`.
+- `pages/` unchanged location; every page import gained one `../`
+  level where needed. `board_main.zig`/`main.zig` test-block imports
+  updated.
+
+Convention going forward: slices are created on demand — todo/car/
+mon/demo stay flat. `zig build new-app` scaffolds flat only and
+prints the layer convention in its next-steps (no empty dirs).
+
+Verified: `zig fmt`, `zig build gen` (no-op), `zig build test`,
+`zig build` green.

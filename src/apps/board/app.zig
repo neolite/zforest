@@ -8,15 +8,19 @@
 //! for sessions whose route doesn't show the change), then publishes the
 //! batch to that session's history — so one POST reaches every open tab.
 //!
-//! zmeta app dir: `app.zig` holds `BoardDeps` (the Deps contract) + the
+//! zmeta app dir (FSD layers — docs/meta-framework.md §5.6):
+//! `app.zig` holds `BoardDeps` (the Deps contract) + the
 //! hand-declared `Session` (groups.zig needs `scopeForRoute`/
 //! `scopeVersion` as statics — see the comment above `Session`),
-//! `model.zig` the shared BoardModel, `accounts.zig` the account
-//! operations, `auth.zig` the session-auth handlers/cookie resolution,
-//! `components.zig` the domain
-//! Route/ViewEnv + shared components, `groups.zig` the render-group
-//! registry, `pages/` the file routes (+ `_layout.zig` chrome),
-//! `actions.zig` the manifest, `gen/` the checked-in codegen.
+//! `groups.zig` the render-group registry (app-layer session/render
+//! infra — it calls `Session.scopeForRoute`/`scopeVersion`, so it is
+//! NOT a domain slice and stays at the app root), `seed.zig` the db
+//! seeder, `actions.zig` the manifest, `gen/` the checked-in codegen.
+//! `entities/model.zig` is the shared BoardModel, `entities/accounts.zig`
+//! the account operations, `features/auth.zig` the session-auth
+//! handlers/cookie resolution, `shared/components.zig` the domain
+//! Route/ViewEnv + shared components, `shared/markdown.zig` the text
+//! renderer, `pages/` the file routes (+ `_layout.zig` chrome).
 //!
 //! Routing split: `gen/routes.zig` owns path parsing + typed params;
 //! `pageOf` maps the generated `routes.Route` onto the domain
@@ -29,10 +33,10 @@ const std = @import("std");
 const zefx = @import("zefx");
 const forest = @import("forest");
 const zmeta = @import("zmeta.zig");
-const model = @import("model.zig");
-const auth = @import("auth.zig");
+const model = @import("entities/model.zig");
+const auth = @import("features/auth.zig");
 const groups = @import("groups.zig");
-const components = @import("components.zig");
+const components = @import("shared/components.zig");
 const routes = @import("gen/routes.zig");
 const actions = @import("gen/actions.zig");
 const History = @import("../../server/history.zig").History;

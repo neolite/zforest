@@ -1189,6 +1189,8 @@ fn emitHrefCase(arena: Allocator, w: *std.Io.Writer, p: Page) !void {
             }
             break :blk all_static;
         };
+        const a_args = try fmtTupleArgs(arena, args.items);
+        const fa_args = try fmtTupleArgs(arena, full_args.items);
         if (prefix_static) {
             // Prefix is a comptime literal — no allocPrint needed.
             var lit: std.ArrayList(u8) = .empty;
@@ -1199,20 +1201,28 @@ fn emitHrefCase(arena: Allocator, w: *std.Io.Writer, p: Page) !void {
             }
             try w.print(
                 "        .{s} => |p| if (p.{s}.len == 0) \"{s}\" else std.fmt.allocPrint(a, \"{s}\", .{{{s}}}) catch @panic(\"OOM\"),\n",
-                .{ p.tag, name, lit.items, full_fmt.items, full_args.items },
+                .{ p.tag, name, lit.items, full_fmt.items, fa_args },
             );
         } else {
             try w.print(
                 "        .{s} => |p| if (p.{s}.len == 0) std.fmt.allocPrint(a, \"{s}\", .{{{s}}}) catch @panic(\"OOM\") else std.fmt.allocPrint(a, \"{s}\", .{{{s}}}) catch @panic(\"OOM\"),\n",
-                .{ p.tag, name, fmt.items, args.items, full_fmt.items, full_args.items },
+                .{ p.tag, name, fmt.items, a_args, full_fmt.items, fa_args },
             );
         }
         return;
     }
     try w.print(
         "        .{s} => |p| std.fmt.allocPrint(a, \"{s}\", .{{{s}}}) catch @panic(\"OOM\"),\n",
-        .{ p.tag, fmt.items, args.items },
+        .{ p.tag, fmt.items, try fmtTupleArgs(arena, args.items) },
     );
+}
+
+/// `zig fmt` wants `.{ a, b }` for multi-element tuples but `.{a}`
+/// for a single arg — pad the arg list when it holds a comma so
+/// generated files come out already fmt-clean.
+fn fmtTupleArgs(arena: Allocator, args: []const u8) ![]const u8 {
+    if (std.mem.indexOfScalar(u8, args, ',') == null) return args;
+    return std.fmt.allocPrint(arena, " {s} ", .{args});
 }
 
 // ─────────────────────────────────────────────

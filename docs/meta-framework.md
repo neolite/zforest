@@ -586,6 +586,9 @@ apps/<name>/                  # new convention; existing src/*_app.zig untouched
   layouts/
     root.zig                  # optional; wraps every page
     b.zig                     # optional; wraps /b/* pages
+  entities/                   # optional FSD slice — domain state leaf (§5.6)
+  features/                   # optional FSD slice — session-bound features
+  shared/                     # optional FSD slice — shared view components
   gen/routes.zig              # GENERATED: Route union, parse, href, dispatch
   gen/actions.zig             # GENERATED: comptime names + dispatch skeleton
 ```
@@ -697,6 +700,59 @@ contract is already stable and compile-enforced.
 - **Not feasible/desired in Zig:** JSX ergonomics (comptime gives
   typed tags/attrs — the `Tag` enum and event whitelist already —
   not brevity), runtime reflection (hence codegen), npm ecosystem.
+
+### 5.6 Layer structure (FSD)
+
+Apps may organize non-page code into Feature-Sliced Design layer
+dirs inside `src/apps/<name>/`. **zboard is the reference
+implementation**; slices are created on demand — small apps stay
+flat (todo/car/mon/demo have no layer dirs). `zig build gen` scans
+only `pages/`, so layer dirs are invisible to codegen and never
+affect `gen/` output.
+
+| FSD layer | zmeta location | contents |
+|---|---|---|
+| app | `app.zig`, `groups.zig`, `seed.zig`, `zmeta.zig`, `actions.zig`, `gen/` | session/`Deps` contract, render-group infra, action manifest, zmeta shim, checked-in codegen |
+| pages | `pages/**/*.zig` (+ `_layout.zig`/`_middleware.zig`) | file routes |
+| features | `features/*.zig` | session-bound slices — auth handlers, per-session workflows |
+| shared | `shared/*.zig` | shared view components + pure helpers (markdown, formatters) |
+| entities | `entities/*.zig` | domain state leaf — models, stores, account ops |
+
+Import rules — dependencies point DOWN the table
+(`app → pages → features → shared → entities → src/` infra):
+
+- `entities/` imports nothing from any slice, `pages/`, or the app
+  root — only `src/` infra (`db.zig`, …) and intra-entity siblings.
+- `shared/` may import `entities/` — **documented deviation from
+  strict FSD** (where shared is the lowest layer): zmeta shared
+  components render entity rows (`model.Post`/`model.Comment`), so
+  entities is the leaf instead. Shared still never imports
+  features/pages/app.
+- `shared/` may import `gen/routes.zig` **only for `routes.href`
+  URL builders** — gen imports pages, so this closes a file-level
+  cycle that Zig tolerates via lazy `@import`; keep the use to pure
+  URL formatting, never page/dispatch symbols.
+- `features/` may import `entities/` + `shared/` **plus the app
+  root's session/render contract** (`app.zig` `Session`/`Deps`,
+  `groups.zig`): zmeta features are session-bound — generated
+  `actions.dispatch` calls `Deps.on_<name>` on `*Session`, so the
+  upward edge is structural, not accidental. This makes
+  `app.zig ↔ features/*.zig` and `groups.zig ↔ app.zig` import
+  cycles; they predate FSD and Zig resolves them lazily.
+- `pages/` may import everything.
+- The app root may import everything.
+
+`groups.zig`-style infra stays at the app root even though it looks
+slice-ish: it is session/render plumbing (`Session.scopeForRoute`/
+`scopeVersion` statics, Dom/history/rev sharing), not a domain
+slice — putting it under `features/` would invert the dependency
+(features must not be imported by the session skeleton).
+
+When to create a slice: a file whose concern is a distinct domain
+object or workflow. Domain state → `entities/`; behavior bound to a
+session/action → `features/`; view pieces reused across pages →
+`shared/`. Never scaffold empty dirs — flat files are fine until a
+second concern appears.
 
 ## 6. Non-goals
 

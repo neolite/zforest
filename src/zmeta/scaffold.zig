@@ -8,6 +8,12 @@
 //! App dirs are inert until registered: nothing imports them, so an
 //! unregistered scaffold never breaks `zig build`/`zig build test`.
 //!
+//! Layout: the flat files above ARE the whole app until it grows —
+//! FSD layer dirs (`entities/`, `features/`, `shared/`) are created
+//! on demand, not scaffolded (docs/meta-framework.md §5.6; zboard is
+//! the reference). `zig build gen` only scans `pages/`, so layer
+//! dirs never affect codegen.
+//!
 //! Usage: `zig build new-app -- my_app` (name must be a valid Zig
 //! identifier; the directory must not exist yet).
 
@@ -64,6 +70,10 @@ pub fn main(init: std.process.Init) !void {
         \\    const {s}_tests = b.addTest(.{{ .root_module = {s}_mod }});
         \\    test_step.dependOn(&b.addRunArtifact({s}_tests).step);
         \\
+        \\layout: app.zig + pages/ + actions.zig + zmeta.zig + gen/ at the app
+        \\root; add entities/, features/, shared/ slice dirs as the app grows
+        \\(docs/meta-framework.md §5.6 — zboard is the reference).
+        \\
     , .{ app_dir, main_rel, name, name, name, name, name, name, name, name, name, name, name, name, name, name, name, name, name, name });
 }
 
@@ -95,7 +105,9 @@ fn appZig(arena: Allocator, name: []const u8) ![]const u8 {
         \\//! {s} — zmeta app scaffolded by `zig build new-app`.
         \\//! Domain state + `Deps` contract live here; the view is in
         \\//! `pages/`, action names in `actions.zig`, generated glue in
-        \\//! `gen/` (regenerate with `zig build gen`).
+        \\//! `gen/` (regenerate with `zig build gen`). As the app grows,
+        \\//! split slices into `entities/`/`features/`/`shared/` dirs
+        \\//! (FSD — docs/meta-framework.md §5.6, zboard is the reference).
         \\
         \\const std = @import("std");
         \\const forest = @import("forest");
