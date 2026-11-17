@@ -33,6 +33,14 @@ pub const Dom = struct {
         /// Owned attribute name for `.attr` bindings, "" otherwise.
         name: []u8 = "",
         ctx: *anyopaque,
+        /// IslandCtx (view-side opaque) owning this binding's arena
+        /// captures — set for every binding created inside an island's
+        /// deep-copied subtree. `variant_nodes`/operand slices point
+        /// into that arena, so the binding must die with the island
+        /// even when an absolute `.id` escapes the `id`/`id/…` prefix
+        /// rule. Only ever COMPARED, never dereferenced. null =
+        /// captures are session-stable.
+        owner: ?*anyopaque = null,
         /// Unsubscribes the store watcher and frees `ctx` (and `node_id`/
         /// `name` stay owned by the Dom — freed by the drop helpers).
         destroy: *const fn (*anyopaque) void,
@@ -122,6 +130,15 @@ pub const Dom = struct {
         return out;
     }
 
+    /// ctx of the binding matching `(kind, node_id, name)`, or null —
+    /// e.g. the IslandCtx behind an `.island` marker.
+    pub fn bindingCtx(self: *Dom, kind: Binding.Kind, node_id: []const u8, name: []const u8) ?*anyopaque {
+        for (self.bindings.items) |b| {
+            if (b.kind == kind and std.mem.eql(u8, b.node_id, node_id) and std.mem.eql(u8, b.name, name)) return b.ctx;
+        }
+        return null;
+    }
+
     /// Whether a live binding for `(kind, node_id, name)` is already
     /// registered — bindTree uses this to stay idempotent.
     pub fn findBinding(self: *Dom, kind: Binding.Kind, node_id: []const u8, name: []const u8) bool {
@@ -132,13 +149,15 @@ pub const Dom = struct {
     }
 
     /// Register a live binding. `node_id`/`name` are copied; `ctx` ownership
-    /// transfers to the Dom (destroyed on drop/deinit).
-    pub fn addBinding(self: *Dom, kind: Binding.Kind, node_id: []const u8, name: []const u8, ctx: *anyopaque, destroy: *const fn (*anyopaque) void) void {
+    /// transfers to the Dom (destroyed on drop/deinit). `owner` is the
+    /// IslandCtx this binding's captures live in (null outside islands).
+    pub fn addBinding(self: *Dom, kind: Binding.Kind, node_id: []const u8, name: []const u8, ctx: *anyopaque, owner: ?*anyopaque, destroy: *const fn (*anyopaque) void) void {
         self.bindings.append(self.gpa, .{
             .kind = kind,
             .node_id = self.gpa.dupe(u8, node_id) catch @panic("OOM"),
             .name = self.gpa.dupe(u8, name) catch @panic("OOM"),
             .ctx = ctx,
+            .owner = owner,
             .destroy = destroy,
         }) catch @panic("OOM");
     }
@@ -150,22 +169,52 @@ pub const Dom = struct {
         self.gpa.free(b.name);
     }
 
+    fn ptrIn(list: []const *anyopaque, p: *anyopaque) bool {
+        for (list) |x| {
+            if (x == p) return true;
+        }
+        return false;
+    }
+
     /// Unsubscribe + free every binding whose node id is `id` or under
-    /// `id/…` — mirrors the texts/attrs/when_states prefix rule. `keep`
-    /// exempts one binder ctx (a `when_key` binder dropping its own
-    /// anchor's tracked state during a branch swap must survive).
+    /// `id/…` — mirrors the texts/attrs/when_states prefix rule — plus
+    /// every binding OWNED by an island marker dropped here: bindings
+    /// created inside an island's deep-copied subtree capture that
+    /// IslandCtx's arena and must die with it even when an absolute
+    /// `.id` escapes the prefix rule. Dropping an owned `.island`
+    /// marker joins its ctx to the dead set, cascading through nested
+    /// islands. `keep` exempts one binder ctx (a `when_key` binder
+    /// dropping its own anchor's tracked state during a branch swap
+    /// must survive).
     pub fn dropBindings(self: *Dom, id: []const u8, keep: ?*anyopaque) void {
         var prefix_buf: [128]u8 = undefined;
         const prefix = std.fmt.bufPrint(&prefix_buf, "{s}/", .{id}) catch @panic("id too long");
-        var i: usize = 0;
-        while (i < self.bindings.items.len) {
-            const b = &self.bindings.items[i];
-            const kept = keep != null and b.ctx == keep.?;
-            if (!kept and (std.mem.eql(u8, b.node_id, id) or std.mem.startsWith(u8, b.node_id, prefix))) {
-                self.dropBindingAt(i);
-            } else {
-                i += 1;
+
+        // IslandCtx pointers destroyed by this drop — compared by
+        // value only, never dereferenced (the pointee may be freed).
+        var dead: std.ArrayListUnmanaged(*anyopaque) = .empty;
+        defer dead.deinit(self.gpa);
+
+        // Repeat until stable: an owned island marker joins `dead`
+        // when it drops, orphaning bindings owned by ITS ctx.
+        while (true) {
+            var dropped = false;
+            var i: usize = 0;
+            while (i < self.bindings.items.len) {
+                const b = &self.bindings.items[i];
+                const kept = keep != null and b.ctx == keep.?;
+                const hit = std.mem.eql(u8, b.node_id, id) or
+                    std.mem.startsWith(u8, b.node_id, prefix) or
+                    (b.owner != null and ptrIn(dead.items, b.owner.?));
+                if (!kept and hit) {
+                    if (b.kind == .island) dead.append(self.gpa, b.ctx) catch @panic("OOM");
+                    self.dropBindingAt(i);
+                    dropped = true;
+                } else {
+                    i += 1;
+                }
             }
+            if (!dropped) break;
         }
     }
 
@@ -352,6 +401,23 @@ pub const Dom = struct {
             const kv = self.when_states.fetchRemove(k).?;
             self.gpa.free(kv.key);
             if (kv.value) |v| self.gpa.free(v);
+        }
+
+        // Keyed-list order maps keyed by parent id — same prefix rule,
+        // so a removed subtree doesn't leak its `orders` entries.
+        var odel: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer odel.deinit(self.gpa);
+        var oi = self.orders.iterator();
+        while (oi.next()) |e| {
+            if (std.mem.eql(u8, e.key_ptr.*, id) or std.mem.startsWith(u8, e.key_ptr.*, prefix)) {
+                odel.append(self.gpa, e.key_ptr.*) catch @panic("OOM");
+            }
+        }
+        for (odel.items) |k| {
+            var kv = self.orders.fetchRemove(k).?;
+            for (kv.value.items) |cid| self.gpa.free(cid);
+            kv.value.deinit(self.gpa);
+            self.gpa.free(kv.key);
         }
         self.dropBindings(id, keep_binding);
     }
@@ -669,6 +735,25 @@ test "when anchors track branch keys and purge with their row" {
     try std.testing.expect(dom.when_states.get("w-top") != null);
     // Purged anchors report changed again on next diff.
     try std.testing.expect(dom.setWhen("row-1/sw", "on"));
+}
+
+test "removeTracked drops keyed orders inside the removed subtree" {
+    var dom = Dom.init(std.testing.allocator);
+    defer dom.deinit();
+
+    dom.seedOrder("row-1/kids", &.{ "k1", "k2" });
+    dom.seedOrder("row-1", &.{"k1"});
+    dom.seedOrder("row-2/kids", &.{"k3"});
+    dom.seedOrder("top", &.{ "row-1", "row-2" });
+    try std.testing.expectEqual(@as(usize, 4), dom.orders.count());
+
+    dom.removeTracked("row-1", null);
+    // "row-1" and everything under "row-1/…" is gone; siblings survive.
+    try std.testing.expect(dom.orders.get("row-1") == null);
+    try std.testing.expect(dom.orders.get("row-1/kids") == null);
+    try std.testing.expect(dom.orders.get("row-2/kids") != null);
+    try std.testing.expect(dom.orders.get("top") != null);
+    try std.testing.expectEqual(@as(usize, 2), dom.orders.count());
 }
 
 test "cloneDeep copies all tracked state and stays independent" {

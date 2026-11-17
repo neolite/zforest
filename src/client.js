@@ -5,18 +5,69 @@
 (function () {
   "use strict";
 
-  // Only these attributes may be patched by attr ops; data-on-*/data-arg
-  // and friends are static markup and never appear here.
-  var ATTR_WHITELIST = {
+  // Live-patchable attributes. The contract is deliberately narrow and
+  // mirrored by the server's attr ops: `data-*`/`aria-*` always pass,
+  // a fixed set of inert standard + SVG attributes passes, and
+  // EVERYTHING else is refused — `on*` handlers, `style`, `srcdoc`,
+  // URL-bearing attributes (href, src, action, formaction, poster,
+  // background, cite, ...) that could smuggle javascript: URLs or
+  // trackers into trusted markup, and `id` (patching it would break
+  // every later op that resolves the element by id). Names are
+  // compared case-insensitively but applied verbatim so SVG's
+  // case-sensitive attrs (viewBox & friends) survive.
+  var SAFE_ATTRS = {
+    // HTML — document metadata, semantics, forms, media
+    accept: true, "accept-charset": true, accesskey: true, align: true,
+    alt: true, autocomplete: true, autofocus: true, axis: true,
+    bgcolor: true, border: true, challenge: true, char: true,
+    charoff: true, charset: true, class: true, classid: true, code: true,
+    codetype: true, colspan: true, color: true, compact: true,
+    contenteditable: true, contextmenu: true, coords: true, datetime: true,
+    declare: true, dir: true, direction: true, disabled: true,
+    draggable: true, enctype: true, face: true, for: true, frame: true,
+    headers: true, height: true, hidden: true, hreflang: true, hspace: true,
+    ismap: true,
+    keytype: true, label: true, lang: true, language: true, list: true,
+    loop: true, low: true, marginheight: true, marginwidth: true, max: true,
+    maxlength: true, media: true, method: true, min: true, minlength: true,
+    multiple: true, muted: true, name: true, nohref: true, noresize: true,
+    noshade: true, nowrap: true, open: true, optimum: true, pattern: true,
+    placeholder: true, preload: true, prompt: true, pubdate: true,
+    radiogroup: true, readonly: true, rel: true, required: true, rev: true,
+    rows: true, rowspan: true, rules: true, scope: true, scoped: true,
+    scrolling: true, selected: true, shape: true, size: true, sizes: true,
+    span: true, spellcheck: true, standby: true, start: true, step: true,
+    summary: true, tabindex: true, title: true, type: true, valign: true,
+    value: true, variable: true, version: true, vspace: true, width: true,
+    wrap: true,
+    // SVG — geometry + presentation (live charts/sparklines)
+    points: true, d: true, cx: true, cy: true, r: true, rx: true, ry: true,
+    x: true, y: true, x1: true, y1: true, x2: true, y2: true, fill: true,
+    "fill-opacity": true, "fill-rule": true, stroke: true,
+    "stroke-width": true, "stroke-linecap": true, "stroke-linejoin": true,
+    "stroke-dasharray": true, "stroke-dashoffset": true,
+    "stroke-opacity": true, opacity: true, transform: true, offset: true,
+    "stop-color": true, "stop-opacity": true, "clip-path": true,
+    "clip-rule": true, cursor: true, display: true, "font-family": true,
+    "font-size": true, "font-size-adjust": true, "font-stretch": true,
+    "font-style": true, "font-variant": true, "font-weight": true,
+    "image-rendering": true, "letter-spacing": true, "marker-end": true,
+    "marker-mid": true, "marker-start": true, "paint-order": true,
+    "pointer-events": true, "shape-rendering": true, "text-anchor": true,
+    "text-decoration": true, "text-rendering": true, "transform-origin": true,
+    "vector-effect": true, visibility: true, "word-spacing": true,
+    "writing-mode": true, "dominant-baseline": true, "color-interpolation": true,
+    viewbox: true,
+    // checked needs property sync — handled specially in applyPatch.
     checked: true,
-    value: true,
-    "data-active": true,
-    hidden: true,
-    disabled: true,
-    "class": true,
-    type: true,
-    points: true,
   };
+
+  function attrAllowed(name) {
+    var n = String(name).toLowerCase();
+    if (n.slice(0, 2) === "on") return false; // on* event handlers
+    if (n.slice(0, 5) === "data-" || n.slice(0, 5) === "aria-") return true;
+    return SAFE_ATTRS[n] === true;
+  }
 
   // Comment anchors for "when" ops: id -> {start, end} Comment nodes.
   // Marker comments are never removed while their anchor is live, so a
@@ -96,7 +147,7 @@
       }
       case "attr":
         el = document.getElementById(p.id);
-        if (!el || !ATTR_WHITELIST[p.name]) {
+        if (!el || !attrAllowed(p.name)) {
           if (!el) console.debug("zforest: attr target missing: " + p.id);
           return;
         }
@@ -243,13 +294,19 @@
     if (extra) for (var k in extra) {
       if (extra[k] !== null && extra[k] !== undefined) payload[k] = extra[k];
     }
+    // Capture the route-session and CSRF token at ENQUEUE time: the job
+    // runs after earlier queued actions, and a soft navigation may have
+    // swapped both globals by then — the action belongs to the page and
+    // route-session that emitted it (the cookie itself stays implicit).
+    var sendRoute = route;
+    var sendCsrf = csrfToken;
     var job = queue.then(function () {
       return fetch("/action", {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          "x-zforest-csrf": csrfToken,
-          "x-zforest-route": route,
+          "x-zforest-csrf": sendCsrf,
+          "x-zforest-route": sendRoute,
         },
         body: JSON.stringify(payload),
         credentials: "same-origin",
@@ -346,7 +403,11 @@
   // Opt out per-link with data-reload, per-gesture with modifier keys.
   var navSeq = 0;
 
-  function softNav(url, href) {
+  // `record` pushes a history entry (click navigation); popstate
+  // navigations arrive with the entry already current, so they pass
+  // false — no extra pushState, and the browser's own scroll
+  // restoration is left alone.
+  function navigate(url, href, record) {
     var my = ++navSeq;
     stashDraft();
     fetch(href, { credentials: "same-origin" }).then(function (r) {
@@ -376,13 +437,23 @@
       route = url.pathname;
       lastRev = 0; // new route-session numbers revisions independently
       ready = false; // re-gate submit controls until the snapshot lands
-      history.pushState(null, "", href);
-      window.scrollTo(0, 0);
+      if (record) history.pushState(null, "", href);
+      if (record) window.scrollTo(0, 0);
       connect();
     }).catch(function () {
       location.href = href;
     });
   }
+
+  function softNav(url, href) {
+    navigate(url, href, true);
+  }
+
+  // Browser Back/Forward: the URL already changed — run the same
+  // graft-and-reconnect flow without pushing a new history entry.
+  window.addEventListener("popstate", function () {
+    navigate(new URL(location.href), location.href, false);
+  });
 
   document.addEventListener("click", function (ev) {
     if (ev.defaultPrevented || ev.button !== 0) return;

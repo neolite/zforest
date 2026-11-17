@@ -2025,3 +2025,50 @@ pass, found additional issues. Delta vs the Devin review:
 Fix queue (priority): C1 key-bounds → cookie-header dupe → island
 subtree ownership → comment depth cap → sample settle semantics →
 settle-loop budget → app-level mediums.
+
+## Framework correctness fixes (2026-11-17, landed)
+
+All eight framework-only findings from the two reviews above are
+fixed; app-level items (comment depth cap, `edit_save` bumpSeq,
+minted-cookie loss, board auth `when`/`variant`, post-delete view,
+cascade transactions) remain app-side work in zforest-examples.
+
+- **Session-key bounds** (`server/http.zig`): token ≤128B, route
+  ≤512B enforced at every extraction point — session cookie
+  (`sessionToken` treats oversized as absent), `x-zforest-route`
+  (400), request path (404 before lookup), `/events?r=` (stream
+  expires like an unknown route). `lookup` also returns null for
+  oversized pairs as a second line of defense; `create` asserts the
+  cap (framework bug, not attacker data). No more 320B panic.
+- **Response-cookie ownership**: `s.out_cookie`/`outCookie2()` are
+  dupe'd into the request arena while `srv.mutex` is still held —
+  `req.respond` serializes headers after release, and session-owned
+  buffers could otherwise be freed/overwritten by eviction or a
+  concurrent action.
+- **Bounded flush + sample diamonds** (`zefx/engine.zig`): `flush`
+  carries a 100k work budget (thunk invocations + store propagations)
+  that panics in every build mode — a loud crash beats a silent
+  wedge inside `srv.mutex`, matching the `@panic("OOM")` style.
+  `drainSamples` now re-settles pure work + dirty stores after EACH
+  sample wire, so wires on one clock observe fully propagated
+  derived state ({new a, new map(a)}) instead of half-settled
+  diamonds.
+- **Island ownership** (`forest/dom.zig`, `forest/view.zig`):
+  `Dom.Binding.owner` records the IslandCtx whose arena a binding's
+  captures live in; `dropBindings` drops every binding owned by an
+  island marker it removes (iterating to a fixpoint for nested
+  islands), so absolute `.id`s inside islands can no longer escape
+  `removeTracked`'s prefix rule into freed arena memory.
+- **Keyed-order cleanup**: `removeTracked` now deletes `orders`
+  entries keyed by the removed id or under its `id/…` prefix, freeing
+  child-id slices — no per-deleted-subtree leak.
+- **Client** (`client.js`): queued actions capture `route` +
+  `csrfToken` at enqueue time (no cross-navigation misroute);
+  `popstate` runs the same graft-and-reconnect flow as soft-nav
+  without a second `pushState`; the attr-op gate widened from an
+  8-name whitelist to `data-*`/`aria-*` + a curated inert
+  standard/SVG set — `on*`, `style`, `srcdoc`, and URL-bearing
+  attributes (href/src/action/...) stay refused.
+- **Build**: `.optimize` now propagates to every framework module
+  (`zefx`/`forest`/`zassets`/`zserver`/`zmeta`/`zdb`), not just the
+  gen/scaffold test roots — `-Doptimize` actually reaches tests.

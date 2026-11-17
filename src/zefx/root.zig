@@ -598,6 +598,41 @@ test "sample supports shape source snapshot" {
     try std.testing.expectEqual(@as(i32, 13), sum.get());
 }
 
+test "sample diamond: wires on one clock see settled derived state" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const clk = createEvent(&eng, u32);
+    const a = createStore(&eng, u32, 0);
+    const doubled = a.map(u32, &struct {
+        fn f(v: u32) u32 {
+            return v * 2;
+        }
+    }.f);
+    const seen = createStore(&eng, u64, 0);
+
+    // Wire 1 writes `a` from the clock payload; wire 2 samples the
+    // {a, doubled} diamond. Wire 2 must observe `doubled` ALREADY
+    // propagated — draining the whole sample queue before re-settling
+    // used to let it read {new a, old doubled}.
+    _ = sample(&eng, .{ .clock = clk, .target = a });
+    _ = sample(&eng, .{
+        .clock = clk,
+        .source = .{ .a = a, .d = doubled },
+        .fn_ = &struct {
+            fn pack(snap: shape.SnapshotTypeOf(struct { a: *Store(u32), d: *Store(u32) }), _: u32) u64 {
+                return @as(u64, snap.a) * 1000 + snap.d;
+            }
+        }.pack,
+        .target = seen,
+    });
+
+    clk.emit(5); // a=5 → doubled=10 → seen=5010
+    try std.testing.expectEqual(@as(u64, 5010), seen.get());
+    clk.emit(7); // a=7 → doubled=14 → seen=7014
+    try std.testing.expectEqual(@as(u64, 7014), seen.get());
+}
+
 test "store watcher runs once per tick even with multiple reducers" {
     var eng = Engine.init(std.testing.allocator);
     defer eng.deinit();

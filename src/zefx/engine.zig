@@ -27,6 +27,15 @@ pub const Engine = struct {
     pub const CleanupFn = *const fn (std.mem.Allocator, *anyopaque) void;
     pub const CleanupEntry = struct { ptr: *anyopaque, dtor: CleanupFn };
 
+    /// Per-flush work budget: thunk invocations plus store propagations.
+    /// A cyclic graph (a watcher re-dirtying its source, a thunk that
+    /// re-schedules itself) would otherwise spin forever inside the
+    /// caller's lock — for the server that is a silent full-process
+    /// stall. Exceeding the budget panics in EVERY build mode: a loud
+    /// crash beats a wedge, matching the codebase's `@panic("OOM")`
+    /// fail-fast style. Legitimate flushes stay far below this.
+    const flush_work_budget = 100_000;
+
     allocator: std.mem.Allocator,
     tick_arena: std.heap.ArenaAllocator,
     phase: Phase = .idle,
@@ -89,14 +98,59 @@ pub const Engine = struct {
         self.dirty_indices.append(self.allocator, store_index) catch @panic("OOM");
     }
 
-    /// Drain a queue with an index cursor — no alloc/copy. Thunks appended
-    /// while draining are processed in the same pass.
-    fn drainQueue(queue: *std.ArrayListUnmanaged(Thunk)) void {
+    /// Drain a queue with an index cursor — no alloc/copy. Thunks
+    /// appended while draining are processed in the same pass. Every
+    /// invocation spends one unit of the flush work budget.
+    fn drainQueue(queue: *std.ArrayListUnmanaged(Thunk), budget: *usize) void {
         var i: usize = 0;
         while (i < queue.items.len) : (i += 1) {
+            if (budget.* == 0) @panic("zefx: flush work budget exhausted — cyclic reactive graph?");
+            budget.* -= 1;
             queue.items[i].invoke();
         }
         queue.clearRetainingCapacity();
+    }
+
+    /// Settle phase: propagate each dirty store's `updates` event so
+    /// derived stores (map/sample/combine) recompute in the pure
+    /// phase. Repeats until no store is left dirty — chains and
+    /// diamonds settle before any sample wire or view watcher
+    /// observes state.
+    fn settleDirty(self: *Engine, budget: *usize) void {
+        while (self.dirty_indices.items.len > 0) {
+            var i: usize = 0;
+            while (i < self.dirty_indices.items.len) : (i += 1) {
+                if (budget.* == 0) @panic("zefx: flush work budget exhausted — cyclic reactive graph?");
+                budget.* -= 1;
+                const n = self.store_notifiers.items[self.dirty_indices.items[i]];
+                n.propagateFn(n.ctx);
+            }
+            self.dirty_indices.clearRetainingCapacity();
+            self.phase = .pure;
+            drainQueue(&self.pure_queue, budget);
+        }
+    }
+
+    /// Post-settle phase: sample wires read store/shape sources here,
+    /// after every reducer and derived propagation has run. Each wire
+    /// is followed by a re-settle: a wire that writes a store (or
+    /// emits an event whose reducers write one) must let its
+    /// dependents propagate before the NEXT wire reads sources — two
+    /// samples on one clock would otherwise observe a half-propagated
+    /// diamond ({new a, old map(a)}), violating the settled-source
+    /// guarantee. Wires enqueued mid-pass (a target event feeding
+    /// another sample) run later in the same pass, also settled.
+    fn drainSamples(self: *Engine, budget: *usize) void {
+        var i: usize = 0;
+        while (i < self.sample_queue.items.len) : (i += 1) {
+            if (budget.* == 0) @panic("zefx: flush work budget exhausted — cyclic reactive graph?");
+            budget.* -= 1;
+            self.sample_queue.items[i].invoke();
+            self.phase = .pure;
+            drainQueue(&self.pure_queue, budget);
+            self.settleDirty(budget);
+        }
+        self.sample_queue.clearRetainingCapacity();
     }
 
     /// Begin a notification batch. Emits, store writes and effect runs
@@ -131,34 +185,24 @@ pub const Engine = struct {
         // recursively drain the queues the outer loop is iterating.
         if (self.batch_depth > 0 or self.flushing) return;
         self.flushing = true;
+        var budget: usize = flush_work_budget;
 
         // Drain until stable. Effects may emit new events, which enqueue new
         // pure reducers that must run before ending the tick/resetting arena.
         while (true) {
             // Phase 1: pure — drain reducers (may enqueue more)
             self.phase = .pure;
-            drainQueue(&self.pure_queue);
+            drainQueue(&self.pure_queue, &budget);
 
-            // Settle phase: propagate each dirty store's `updates` event so
-            // derived stores (map/sample/combine) recompute in the pure phase.
-            // Repeat until no store is left dirty — chains and diamonds settle
-            // before any view watcher observes state.
-            while (self.dirty_indices.items.len > 0) {
-                var i: usize = 0;
-                while (i < self.dirty_indices.items.len) : (i += 1) {
-                    const n = self.store_notifiers.items[self.dirty_indices.items[i]];
-                    n.propagateFn(n.ctx);
-                }
-                self.dirty_indices.clearRetainingCapacity();
-                self.phase = .pure;
-                drainQueue(&self.pure_queue);
-            }
+            // Settle phase: derived stores recompute before anything
+            // downstream reads them.
+            self.settleDirty(&budget);
 
-            // Post-settle phase: sample wires read store/shape sources here,
-            // after every reducer and derived propagation has run. A wire may
-            // enqueue more pure work (target store.set / event.emit /
-            // effect.run) — loop back to re-settle before effects run.
-            drainQueue(&self.sample_queue);
+            // Post-settle phase: sample wires, each re-settled before
+            // the next runs (see drainSamples). A wire may enqueue more
+            // pure work (target store.set / event.emit / effect.run) —
+            // loop back to re-settle before effects run.
+            self.drainSamples(&budget);
             if (self.pure_queue.items.len > 0 or self.dirty_indices.items.len > 0) continue;
 
             // Phase 2: effects — the graph is fully settled.
@@ -169,7 +213,7 @@ pub const Engine = struct {
             }
 
             // 2b: event watchers / scheduled effects
-            drainQueue(&self.effect_queue);
+            drainQueue(&self.effect_queue, &budget);
 
             if (self.pure_queue.items.len == 0 and self.effect_queue.items.len == 0 and
                 self.dirty_indices.items.len == 0 and self.sample_queue.items.len == 0)

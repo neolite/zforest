@@ -19,6 +19,16 @@ const max_sessions = 32;
 const max_body_len = 4096;
 const max_conns = 128;
 const head_buf_len = 8192;
+/// Session-key input caps. The `(token, route)` lookup key is built
+/// from the session cookie and the route (request path,
+/// `x-zforest-route` header, `/events?r=`) — all attacker-controlled.
+/// Inputs beyond these caps are rejected BEFORE lookup/create so the
+/// fixed key buffer can never overflow; `lookup` additionally returns
+/// null for oversized pairs as a second line of defense.
+const max_token_len = 128;
+const max_route_len = 512;
+/// Largest legal key — sizes `lookup`'s stack buffer.
+const key_buf_len = max_token_len + 1 + max_route_len;
 const sse_poll_ms = 50;
 const sse_heartbeat_ticks = 200; // 200 * 50ms ≈ 10s
 
@@ -117,8 +127,12 @@ pub fn SessionStore(comptime Session: type) type {
             return buf[0..n];
         }
 
+        /// Oversized inputs can never name a session (callers cap
+        /// token/route at extraction) — return null rather than panic:
+        /// these slices are attacker-controlled.
         pub fn lookup(self: *Self, token: []const u8, route: []const u8) ?*Session {
-            var buf: [320]u8 = undefined;
+            var buf: [key_buf_len]u8 = undefined;
+            if (token.len + 1 + route.len > buf.len) return null;
             const key = keyInto(token, route, &buf);
             return self.by_key.get(key);
         }
@@ -134,6 +148,9 @@ pub fn SessionStore(comptime Session: type) type {
                 self.gpa.free(oldest);
             }
             const n = token.len + 1 + route.len;
+            // Callers cap both parts (max_token_len/max_route_len) — an
+            // oversized pair here is a framework bug, not attacker data.
+            std.debug.assert(n <= key_buf_len);
             const key = self.gpa.alloc(u8, n) catch @panic("OOM");
             @memcpy(key[0..token.len], token);
             key[token.len] = 0x01;
@@ -177,6 +194,14 @@ fn cookieValue(cookie_header: ?[]const u8, name: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+/// Session cookie token, length-capped: an oversized value is treated
+/// as absent (no session) rather than reaching the key builder — the
+/// cookie is attacker-controlled and `keyInto` must never see it raw.
+fn sessionToken(cookie_header: ?[]const u8, name: []const u8) ?[]const u8 {
+    const tok = cookieValue(cookie_header, name) orelse return null;
+    return if (tok.len <= max_token_len) tok else null;
 }
 
 fn sessionCookieName(comptime Session: type) []const u8 {
@@ -298,14 +323,16 @@ fn handle(
 
     if (method == .POST and std.mem.eql(u8, path, "/action")) {
         // The action targets the route-session the page was rendered for.
-        const route = normalizeRoute(route_hdr orelse return .bad_request);
+        const route_raw = route_hdr orelse return .bad_request;
+        if (route_raw.len > max_route_len) return .bad_request;
+        const route = normalizeRoute(route_raw);
 
         // Fast locked precheck so unauthorized requests get 403 without
         // waiting on a body read (ordering identical to the old server).
         {
             srv.mutex.lockUncancelable(srv.io);
             defer srv.mutex.unlock(srv.io);
-            const pre = if (cookieValue(cookie_hdr, cname)) |tok| srv.store.lookup(tok, route) else null;
+            const pre = if (sessionToken(cookie_hdr, cname)) |tok| srv.store.lookup(tok, route) else null;
             const ps = pre orelse return .forbidden;
             const pre_ok = csrf_hdr != null and std.mem.eql(u8, csrf_hdr.?, ps.csrf_token);
             if (!pre_ok and !sameOrigin(origin_hdr, host_hdr)) return .forbidden;
@@ -324,7 +351,7 @@ fn handle(
         // apply + serialize + publish + clear. No network I/O inside.
         srv.mutex.lockUncancelable(srv.io);
         defer srv.mutex.unlock(srv.io);
-        const entry = if (cookieValue(cookie_hdr, cname)) |tok| srv.store.lookup(tok, route) else null;
+        const entry = if (sessionToken(cookie_hdr, cname)) |tok| srv.store.lookup(tok, route) else null;
         const s = entry orelse return .forbidden;
         // CSRF: accept when the custom X-Zforest-CSRF header matches the
         // per-session token (browsers can't set custom headers cross-origin
@@ -359,17 +386,22 @@ fn handle(
             s.log.clear();
         }
 
-        // Per-action Set-Cookie hooks (e.g. minted on first POST) — the
-        // values stay valid in `extra` because the session owns them.
+        // Per-action Set-Cookie hooks (e.g. minted on first POST).
         // `outCookie2()` is an optional second auxiliary cookie (board's
         // `zfxa` account auth): it's a DECL accessor, not a field —
         // @hasDecl can't see struct fields — so sessions that don't
-        // declare it skip the probe entirely.
+        // declare it skip the probe entirely. Values are session-owned
+        // slices: dupe into the request arena NOW, while the mutex is
+        // still held — `req.respond` serializes headers after release,
+        // and an eviction or a later action could free/overwrite the
+        // session buffers in between.
         if (s.out_cookie.len != 0) {
-            extra.append(arena, .{ .name = "set-cookie", .value = s.out_cookie }) catch @panic("OOM");
+            const v = arena.dupe(u8, s.out_cookie) catch @panic("OOM");
+            extra.append(arena, .{ .name = "set-cookie", .value = v }) catch @panic("OOM");
         }
         if (@hasDecl(Session, "outCookie2") and s.outCookie2().len != 0) {
-            extra.append(arena, .{ .name = "set-cookie", .value = s.outCookie2() }) catch @panic("OOM");
+            const v = arena.dupe(u8, s.outCookie2()) catch @panic("OOM");
+            extra.append(arena, .{ .name = "set-cookie", .value = v }) catch @panic("OOM");
         }
 
         var ack: std.Io.Writer.Allocating = .init(arena);
@@ -395,6 +427,9 @@ fn handle(
     if (method == .GET) {
         // "/index.html" is an alias for "/" on every app.
         const rpath = if (std.mem.eql(u8, path, "/index.html")) "/" else path;
+        // The path feeds the session key — reject oversized ones before
+        // any lookup/create (they can't be real routes anyway).
+        if (rpath.len > max_route_len) return .not_found;
         // Optional pure route check keeps bogus paths from minting sessions.
         if (@hasDecl(Session, "validPath") and !Session.validPath(rpath)) return .not_found;
         srv.mutex.lockUncancelable(srv.io);
@@ -403,7 +438,7 @@ fn handle(
         // session per route it visits, so tabs on different routes never
         // share a view. The cookie token itself is stable per browser.
         var fresh_token: ?[]const u8 = null;
-        const e = if (cookieValue(cookie_hdr, cname)) |tok| blk: {
+        const e = if (sessionToken(cookie_hdr, cname)) |tok| blk: {
             if (srv.store.lookup(tok, rpath)) |s| break :blk s;
             break :blk srv.store.create(tok, rpath);
         } else blk: {
@@ -479,11 +514,14 @@ fn serveEvents(comptime Session: type, srv: *Server(Session), req: *std.http.Ser
     while (it.next()) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "cookie")) cookie_hdr = h.value;
     }
-    const token = try srv.gpa.dupe(u8, cookieValue(cookie_hdr, sessionCookieName(Session)) orelse "");
+    const token = try srv.gpa.dupe(u8, sessionToken(cookie_hdr, sessionCookieName(Session)) orelse "");
     defer srv.gpa.free(token);
     // The page tells us which route-session this stream belongs to; a
     // missing param (very old client) falls back to the home route.
+    // Oversized routes name no session — every poll misses and the
+    // stream expires like an unknown route, never reaching keyInto.
     const route = normalizeRoute(queryParam(req.head.target, "r") orelse "/");
+    const route_ok = route.len <= max_route_len;
 
     const out = req.server.out;
     try out.writeAll("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-store\r\nx-accel-buffering: no\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n");
@@ -506,7 +544,7 @@ fn serveEvents(comptime Session: type, srv: *Server(Session), req: *std.http.Ser
         {
             srv.mutex.lockUncancelable(srv.io);
             defer srv.mutex.unlock(srv.io);
-            const s = srv.store.lookup(token, route);
+            const s = if (route_ok) srv.store.lookup(token, route) else null;
             // Eviction + recreation between polls yields a NEW session
             // under the same (token, route) key — its seq/history
             // restarted near 0, so this stream's cursor could never be
@@ -718,6 +756,8 @@ test "session store stamps a fresh incarnation per create, across eviction" {
     // Fill past the cap so the oldest keys are evicted FIFO; recreating
     // "tok"/"/" must yield a DIFFERENT incarnation — an SSE cursor into
     // the dead session's history can never alias the new one's revs.
+    // `a` is destroyed by the eviction — save its incarnation first.
+    const a_incarnation = a.incarnation;
     var i: usize = 0;
     while (i < max_sessions) : (i += 1) {
         var kb: [32]u8 = undefined;
@@ -726,7 +766,27 @@ test "session store stamps a fresh incarnation per create, across eviction" {
     }
     try std.testing.expect(store.lookup("tok", "/") == null);
     const a2 = store.create("tok", "/");
-    try std.testing.expect(a2.incarnation != a.incarnation);
+    try std.testing.expect(a2.incarnation != a_incarnation);
+}
+
+test "session store lookup never panics on oversized key parts" {
+    const alloc = std.testing.allocator;
+    var store = SessionStore(TestSession).init(alloc, std.testing.io);
+    defer store.deinit();
+
+    // Attacker-controlled cookie/route strings must miss, not overflow
+    // the fixed key buffer — both under and over key_buf_len.
+    var tb: [600]u8 = undefined;
+    @memset(&tb, 'x');
+    var rb: [900]u8 = undefined;
+    @memset(&rb, 'y');
+    try std.testing.expect(store.lookup(tb[0..500], "/") == null);
+    try std.testing.expect(store.lookup("tok", rb[0..800]) == null);
+    try std.testing.expect(store.lookup(tb[0..500], rb[0..800]) == null);
+
+    // In-cap lookups still resolve normally.
+    const s = store.create("tok", "/");
+    try std.testing.expect(store.lookup("tok", "/") == s);
 }
 
 test {

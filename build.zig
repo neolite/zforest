@@ -29,11 +29,13 @@ pub fn build(b: *std.Build) void {
     const zefx_mod = b.addModule("zefx", .{
         .root_source_file = b.path("src/zefx/root.zig"),
         .target = target,
+        .optimize = optimize,
     });
 
     const forest_mod = b.addModule("forest", .{
         .root_source_file = b.path("src/forest/root.zig"),
         .target = target,
+        .optimize = optimize,
     });
 
     // Framework modules — named so every consumer compiles ONE copy of
@@ -50,11 +52,13 @@ pub fn build(b: *std.Build) void {
     const assets_mod = b.addModule("zassets", .{
         .root_source_file = b.path("src/assets.zig"),
         .target = target,
+        .optimize = optimize,
     });
 
     const zserver_mod = b.addModule("zserver", .{
         .root_source_file = b.path("src/server/http.zig"),
         .target = target,
+        .optimize = optimize,
         .imports = &.{
             .{ .name = "forest", .module = forest_mod },
             .{ .name = "zassets", .module = assets_mod },
@@ -64,6 +68,7 @@ pub fn build(b: *std.Build) void {
     const zmeta_mod = b.addModule("zmeta", .{
         .root_source_file = b.path("src/zmeta/root.zig"),
         .target = target,
+        .optimize = optimize,
         .imports = &.{
             .{ .name = "zefx", .module = zefx_mod },
             .{ .name = "forest", .module = forest_mod },
@@ -80,6 +85,7 @@ pub fn build(b: *std.Build) void {
     const db_mod = b.addModule("zdb", .{
         .root_source_file = b.path("src/db.zig"),
         .target = target,
+        .optimize = optimize,
     });
     addSqlite(db_mod, b);
 

@@ -1004,6 +1004,10 @@ pub const AttachEnv = struct {
     bound_ctx: *const anyopaque,
     /// Branch markup for `.when_key` binders — re-serialized on swaps.
     variant_nodes: []const Node = &.{},
+    /// IslandCtx owning this binding's arena captures (null outside
+    /// islands) — recorded on `Dom.Binding.owner` so `removeTracked`
+    /// drops the whole island subtree, absolute `.id`s included.
+    owner: ?*anyopaque = null,
 };
 
 /// A subscribed leaf. Owned by the Dom's binding registry; `detach_fn`
@@ -1023,6 +1027,9 @@ pub const Binder = struct {
     bound_call: *const fn (std.mem.Allocator, *const anyopaque) ?[]const u8,
     bound_ctx: *const anyopaque,
     variant_nodes: []const Node,
+    /// IslandCtx owning `variant_nodes`' arena (null outside islands)
+    /// — re-bound leaves inherit it so they die with the island.
+    owner: ?*anyopaque = null,
 
     /// Re-resolve the Bound and emit the leaf's patch op. Called from the
     /// store's notify phase — the graph has settled, `arena` is scratch.
@@ -1055,7 +1062,7 @@ pub const Binder = struct {
         if (key != null) {
             const a = self.arena;
             for (self.variant_nodes) |k| seedNode(a, k, self.id, self.dom);
-            bindNodes(a, self.variant_nodes, self.id, self.dom, self.log);
+            bindNodes(a, self.variant_nodes, self.id, self.dom, self.log, self.owner);
         }
     }
 };
@@ -1104,11 +1111,12 @@ fn LiveGen(comptime S: type) type {
                 .bound_call = env.bound_call,
                 .bound_ctx = env.bound_ctx,
                 .variant_nodes = env.variant_nodes,
+                .owner = env.owner,
             };
             const sub = env.gpa.create(SubT) catch @panic("OOM");
             sub.* = st.watchCtx(b, &watchCb);
             b.sub_box = sub;
-            env.dom.addBinding(env.kind, env.id, env.name, b, &destroyBinder);
+            env.dom.addBinding(env.kind, env.id, env.name, b, env.owner, &destroyBinder);
             return b;
         }
 
@@ -1135,11 +1143,15 @@ fn LiveGen(comptime S: type) type {
 /// `a` is scratch for id resolution AND the emit-time arena stored in
 /// each binder — pass an arena that survives until the next refresh.
 pub fn bindTree(a: std.mem.Allocator, nodes: []const Node, dom: *Dom, log: *PatchLog) void {
-    bindNodes(a, nodes, "", dom, log);
+    bindNodes(a, nodes, "", dom, log, null);
 }
 
-fn bindNodes(a: std.mem.Allocator, nodes: []const Node, parent_path: []const u8, dom: *Dom, log: *PatchLog) void {
-    for (nodes) |n| bindNode(a, n, parent_path, dom, log);
+/// `owner` is the IslandCtx whose arena the current subtree's captures
+/// live in — null outside islands. Every binder created under it is
+/// recorded with that owner so `removeTracked` can drop the whole
+/// island subtree even when absolute `.id`s escape the prefix rule.
+fn bindNodes(a: std.mem.Allocator, nodes: []const Node, parent_path: []const u8, dom: *Dom, log: *PatchLog, owner: ?*anyopaque) void {
+    for (nodes) |n| bindNode(a, n, parent_path, dom, log, owner);
 }
 
 fn boundOf(v: Value) ?Bound {
@@ -1153,19 +1165,24 @@ fn attachLeaf(env_base: AttachEnv, lv: Live) void {
     _ = lv.attach(env_base);
 }
 
-fn bindNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, dom: *Dom, log: *PatchLog) void {
+fn bindNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, dom: *Dom, log: *PatchLog, owner: ?*anyopaque) void {
     switch (node) {
         .text, .raw => {},
-        .fragment => |kids| bindNodes(a, kids, parent_path, dom, log),
+        .fragment => |kids| bindNodes(a, kids, parent_path, dom, log, owner),
         .island => |isl| {
             const iid = islandId(a, isl, parent_path);
             // Register the marker so diff/bindIslands treat the subtree
             // as binder-owned. This walk already runs on stable nodes
             // (bindTree's once-built view, emitWhen's captured branch,
             // or bindIslands' island-arena copy), so no subtree copy is
-            // kept — markIsland only.
-            _ = ensureIsland(dom, iid, null);
-            bindNodes(a, isl.nodes, iid, dom, log);
+            // kept — markIsland only. The marker itself belongs to the
+            // CURRENT owner (nested islands die with their parent
+            // island); the island's own leaves belong to ITS ctx.
+            const ictx: *anyopaque = if (ensureIsland(dom, iid, null, owner)) |c|
+                @as(*anyopaque, c)
+            else
+                dom.bindingCtx(.island, iid, "") orelse @panic("island marker missing");
+            bindNodes(a, isl.nodes, iid, dom, log, ictx);
         },
         .variant => |v| {
             const anchor = anchorId(a, v, parent_path);
@@ -1184,12 +1201,13 @@ fn bindNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, dom: *Dom
                                 .bound_call = bnd.call,
                                 .bound_ctx = bnd.ctx,
                                 .variant_nodes = v.nodes,
+                                .owner = owner,
                             }, lv);
                         }
                     }
                 }
             }
-            if (resolveValue(a, v.key) != null) bindNodes(a, v.nodes, anchor, dom, log);
+            if (resolveValue(a, v.key) != null) bindNodes(a, v.nodes, anchor, dom, log, owner);
         },
         .element => |e| {
             const id = resolvedId(a, e.id, e.lid, parent_path);
@@ -1210,6 +1228,7 @@ fn bindNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, dom: *Dom
                         .store = bnd.ctx,
                         .bound_call = bnd.call,
                         .bound_ctx = bnd.ctx,
+                        .owner = owner,
                     }, lv);
                 }
                 if (e.text) |tv| {
@@ -1226,6 +1245,7 @@ fn bindNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, dom: *Dom
                                     .store = bnd.ctx,
                                     .bound_call = bnd.call,
                                     .bound_ctx = bnd.ctx,
+                                    .owner = owner,
                                 }, lv);
                             }
                         }
@@ -1235,10 +1255,10 @@ fn bindNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, dom: *Dom
             const path = id orelse parent_path;
             if (e.text != null) return; // .text owns the element's content
             switch (e.children) {
-                .nodes => |kids| bindNodes(a, kids, path, dom, log),
+                .nodes => |kids| bindNodes(a, kids, path, dom, log, owner),
                 .keyed => |kids| {
                     const pid = id orelse @panic("keyed children require a bound parent (.id/.lid)");
-                    for (kids) |k| bindNode(a, k, pid, dom, log);
+                    for (kids) |k| bindNode(a, k, pid, dom, log, owner);
                 },
             }
         },
@@ -1284,27 +1304,27 @@ fn destroyIslandCtx(p: *anyopaque) void {
 
 /// Register `iid` as binder-owned: `diff`/`seedNode`/`bindIslands` skip
 /// the subtree from then on. When `copy_nodes` is non-null the subtree
-/// is deep-copied into a binding-owned arena and the copy returned —
-/// `bindIslands` walks THAT so binder captures outlive the render
-/// arena. Returns the stable copy, or null when the island was already
-/// bound (or marked without a copy).
-fn ensureIsland(dom: *Dom, iid: []const u8, copy_nodes: ?[]const Node) ?[]const Node {
+/// is deep-copied into a binding-owned arena — `ctx.nodes` is the
+/// stable copy `bindIslands` walks so binder captures outlive the
+/// render arena. `owner` is the ENCLOSING island's ctx (null at top
+/// level): the marker binding is recorded under it so a parent island
+/// removal cascades through `Dom.dropBindings`. Returns the ctx, or
+/// null when the island was already bound.
+fn ensureIsland(dom: *Dom, iid: []const u8, copy_nodes: ?[]const Node, owner: ?*anyopaque) ?*IslandCtx {
     if (dom.findBinding(.island, iid, "")) return null;
     const ctx = dom.gpa.create(IslandCtx) catch @panic("OOM");
     ctx.* = .{
         .gpa = dom.gpa,
         .arena = std.heap.ArenaAllocator.init(dom.gpa),
     };
-    var out: ?[]const Node = null;
     if (copy_nodes) |ns| {
         const sa = ctx.arena.allocator();
         const cp = sa.alloc(Node, ns.len) catch @panic("OOM");
         for (ns, 0..) |n, i| cp[i] = dupeNodeDeep(sa, n);
         ctx.nodes = cp;
-        out = cp;
     }
-    dom.addBinding(.island, iid, "", ctx, &destroyIslandCtx);
-    return out;
+    dom.addBinding(.island, iid, "", ctx, owner, &destroyIslandCtx);
+    return ctx;
 }
 
 /// Deep-copy a node subtree into `a` — every slice/string re-allocated
@@ -1422,9 +1442,10 @@ fn bindIslandsNode(a: std.mem.Allocator, node: Node, parent_path: []const u8, do
             // Fresh island: deep-copy the subtree into a binding-owned
             // arena, then run the full bind walk on the COPY — every
             // capture (leaf ids are gpa-duped anyway; variant_nodes
-            // slices) then points at stable memory.
-            if (ensureIsland(dom, iid, isl.nodes)) |stable| {
-                bindNodes(a, stable, iid, dom, log);
+            // slices) then points at stable memory, and every binder
+            // records the IslandCtx as its owner.
+            if (ensureIsland(dom, iid, isl.nodes, null)) |ctx| {
+                bindNodes(a, ctx.nodes, iid, dom, log, ctx);
             }
         },
         .variant => |v| {
@@ -2604,4 +2625,57 @@ test "island without bindIslands degrades to plain diff behavior" {
     try std.testing.expectEqual(@as(usize, 1), log.patches.items.len);
     try expectText(log.patches.items[0], "top/v", "2");
     try std.testing.expectEqual(@as(usize, 0), dom.bindings.items.len);
+}
+
+test "island removal drops absolute-id variant binders via owner cascade" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var flag = FakeLiveStore(bool){ .gpa = std.testing.allocator, .v = true };
+    defer flag.deinit();
+    var txt = FakeLiveStore(u32){ .gpa = std.testing.allocator, .v = 7 };
+    defer txt.deinit();
+    var dom = Dom.init(std.testing.allocator);
+    defer dom.deinit();
+    var log = PatchLog.init(std.testing.allocator);
+    defer log.deinit();
+
+    // The island subtree holds a variant with an ABSOLUTE `.id` — its
+    // anchor "abs-w" (and the leaf under it) does not start with the
+    // removed "r1/" prefix, so prefix matching alone cannot find those
+    // bindings. They capture the island's arena (variant_nodes,
+    // operand slices) and MUST die via IslandCtx ownership — otherwise
+    // they keep watching stores and touch freed memory on emit.
+    const nodes = &.{el(a, .div, .{ .id = "r1" }, .{
+        island(a, .{ .lid = "isl" }, .{
+            variant(a, .{ .id = "abs-w" }, &flag, .{
+                el(a, .span, .{ .lid = "t", .text = &txt }, .{}),
+            }),
+        }),
+    })};
+    diff(a, nodes, &dom, &log);
+    log.clear();
+    bindIslands(a, nodes, &dom, &log);
+
+    // island marker + when_key binder + mounted text leaf.
+    try std.testing.expect(dom.findBinding(.island, "r1/isl", ""));
+    try std.testing.expect(dom.findBinding(.when_key, "abs-w", ""));
+    try std.testing.expect(dom.findBinding(.text, "abs-w/t", ""));
+    try std.testing.expectEqual(@as(usize, 3), dom.bindings.items.len);
+    try std.testing.expectEqual(@as(usize, 1), flag.watcherCount());
+    try std.testing.expectEqual(@as(usize, 1), txt.watcherCount());
+
+    // Removing the island's parent must detach EVERY binding the
+    // island owned — absolute ids included.
+    dom.removeTracked("r1", null);
+    try std.testing.expectEqual(@as(usize, 0), dom.bindings.items.len);
+    try std.testing.expectEqual(@as(usize, 0), flag.watcherCount());
+    try std.testing.expectEqual(@as(usize, 0), txt.watcherCount());
+
+    // Mutating the stores afterwards must not resurrect the dead
+    // binders or touch the freed island arena.
+    flag.emit(false);
+    txt.emit(9);
+    txt.emit(10);
+    try std.testing.expectEqual(@as(usize, 0), log.patches.items.len);
 }
