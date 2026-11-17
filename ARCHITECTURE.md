@@ -1983,3 +1983,45 @@ Static pass over zefx/forest/zserver/zmeta/zdb + all five example apps
   (render/live/binder), `defer finalize` on sqlite stmts.
 
 Fixes pending: C1 + H1 above are the two to schedule first.
+
+## Astra correctness review (2026-11-17, docs/astra-reviews/2026-11-17-astra-correctness.md)
+
+Codex `gpt-6-astra` pass over the same scope — deeper than the Devin
+pass, found additional issues. Delta vs the Devin review:
+
+- **Confirmed**: session-key 320B panic (remote crash); unbounded
+  settle loop; diamond/module identity clean; sqlite single-link.
+- **New High — UAF on response cookies**: `handle()` appends borrowed
+  `s.out_cookie`/`outCookie2()` slices to headers, releases `srv.mutex`,
+  THEN `req.respond()` serializes them — eviction or another action can
+  free/overwrite the session buffers in between. Fix: dupe cookie
+  values into the request arena under the lock.
+- **New High — island removal UAF**: `removeTracked` finds descendants
+  by ID-prefix only; nodes inside an island with absolute `.id` escape
+  cleanup — island arena freed while `when_key` binders still point
+  into it. Needs explicit subtree membership.
+- **New High — unbounded comment depth**: `addComment` has no depth
+  cap; recursive `commentNode` + recursive forest serialize/diff can
+  exhaust the worker stack on a persisted deep chain.
+- **The REAL diamond problem (semantic, zefx)**: `Engine.flush` drains
+  the whole `sample_queue` before re-settling stores — two samples on
+  one clock can observe `{new a, old doubled}` mid-propagation,
+  violating the settled-source guarantee. Not a module diamond (that
+  was verified clean) but a dataflow diamond.
+- App-level mediums: empty-title `edit_save` skips `bumpSeq` (clients
+  discard the removal patches); rejected first action loses the minted
+  `ztd`/`zfxu` cookie forever; board auth controls use plain Zig
+  conditionals — invisible to diff (need `when`/`variant`); post-delete
+  doesn't swap to not-found view (no structural boundary); cascade
+  deletes not transactional; client queued actions read global
+  route/csrf at send time (wrong route after soft-nav); no `popstate`
+  handler (Back/Forward desync); client attr whitelist (8 names)
+  rejects valid bound attrs.
+- Low: `Dom.orders` entries survive `removeTracked` (leak per deleted
+  keyed subtree); eviction test reads freed `a.incarnation`; framework
+  test modules ignore `-Doptimize`; `serve()` swallows `accept()`
+  errors incl. cancellation.
+
+Fix queue (priority): C1 key-bounds → cookie-header dupe → island
+subtree ownership → comment depth cap → sample settle semantics →
+settle-loop budget → app-level mediums.
