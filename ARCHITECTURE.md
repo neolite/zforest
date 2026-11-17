@@ -1866,3 +1866,55 @@ prints the layer convention in its next-steps (no empty dirs).
 
 Verified: `zig fmt`, `zig build gen` (no-op), `zig build test`,
 `zig build` green.
+
+## Framework/app module separation (done)
+
+`src/` is now 100% framework; every app — including its exe entry point
+— lives under `src/apps/<name>/main.zig`. One git repo, no split: the
+boundary is enforced by the Zig module graph instead of directory
+convention alone.
+
+- Named modules: `zefx`, `forest` (unchanged), plus NEW `zserver`
+  (`src/server/http.zig`, imports `{forest}`) and `zmeta`
+  (`src/zmeta/root.zig`, imports `{zefx, forest, zserver}`). Every exe
+  module gets all four; `zdb` (`src/db.zig`) is imported ONLY by the
+  sqlite-linked exes (zforest/zboard) since it sits at `src/` root,
+  outside every app's module path — relative imports can't reach it.
+  `zassets` (`src/assets.zig`) exists because `client.js`/`style.css`
+  stay at `src/` while `zserver`'s package path stops at `src/server/`
+  — only a `src/`-rooted module can `@embedFile` them.
+- Rules: no framework file may be pulled into an exe module via
+  relative import (kills the old `server/stream.zig` → todo test
+  dependency — that snapshot test moved to `apps/todo/app.zig` and
+  calls `zserver.writeSnapshotJson`); no app file may relative-import
+  `src/{zefx,forest,zmeta,server}/` — cross-boundary imports are named
+  modules only.
+- Type identity: `zserver.History` is THE retained-batch ring —
+  `zmeta/session.zig` and board's `app.zig`/`groups.zig` all import it
+  by name, so `Session(Deps)`/`Skel`/`Deps.streamHistory` signatures
+  line up. This is why zmeta could finally become a named module: the
+  earlier plain-source arrangement existed ONLY to keep `History` (and
+  `Dom`/`zefx`/`forest`) a single type across `server/` + `zmeta/` +
+  apps; with `server/` itself a named module (`zserver`) and zmeta
+  importing `{zefx, forest, zserver}`, the named-module path preserves
+  identity without relative-import gymnastics. No cycle: zserver is
+  generic over `Session` and never names zmeta — the arrow only points
+  app → framework.
+- Per-app `zmeta.zig` shims are now thin re-exports
+  (`pub const Session = @import("zmeta").Session` etc.) so page/app
+  imports stay short (`../zmeta.zig`) while resolving to the named
+  module. `gen.zig` emits `const zmeta = @import("../zmeta.zig");`
+  (was a computed `../../../zmeta/root.zig`); `scaffold.zig` writes
+  `main.zig` inside the app dir and prints the `src/apps/<name>/main.zig`
+  build.zig snippet.
+- Mains moved: `src/main.zig`→`apps/todo/`, `board_main.zig`→`apps/board/`,
+  `car_main.zig`→`apps/car/`, `mon_main.zig`→`apps/mon/`,
+  `zmeta_demo_main.zig`→`apps/zmeta_demo/` (all `git mv`, install names
+  unchanged). Test blocks updated: todo's dropped the board imports;
+  framework module tests (zserver/zmeta/zdb) run under their own
+  `addTest` targets — named-module tests do not propagate into exe test
+  binaries.
+
+Verified: `zig build gen` (regenerated `gen/routes.zig` ×5 — only the
+zmeta import line changed), `zig fmt --check`, `zig build test`,
+`zig build`, smoke (`zboard`/`zforest`/`zmeta-demo` serve SSR).

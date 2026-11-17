@@ -29,15 +29,18 @@ zig build new-app -- my_app
 ```
 
 creates `src/apps/my_app/` (`app.zig`, `pages/index.zig`,
-`actions.zig`, `zmeta.zig`) plus `src/my_app_main.zig`, and
-regenerates `gen/` — then prints the ~15 `build.zig` lines needed to
-register the executable. Unregistered apps are inert: nothing
-imports them, so `zig build`/`zig build test` stay green.
+`actions.zig`, `zmeta.zig`, `main.zig` — the exe entry point lives
+inside the app dir), and regenerates `gen/` — then prints the ~15
+`build.zig` lines needed to register the executable. Unregistered
+apps are inert: nothing imports them, so `zig build`/`zig build test`
+stay green.
 
 ## Project layout
 
 ```
 src/apps/<name>/
+├── main.zig         executable entry point (zserver.serve + app.Session)
+├── zmeta.zig        shim re-exporting the `zmeta` named module
 ├── pages/            file-based routes — one .zig per page
 │   ├── index.zig     "/"
 │   ├── about.zig     "/about"
@@ -57,8 +60,9 @@ src/apps/<name>/
 ├── features/         optional FSD slice — session-bound features
 ├── shared/           optional FSD slice — shared view components/helpers
 └── gen/              GENERATED — routes.zig + actions.zig (checked in)
-src/zmeta/            the framework: session.zig, h.zig, gen.zig, env.zig
-src/zmeta_demo_main.zig  executable entry point (flat src/ placement)
+src/zefx/ src/forest/ src/zmeta/ src/server/   framework (named modules)
+src/db.zig           sqlite wrapper — `zdb` module, sqlite exes only
+src/client.js src/style.css   embedded web assets (`zassets` module)
 ```
 
 Layer dirs are created on demand as the app grows — `entities/`

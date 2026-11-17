@@ -8,7 +8,7 @@
 //! tests set it per case); `null` means persistence is disabled and
 //! the app runs exactly like the old in-memory demo.
 const std = @import("std");
-const db = @import("../../db.zig");
+const db = @import("zdb");
 
 /// One persisted todo. `text` is owned — dupe it out of the column and
 /// free it together with the row list returned by `load`.

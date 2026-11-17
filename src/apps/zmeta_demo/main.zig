@@ -1,11 +1,11 @@
 //! zmeta-demo executable entry point: `zmeta-demo [port] [bind-ip]`.
-//! The app itself lives under `src/apps/zmeta_demo/` (pages/, app.zig,
-//! actions.zig manifest, generated gen/) — this flat `*_main.zig`
-//! matches the board/car/mon entry-point convention and keeps every
-//! relative import inside `src/` (the module path boundary).
+//! The app itself lives alongside this file under `src/apps/zmeta_demo/`
+//! (pages/, app.zig, actions.zig manifest, generated gen/) — the exe
+//! entry point lives INSIDE the app dir like every other app; only
+//! framework code stays at the `src/` root.
 const std = @import("std");
-const server = @import("server/http.zig");
-const app = @import("apps/zmeta_demo/app.zig");
+const server = @import("zserver");
+const app = @import("app.zig");
 
 /// Parse the optional `bind-ip` arg: a dotted IPv4 literal, or loopback
 /// for anything unparsable (safe default for a demo server).
@@ -26,7 +26,7 @@ pub fn main(init: std.process.Init) !void {
 test {
     // Pull app + generated modules into the test binary so their
     // colocated test blocks are discovered by `zig build test`.
-    _ = @import("apps/zmeta_demo/app.zig");
-    _ = @import("apps/zmeta_demo/gen/routes.zig");
-    _ = @import("apps/zmeta_demo/gen/actions.zig");
+    _ = @import("app.zig");
+    _ = @import("gen/routes.zig");
+    _ = @import("gen/actions.zig");
 }

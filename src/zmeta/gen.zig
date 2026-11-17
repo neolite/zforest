@@ -261,8 +261,7 @@ fn genApp(io: Io, arena: Allocator, app_dir: []const u8) !void {
     try checkConflicts(apis);
     std.mem.sort(Page, apis, {}, pageLessThan);
 
-    const zmeta_path = try zmetaImportPath(io, arena, app_dir);
-    const routes_src = try emitRoutes(arena, zmeta_path, parsed, apis, layouts.items, middlewares.items);
+    const routes_src = try emitRoutes(arena, parsed, apis, layouts.items, middlewares.items);
     const actions_src = try emitActions(io, arena, app_dir);
 
     const gen_rel = try std.fmt.allocPrint(arena, "{s}/gen", .{app_dir});
@@ -655,10 +654,13 @@ fn pageLessThan(_: void, a: Page, b: Page) bool {
 // emission: routes.zig
 // ─────────────────────────────────────────────
 
-fn emitRoutes(arena: Allocator, zmeta_path: []const u8, pages: []const Page, apis: []const Page, layouts: []const Layout, middlewares: []const Middleware) ![]const u8 {
+fn emitRoutes(arena: Allocator, pages: []const Page, apis: []const Page, layouts: []const Layout, middlewares: []const Middleware) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     const w = &out.writer;
 
+    // Generated files live in `<app>/gen/` and reach the framework
+    // through NAMED modules (`forest`, `zmeta`) plus the app-local
+    // `../zmeta.zig` shim — never a relative path into `src/zmeta/`.
     try w.writeAll(
         \\//! GENERATED FILE — do not edit. Regenerate with `zig build gen`
         \\//! (or `zig run src/zmeta/gen.zig -- <app-dir>`).
@@ -666,10 +668,9 @@ fn emitRoutes(arena: Allocator, zmeta_path: []const u8, pages: []const Page, api
         \\
         \\const std = @import("std");
         \\const forest = @import("forest");
-        \\const zmeta = @import("
+        \\const zmeta = @import("../zmeta.zig");
+        \\
     );
-    try w.writeAll(zmeta_path);
-    try w.writeAll("\");\n\n");
     for (pages) |p| {
         try w.print("const {s}_page = @import(\"../{s}\");\n", .{ p.tag, p.rel });
     }
@@ -1314,37 +1315,6 @@ fn parseActionManifest(arena: Allocator, src: []const u8) GenError![]const []con
     return error.BadAction;
 }
 
-/// Relative @import path from `<app>/gen/` to the repo's
-/// `src/zmeta/root.zig`: walk app_dir's ancestors for the directory
-/// containing `src/zmeta/root.zig`, then compute the ../.. path.
-fn zmetaImportPath(io: Io, arena: Allocator, app_dir: []const u8) ![]const u8 {
-    var dir: []const u8 = app_dir;
-    var tried_cwd = false;
-    while (true) {
-        const candidate = try std.fmt.allocPrint(arena, "{s}/src/zmeta/root.zig", .{dir});
-        Dir.cwd().access(io, candidate, .{}) catch {
-            const parent = std.fs.path.dirname(dir);
-            if (parent) |p| {
-                dir = p;
-                continue;
-            }
-            // Single-component relative paths have no dirname — the
-            // cwd itself is the last ancestor worth trying.
-            if (!tried_cwd) {
-                tried_cwd = true;
-                dir = ".";
-                continue;
-            }
-            return error.FileNotFound;
-        };
-        // Found the repo root at `dir`. Import path is relative from
-        // "<app>/gen" to "<dir>/src/zmeta/root.zig".
-        const from = try std.fmt.allocPrint(arena, "{s}/gen", .{app_dir});
-        const rel = try std.fs.path.relativeAlloc(arena, ".", null, from, candidate);
-        return rel;
-    }
-}
-
 // ─────────────────────────────────────────────
 // tests
 // ─────────────────────────────────────────────
@@ -1600,7 +1570,7 @@ test "emitRoutes runs applicable middleware before page prepare" {
     const apis = [_]Page{
         .{ .rel = "pages/api/ping.zig", .segs = &.{.{ .static = "ping" }}, .params = &.{}, .tag = "ping", .is_api = true },
     };
-    const src = try emitRoutes(arena, "zmeta", &pages, &apis, &[_]Layout{}, &middlewares);
+    const src = try emitRoutes(arena, &pages, &apis, &[_]Layout{}, &middlewares);
     const s = src;
 
     // Only the middleware some page uses is imported.

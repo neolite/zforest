@@ -1,11 +1,11 @@
-//! Per-app shim for the plain-source zmeta modules — keeps page/app
-//! imports short (`@import("../zmeta.zig")`, `@import("../../zmeta.zig")`)
-//! while preserving type identity: these are the SAME files
-//! `zmeta/root.zig` exports, reached relatively like `server/` does.
-//! zmeta is deliberately NOT a named build module (History type
-//! identity — see zmeta/root.zig).
-pub const Archetype = @import("../../zmeta/root.zig").Archetype;
-pub const Env = @import("../../zmeta/root.zig").Env;
-pub const Session = @import("../../zmeta/root.zig").Session;
-pub const queryParam = @import("../../zmeta/root.zig").queryParam;
-pub const h = @import("../../zmeta/root.zig").h;
+//! Per-app shim over the `zmeta` named build module — keeps page/app
+//! imports short (`@import("../../zmeta.zig")`, `@import("../zmeta.zig")`)
+//! while preserving type identity: `zmeta` is a real named module
+//! (build.zig), so `Session`/`Env`/`History` here are THE same types
+//! `zserver`/`zefx`/`forest` see — never relative-import
+//! `src/zmeta/` or `src/server/` from app code.
+pub const Archetype = @import("zmeta").Archetype;
+pub const Env = @import("zmeta").Env;
+pub const Session = @import("zmeta").Session;
+pub const queryParam = @import("zmeta").queryParam;
+pub const h = @import("zmeta").h;

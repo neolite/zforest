@@ -1,7 +1,8 @@
 //! zmeta app scaffold: `zig build new-app -- <name>` creates
-//! `src/apps/<name>/` (app.zig + pages/index.zig + actions.zig +
-//! zmeta.zig shim) and `src/<name>_main.zig`, then the build step
-//! regenerates `gen/` — the lightweight "create-app" of the repo.
+//! `src/apps/<name>/` — app.zig + pages/index.zig + actions.zig +
+//! zmeta.zig shim + main.zig (the exe entry point lives INSIDE the app
+//! dir; only framework code stays at the `src/` root) — then the build
+//! step regenerates `gen/`. The lightweight "create-app" of the repo.
 //!
 //! The scaffolded app still needs ~15 lines in build.zig (module +
 //! exe + install + run/test steps) — printed verbatim on success.
@@ -47,16 +48,14 @@ pub fn main(init: std.process.Init) !void {
     try writeAppFile(init.io, arena, app_dir, "pages/index.zig", try indexZig(arena, name));
     try writeAppFile(init.io, arena, app_dir, "actions.zig", actionsZig);
     try writeAppFile(init.io, arena, app_dir, "zmeta.zig", zmetaZig);
-
-    const main_rel = try std.fmt.allocPrint(arena, "src/{s}_main.zig", .{name});
-    try writeFile(init.io, main_rel, try mainZig(arena, name));
+    try writeAppFile(init.io, arena, app_dir, "main.zig", try mainZig(arena, name));
 
     std.debug.print(
-        \\zmeta-new: created {s}/ + {s}
+        \\zmeta-new: created {s}/ (incl. main.zig)
         \\next: register the exe in build.zig, then `zig build run-{s}`:
         \\
         \\    const {s}_mod = b.createModule(.{{
-        \\        .root_source_file = b.path("src/{s}_main.zig"),
+        \\        .root_source_file = b.path("src/apps/{s}/main.zig"),
         \\        .target = target,
         \\        .optimize = optimize,
         \\        .imports = &app_imports,
@@ -74,7 +73,7 @@ pub fn main(init: std.process.Init) !void {
         \\root; add entities/, features/, shared/ slice dirs as the app grows
         \\(docs/meta-framework.md §5.6 — zboard is the reference).
         \\
-    , .{ app_dir, main_rel, name, name, name, name, name, name, name, name, name, name, name, name, name, name, name, name, name, name });
+    , .{ app_dir, name, name, name, name, name, name, name, name, name, name, name, name, name, name, name, name, name, name });
 }
 
 fn validateName(name: []const u8) !void {
@@ -213,21 +212,24 @@ const actionsZig =
 ;
 
 const zmetaZig =
-    \\//! Per-app shim for the plain-source zmeta modules — keeps page/app
-    \\//! imports short while preserving type identity (same files
-    \\//! `zmeta/root.zig` exports; zmeta is NOT a named build module).
-    \\pub const Archetype = @import("../../zmeta/root.zig").Archetype;
-    \\pub const Env = @import("../../zmeta/root.zig").Env;
-    \\pub const Session = @import("../../zmeta/root.zig").Session;
-    \\pub const h = @import("../../zmeta/root.zig").h;
+    \\//! Per-app shim over the `zmeta` named build module — keeps
+    \\//! page/app imports short while preserving type identity
+    \\//! (`Session`/`Env` are THE same types `zserver` sees).
+    \\pub const Archetype = @import("zmeta").Archetype;
+    \\pub const Env = @import("zmeta").Env;
+    \\pub const Session = @import("zmeta").Session;
+    \\pub const queryParam = @import("zmeta").queryParam;
+    \\pub const h = @import("zmeta").h;
     \\
 ;
 
 fn mainZig(arena: Allocator, name: []const u8) ![]const u8 {
     return std.fmt.allocPrint(arena,
+        \\//! {s} executable entry point — lives inside the app dir like
+        \\//! every app; only framework code stays at the `src/` root.
         \\const std = @import("std");
-        \\const server = @import("server/http.zig");
-        \\const app = @import("apps/{s}/app.zig");
+        \\const server = @import("zserver");
+        \\const app = @import("app.zig");
         \\
         \\/// Parse the optional `bind-ip` arg: a dotted IPv4 literal, or
         \\/// loopback for anything unparsable (safe demo default).
@@ -247,10 +249,10 @@ fn mainZig(arena: Allocator, name: []const u8) ![]const u8 {
         \\}}
         \\
         \\test {{
-        \\    _ = @import("apps/{s}/app.zig");
+        \\    _ = @import("app.zig");
         \\}}
         \\
-    , .{ name, name, name });
+    , .{ name, name });
 }
 
 test "scaffold templates substitute the app name" {
@@ -263,7 +265,8 @@ test "scaffold templates substitute the app name" {
     const page_src = try indexZig(a, "my_app");
     try std.testing.expect(std.mem.indexOf(u8, page_src, "Hello my_app") != null);
     const main_src = try mainZig(a, "my_app");
-    try std.testing.expect(std.mem.indexOf(u8, main_src, "apps/my_app/app.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, main_src, "@import(\"zserver\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, main_src, "@import(\"app.zig\")") != null);
     try std.testing.expectError(error.BadName, validateName("9lives"));
     try std.testing.expectError(error.BadName, validateName("has-dash"));
 }

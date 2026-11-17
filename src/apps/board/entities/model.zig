@@ -15,7 +15,7 @@
 //! hashing) live in accounts.zig; the `m.<op>` methods below are thin
 //! delegates so call sites are unchanged.
 const std = @import("std");
-const db = @import("../../../db.zig");
+const db = @import("zdb");
 // Account-auth concern module (accounts.zig) — distinct from the
 // `accounts` row-list FIELD on BoardModel; bare `accounts.x` below
 // always means this import, `self.accounts`/`m.accounts` the field.

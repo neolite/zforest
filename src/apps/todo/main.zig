@@ -1,7 +1,7 @@
 const std = @import("std");
-const server = @import("server/http.zig");
-const todo = @import("apps/todo/app.zig");
-const todo_store = @import("apps/todo/store.zig");
+const server = @import("zserver");
+const todo = @import("app.zig");
+const todo_store = @import("store.zig");
 
 /// Parse the optional `bind-ip` arg: a dotted IPv4 literal, or loopback
 /// for anything unparsable (safe default for a demo server).
@@ -28,16 +28,12 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test {
-    // Pull server/session/model modules into the test binary so their
-    // colocated test blocks are discovered by `zig build test` (the
-    // modules are only reachable through serve(), which alone does not
-    // pull test decls). db.zig/model.zig/store.zig pull the sqlite
-    // amalgamation — compiled into this test binary and the zforest
-    // exe (todo persistence), never into zmon/zcar/zmeta-demo.
-    _ = @import("server/http.zig");
-    _ = @import("apps/todo/app.zig");
-    _ = @import("apps/todo/store.zig");
-    _ = @import("db.zig");
-    _ = @import("apps/board/entities/model.zig");
-    _ = @import("apps/board/app.zig");
+    // Pull app + persistence modules into the test binary so their
+    // colocated test blocks are discovered by `zig build test`.
+    // Framework modules (zefx/forest/zserver/zmeta) and the zdb sqlite
+    // wrapper run under their own named-module test targets in
+    // build.zig; zdb is only imported by the sqlite-linked exes.
+    _ = @import("app.zig");
+    _ = @import("store.zig");
+    _ = @import("zdb");
 }

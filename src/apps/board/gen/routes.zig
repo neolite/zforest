@@ -4,8 +4,7 @@
 
 const std = @import("std");
 const forest = @import("forest");
-const zmeta = @import("../../../zmeta/root.zig");
-
+const zmeta = @import("../zmeta.zig");
 const index_page = @import("../pages/index.zig");
 const b_page = @import("../pages/b/[slug].zig");
 const login_page = @import("../pages/login.zig");

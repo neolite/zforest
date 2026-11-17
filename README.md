@@ -2,7 +2,7 @@
 
 Server-driven UIs in Zig: the `zefx` reactive graph core plus `forest`, a
 fine-grained DOM patch layer, served by a minimal `std.http` server with a
-vanilla JS patch client. Four apps share the transport:
+vanilla JS patch client. Five apps share the transport:
 
 - **`zforest`** — the Todo demo (per-session view state; todos persist
   to SQLite keyed by a `ztd` client cookie).
@@ -22,6 +22,15 @@ vanilla JS patch client. Four apps share the transport:
   routes, typed params, generated action dispatch, `Session(Deps)`
   skeleton. See [docs/getting-started.md](docs/getting-started.md).
 
+The repo is split into a framework and its apps. `src/` is pure
+framework — `zefx/` (reactive graph), `forest/` (view/diff/snapshot),
+`zmeta/` (file-routing meta-framework), `server/` (HTTP/SSE transport),
+`db.zig` + `assets.zig` — exposed as the named Zig modules `zefx`,
+`forest`, `zserver`, `zmeta`, `zdb`, `zassets`. Each app is a
+self-contained `src/apps/<name>/` directory with its own `main.zig`
+entry point and may only reach the framework through those named
+modules — the dependency arrow never points back.
+
 <p align="center">
   <img src="docs/architecture.svg" alt="zforest architecture" width="900">
 </p>
@@ -40,7 +49,7 @@ zig build run-demo 8084 127.0.0.1            # zmeta demo on :8084
 ./zig-out/bin/zmon     [port] [bind-ip]
 ./zig-out/bin/zcar     [port] [bind-ip]
 ./zig-out/bin/zmeta-demo [port] [bind-ip]
-zig build test   # engine, forest, session, db, and board tests
+zig build test   # all module + app test targets
 ```
 
 ## zboard
@@ -54,8 +63,9 @@ paths and dangling ids return 404.
   whitelist, in-memory post/comment/user arrays, write-through SQLite
   inserts, one shared `next_id` across posts and comments (display
   `#N`), and `global_seq`, an atomic bumped on every mutation.
-- `src/db.zig` + `vendor/sqlite3/` — the official SQLite 3.54.1
-  amalgamation, compiled only into `zboard` and its test target.
+- `src/db.zig` (module `zdb`) + `vendor/sqlite3/` — the official
+  SQLite 3.54.1 amalgamation, linked only into the sqlite-using exes
+  (`zforest`, `zboard`) and their test targets.
 - `src/apps/board/` — the zmeta app dir (FSD layers): `app.zig`
   (session/deps + action handlers) + `groups.zig` (render groups) at
   the app root, `entities/` (model + accounts), `features/` (auth),

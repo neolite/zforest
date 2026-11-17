@@ -39,7 +39,7 @@ const groups = @import("groups.zig");
 const components = @import("shared/components.zig");
 const routes = @import("gen/routes.zig");
 const actions = @import("gen/actions.zig");
-const History = @import("../../server/history.zig").History;
+const History = @import("zserver").History;
 
 /// Flush-trigger payload — every mutation emits it; the `onPing`
 /// reducer (registered by `BoardDeps.wire`) bumps the patch revision in

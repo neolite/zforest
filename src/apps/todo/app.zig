@@ -13,6 +13,7 @@
 const std = @import("std");
 const zefx = @import("zefx");
 const forest = @import("forest");
+const zserver = @import("zserver");
 const zmeta = @import("zmeta.zig");
 const routes = @import("gen/routes.zig");
 const actions = @import("gen/actions.zig");
@@ -1040,4 +1041,62 @@ test "persistence: file db survives store close/reopen (restart)" {
         try std.testing.expectEqualStrings("restart me", b.deps.todos.items[0].title);
         try std.testing.expectEqual(@as(u32, 2), b.deps.next_id);
     }
+}
+
+// Moved here from `src/server/stream.zig` when the framework/app split
+// made zserver framework-only: the snapshot serializer is framework
+// code (`zserver.writeSnapshotJson`), but its coverage needs a real
+// session+view, which is app territory.
+test "snapshot serializes the view as a full-state ops array" {
+    const alloc = std.testing.allocator;
+    const s = createSession(alloc);
+    defer s.deinit();
+    s.seedDom();
+
+    var fields = titleFields(alloc, "say \"<b>hi</b>\"");
+    defer fields.deinit(alloc);
+    try s.dispatch("add", null, null, &fields);
+    s.log.clear(); // simulate publish consuming the batch
+
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    try zserver.writeSnapshotJson(s, s.seq.get(), &aw.writer);
+    const json = aw.writer.buffered();
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expect(root.get("rev").?.integer > 0);
+    const ops = root.get("ops").?.array.items;
+
+    // The keyed list ships as one html op carrying the row markup —
+    // HTML-escaped inside, JSON-escaped outside. Conditional chrome
+    // ships as `when` ops whose html covers the whole branch.
+    var html_op: ?[]const u8 = null;
+    var flt_op: ?[]const u8 = null;
+    var foot_op: ?[]const u8 = null;
+    var empty_op: ?[]const u8 = null;
+    for (ops) |op| {
+        const o = op.object;
+        const kind = o.get("op").?.string;
+        if (std.mem.eql(u8, kind, "html")) {
+            html_op = o.get("html").?.string;
+            try std.testing.expectEqualStrings("list", o.get("id").?.string);
+        } else if (std.mem.eql(u8, kind, "when")) {
+            const id = o.get("id").?.string;
+            if (std.mem.eql(u8, id, "w-flt")) flt_op = o.get("html").?.string;
+            if (std.mem.eql(u8, id, "w-foot")) foot_op = o.get("html").?.string;
+            if (std.mem.eql(u8, id, "w-empty")) empty_op = o.get("html").?.string;
+        } else {
+            // Covered subtrees emit no inner ops — flt-*/count live
+            // inside their anchors' html.
+            const id = o.get("id").?.string;
+            try std.testing.expect(!std.mem.startsWith(u8, id, "flt-"));
+            try std.testing.expect(!std.mem.eql(u8, id, "count"));
+        }
+    }
+    try std.testing.expect(std.mem.indexOf(u8, html_op.?, "&lt;b&gt;hi&lt;/b&gt;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, flt_op.?, "id=\"flt-all\" data-active=\"1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, foot_op.?, "id=\"count\">1 item left") != null);
+    try std.testing.expectEqualStrings("", empty_op.?);
 }

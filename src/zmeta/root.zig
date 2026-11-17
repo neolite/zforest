@@ -1,10 +1,12 @@
 //! zmeta — the meta-framework spike (docs/meta-framework.md §5).
 //!
-//! Plain source files, NOT a named build module: like `server/`, these
-//! files are compiled into whichever exe module imports them relatively,
-//! so `History`/`Dom`/`zefx`/`forest` types stay identical to the ones
-//! `server/http.zig` sees. Apps import `zmeta/root.zig` (or the files
-//! directly) — never `@import("zmeta")` as a package name.
+//! `zmeta` IS a named build module (build.zig): its root is this file,
+//! with named imports `{zefx, forest, zserver}` so `History`/`Dom`/
+//! `zefx`/`forest` types stay identical to the ones `server/http.zig`
+//! and every app see — one type per program, enforced by the module
+//! graph. Apps reach it through their per-app `zmeta.zig` shim
+//! (`pub const Session = @import("zmeta").Session;` etc.), which keeps
+//! page/app imports short without sacrificing type identity.
 
 pub const Archetype = @import("session.zig").Archetype;
 pub const Env = @import("env.zig").Env;

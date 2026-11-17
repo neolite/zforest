@@ -19,24 +19,28 @@ zforest is server-authoritative UI in Zig 0.17.1:
   (`diff` → `Dom`/`PatchLog`, `src/forest/dom.zig`, `patch.zig`).
   `bindTree` (view.zig:1024) is the opt-in live mode: bound leaves
   subscribe to stores and emit patch ops with no rebuild (zmon).
-- `src/server/http.zig` — generic `std.http` server. Cookie sessions
-  keyed `(token, route)` (`SessionStore.keyInto`, http.zig:98);
-  `GET /events` = SSE (`snapshot` then revisioned `patch` events,
-  `serveEvents` http.zig:440); `POST /action` = whitelisted
+- `src/server/http.zig` — generic `std.http` server, compiled as the
+  named module `zserver` (re-exports `History`/`writeSnapshotJson`).
+  Cookie sessions keyed `(token, route)` (`SessionStore.keyInto`,
+  http.zig:98); `GET /events` = SSE (`snapshot` then revisioned `patch`
+  events, `serveEvents` http.zig:440); `POST /action` = whitelisted
   `Session.dispatch` returning ACK `{rev}` only (http.zig:286-359);
   every other GET is a page via `Session.servePage`.
 - `src/client.js` — ~200-line framework-free op applier + delegated
   `data-on-*` event → action POST plumbing. No app knowledge, no
-  hydration, no router.
+  hydration, no router (embedded via the `zassets` module).
 - Apps: `src/apps/todo/` + `src/apps/car/` (per-session models, diff
   path, file-based routing), `src/apps/board/` (shared SQLite-backed
   `BoardModel` in `model.zig`, `global_seq` fan-out, render groups
   sharing one Dom/History/revision across N sessions, file routes for
   `/`, `/b/<slug>`, `/t/<post>`, `/t/<post>/c/<comment>`),
   `src/apps/mon/` (shared model + per-session live-bound
-  stores, `.live_shared`). All four apps run on the `zmeta.Session`
-  skeleton and the `src/apps/<name>/` file-based
-  routing convention (`pages/` + `actions.zig` + checked-in `gen/`).
+  stores, `.live_shared`), `src/apps/zmeta_demo/` (this convention's
+  showcase). All five apps run on the `zmeta.Session` skeleton and
+  the `src/apps/<name>/` file-based routing convention (`pages/` +
+  `actions.zig` + `main.zig` + `zmeta.zig` shim + checked-in `gen/`).
+  Framework↔app imports cross only through the named modules `zefx`,
+  `forest`, `zserver`, `zmeta` (+ `zdb` for the sqlite exes).
 
 The transport invariants a meta-framework must preserve: sessions are
 `(cookie token, route)` — route IS part of session identity; every
@@ -106,7 +110,7 @@ What codegen adds:
   route is.
 
 Costs/notes: the generator is a small Zig tool run as a `zig build`
-step (or `zig run`) scanning `apps/<name>/pages/`; output is a
+step (or `zig run`) scanning `src/apps/<name>/pages/`; output is a
 `gen/routes.zig` module. Dynamic segments are `[name]` (int or
 `[]const u8` params); catch-all `[...rest]` and optional catch-all
 `[[...rest]]` (last segment only, empty tail allowed),
@@ -575,29 +579,33 @@ kind+id+attr only; `Binder.variant_nodes` arena lifetime;
 
 ### 5.1 Directory conventions
 
+Landed layout (this proposal's `apps/` is `src/apps/`; the exe entry
+point `main.zig` and the `zmeta.zig` shim live inside the app dir —
+`layouts/` landed as `pages/**/_layout.zig` instead):
+
 ```
-apps/<name>/                  # new convention; existing src/*_app.zig untouched
-  app.zig                     # manifest: archetype, cookie name, actions, client assets
+src/apps/<name>/             # every app incl. its exe entry point
+  main.zig                   # z<name> exe: zserver.serve + app.Session
+  zmeta.zig                  # shim re-exporting the `zmeta` named module
+  app.zig                    # manifest: archetype, cookie name, actions, client assets
+  actions.zig                # action-name manifest
   pages/
-    index.zig                 # route "/"
-    b/[slug].zig              # route "/b/:slug"
-    t/[post]/index.zig        # route "/t/:post"
-    t/[post]/c/[comment].zig  # route "/t/:post/c/:comment"
-  layouts/
-    root.zig                  # optional; wraps every page
-    b.zig                     # optional; wraps /b/* pages
-  entities/                   # optional FSD slice — domain state leaf (§5.6)
-  features/                   # optional FSD slice — session-bound features
-  shared/                     # optional FSD slice — shared view components
-  gen/routes.zig              # GENERATED: Route union, parse, href, dispatch
-  gen/actions.zig             # GENERATED: comptime names + dispatch skeleton
+    index.zig                # route "/"
+    b/[slug].zig             # route "/b/:slug"
+    t/[post]/index.zig       # route "/t/:post"
+    t/[post]/c/[comment].zig # route "/t/:post/c/:comment"
+    _layout.zig              # optional; wraps pages in its dir + below
+    _middleware.zig          # optional; pre-prepare gate, same dir scoping
+  entities/                  # optional FSD slice — domain state leaf (§5.6)
+  features/                  # optional FSD slice — session-bound features
+  shared/                    # optional FSD slice — shared view components
+  gen/routes.zig             # GENERATED: Route union, parse, href, dispatch
+  gen/actions.zig            # GENERATED: comptime names + dispatch skeleton
 ```
 
 The generator is `src/zmeta/gen.zig`, run as a `zig build` step
-(`zig build gen` or automatically before compile). Output is checked
-in or regenerated deterministically — decide per §7; checked-in stubs
-are reviewable and sidestep Zig module-path issues with generated
-files in `.zig-cache`.
+(`zig build gen`). Output is checked in — reviewable and it sidesteps
+Zig module-path issues with generated files in `.zig-cache`.
 
 ### 5.2 The page contract
 
@@ -667,7 +675,7 @@ pipeline (membership sync + group render instead of `dom.reset` +
 `seedDom`) — landed on `feat/zmeta-grouped`, see ARCHITECTURE.md
 "zmeta: render-path overrides for grouped apps".
 This kills the ~150 lines of contract boilerplate every current app
-repeats (compare `apps/todo/app.zig` vs `board_app.zig` — the board
+repeats (compare `apps/todo/app.zig` vs `apps/board/app.zig` — the board
 app still hand-rolls what the skeleton now provides).
 It is the single biggest DX win and the lowest-risk piece: the
 contract is already stable and compile-enforced.

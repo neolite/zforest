@@ -1,9 +1,18 @@
 const std = @import("std");
 const stream_mod = @import("stream.zig");
-const History = @import("history.zig").History;
+const assets = @import("zassets");
+/// `zserver.History` is THE retained-batch ring type for the whole
+/// program — the zmeta skeleton and app render-group code must never
+/// relative-import `server/history.zig` (that would compile a second,
+/// incompatible copy). `writeSnapshotJson` is the SSE snapshot
+/// serializer (`server/stream.zig`) re-exported for app-side tests.
+pub const History = @import("history.zig").History;
+pub const writeSnapshotJson = stream_mod.writeSnapshotJson;
 
-const index_js = @embedFile("../client.js");
-const style_css = @embedFile("../style.css");
+// Embedded via the `zassets` module (src/assets.zig): this module's
+// package path is `src/server/` and cannot reach `../client.js`.
+const index_js = assets.client_js;
+const style_css = assets.style_css;
 
 const cookie_name = "zfxs"; // default; Session may declare `cookie_name`
 const max_sessions = 32;

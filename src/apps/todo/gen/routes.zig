@@ -4,8 +4,7 @@
 
 const std = @import("std");
 const forest = @import("forest");
-const zmeta = @import("../../../zmeta/root.zig");
-
+const zmeta = @import("../zmeta.zig");
 const index_page = @import("../pages/index.zig");
 
 /// Typed route — one tag per page file. Dynamic `[name]`

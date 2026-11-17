@@ -1,6 +1,9 @@
 const std = @import("std");
 const forest = @import("forest");
-const todo = @import("../apps/todo/app.zig");
+// NOTE: no app imports here — this file compiles inside the `zserver`
+// named module, which must stay framework-only. The snapshot test
+// against the real todo view lives in `src/apps/todo/app.zig` and
+// reaches `writeSnapshotJson` via `zserver.writeSnapshotJson`.
 
 /// Serialize the full-state snapshot event payload: {"rev":N,"ops":[…]}.
 /// `ops` is the declarative view emitted as an idempotent state dump —
@@ -17,63 +20,4 @@ pub fn writeSnapshotJson(s: anytype, rev: u64, writer: *std.Io.Writer) !void {
     const a = s.render_arena.allocator();
     try forest.writeSnapshotOps(a, s.buildViewNodes(a), writer);
     try writer.writeByte('}');
-}
-
-// ─────────────────────────────────────────────
-// tests
-// ─────────────────────────────────────────────
-
-test "snapshot serializes the view as a full-state ops array" {
-    const alloc = std.testing.allocator;
-    const s = todo.createSession(alloc);
-    defer s.deinit();
-    s.seedDom();
-
-    var fields: std.json.ObjectMap = .empty;
-    defer fields.deinit(alloc);
-    try fields.put(alloc, "title", .{ .string = "say \"<b>hi</b>\"" });
-    try s.dispatch("add", null, null, &fields);
-    s.log.clear(); // simulate publish consuming the batch
-
-    var aw: std.Io.Writer.Allocating = .init(alloc);
-    defer aw.deinit();
-    try writeSnapshotJson(s, s.seq.get(), &aw.writer);
-    const json = aw.writer.buffered();
-
-    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
-    defer parsed.deinit();
-    const root = parsed.value.object;
-    try std.testing.expect(root.get("rev").?.integer > 0);
-    const ops = root.get("ops").?.array.items;
-
-    // The keyed list ships as one html op carrying the row markup —
-    // HTML-escaped inside, JSON-escaped outside. Conditional chrome
-    // ships as `when` ops whose html covers the whole branch.
-    var html_op: ?[]const u8 = null;
-    var flt_op: ?[]const u8 = null;
-    var foot_op: ?[]const u8 = null;
-    var empty_op: ?[]const u8 = null;
-    for (ops) |op| {
-        const o = op.object;
-        const kind = o.get("op").?.string;
-        if (std.mem.eql(u8, kind, "html")) {
-            html_op = o.get("html").?.string;
-            try std.testing.expectEqualStrings("list", o.get("id").?.string);
-        } else if (std.mem.eql(u8, kind, "when")) {
-            const id = o.get("id").?.string;
-            if (std.mem.eql(u8, id, "w-flt")) flt_op = o.get("html").?.string;
-            if (std.mem.eql(u8, id, "w-foot")) foot_op = o.get("html").?.string;
-            if (std.mem.eql(u8, id, "w-empty")) empty_op = o.get("html").?.string;
-        } else {
-            // Covered subtrees emit no inner ops — flt-*/count live
-            // inside their anchors' html.
-            const id = o.get("id").?.string;
-            try std.testing.expect(!std.mem.startsWith(u8, id, "flt-"));
-            try std.testing.expect(!std.mem.eql(u8, id, "count"));
-        }
-    }
-    try std.testing.expect(std.mem.indexOf(u8, html_op.?, "&lt;b&gt;hi&lt;/b&gt;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, flt_op.?, "id=\"flt-all\" data-active=\"1\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, foot_op.?, "id=\"count\">1 item left") != null);
-    try std.testing.expectEqualStrings("", empty_op.?);
 }

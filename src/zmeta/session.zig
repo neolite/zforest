@@ -148,7 +148,10 @@
 const std = @import("std");
 const zefx = @import("zefx");
 const forest = @import("forest");
-const History = @import("../server/history.zig").History;
+// `zserver.History` — the ONE retained-batch ring type, shared with
+// server/http.zig and every app via the named module (relative-importing
+// server/history.zig here would compile an incompatible second copy).
+const History = @import("zserver").History;
 const Env = @import("env.zig").Env;
 
 /// Session archetypes (docs/meta-framework.md §4.1). Declare on `Deps`

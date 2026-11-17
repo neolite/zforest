@@ -1,8 +1,8 @@
 const std = @import("std");
-const server = @import("server/http.zig");
-const board_model = @import("apps/board/entities/model.zig");
-const board_app = @import("apps/board/app.zig");
-const board_seed = @import("apps/board/seed.zig");
+const server = @import("zserver");
+const board_model = @import("entities/model.zig");
+const board_app = @import("app.zig");
+const board_seed = @import("seed.zig");
 
 /// Parse the optional `bind-ip` arg: a dotted IPv4 literal, or loopback
 /// for anything unparsable (safe default for a demo server).
@@ -46,11 +46,16 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test {
-    _ = @import("db.zig");
-    _ = @import("apps/board/entities/model.zig");
-    _ = @import("apps/board/entities/accounts.zig");
-    _ = @import("apps/board/features/auth.zig");
-    _ = @import("apps/board/shared/markdown.zig");
-    _ = @import("apps/board/app.zig");
-    _ = @import("apps/board/seed.zig");
+    // Pull app modules into the test binary so their colocated test
+    // blocks are discovered by `zig build test`. The zdb sqlite
+    // wrapper is shared with the todo app and only imported by the
+    // sqlite-linked exes; framework modules run under their own
+    // named-module test targets.
+    _ = @import("zdb");
+    _ = @import("entities/model.zig");
+    _ = @import("entities/accounts.zig");
+    _ = @import("features/auth.zig");
+    _ = @import("shared/markdown.zig");
+    _ = @import("app.zig");
+    _ = @import("seed.zig");
 }

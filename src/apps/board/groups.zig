@@ -20,7 +20,7 @@
 //!     storage when it empties so tests/servers never leak it.
 const std = @import("std");
 const forest = @import("forest");
-const History = @import("../../server/history.zig").History;
+const History = @import("zserver").History;
 const zmeta = @import("zmeta.zig");
 const app = @import("app.zig");
 const model = @import("entities/model.zig");

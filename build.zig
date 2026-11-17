@@ -29,31 +29,87 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    // Framework modules — named so every exe compiles ONE copy of each
+    // type (History/Dom/zefx/forest): `zserver` (HTTP/SSE transport,
+    // generic over Session) sits below `zmeta` (session skeleton), and
+    // zmeta reaching `zserver.History` through the named module is what
+    // keeps the retained-batch ring type identical everywhere. No
+    // framework module may import app code — the dependency arrow only
+    // ever points app → framework.
+    //
+    // `client.js`/`style.css` stay at the `src/` root; `src/assets.zig`
+    // (module `zassets`) is the only file whose package path can embed
+    // them — `zserver`'s stops at `src/server/`. Only zserver imports it.
+    const assets_mod = b.addModule("zassets", .{
+        .root_source_file = b.path("src/assets.zig"),
+        .target = target,
+    });
+
+    const zserver_mod = b.addModule("zserver", .{
+        .root_source_file = b.path("src/server/http.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "forest", .module = forest_mod },
+            .{ .name = "zassets", .module = assets_mod },
+        },
+    });
+
+    const zmeta_mod = b.addModule("zmeta", .{
+        .root_source_file = b.path("src/zmeta/root.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "zefx", .module = zefx_mod },
+            .{ .name = "forest", .module = forest_mod },
+            .{ .name = "zserver", .module = zserver_mod },
+        },
+    });
+
     const app_imports = [_]std.Build.Module.Import{
         .{ .name = "zefx", .module = zefx_mod },
         .{ .name = "forest", .module = forest_mod },
+        .{ .name = "zserver", .module = zserver_mod },
+        .{ .name = "zmeta", .module = zmeta_mod },
+    };
+
+    // `db.zig` → named module `zdb`: it sits at the `src/` root, outside
+    // every app's module path (`src/apps/<name>/`), so relative imports
+    // can no longer reach it — and only the sqlite-linked exe modules
+    // (zforest/zboard) get the import, keeping "db is app-side, never
+    // framework" enforced by the module graph. The sqlite3 amalgamation
+    // + flags live on zdb itself: whichever exe imports it links the C
+    // exactly once per compilation.
+    const db_mod = b.addModule("zdb", .{
+        .root_source_file = b.path("src/db.zig"),
+        .target = target,
+    });
+    addSqlite(db_mod, b);
+
+    const sqlite_imports = [_]std.Build.Module.Import{
+        .{ .name = "zefx", .module = zefx_mod },
+        .{ .name = "forest", .module = forest_mod },
+        .{ .name = "zserver", .module = zserver_mod },
+        .{ .name = "zmeta", .module = zmeta_mod },
+        .{ .name = "zdb", .module = db_mod },
     };
 
     const exe_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("src/apps/todo/main.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &app_imports,
+        .imports = &sqlite_imports,
     });
-    // The todo app persists to sqlite (apps/todo/store.zig → db.zig).
-    addSqlite(exe_mod, b);
+    // The todo app persists to sqlite (apps/todo/store.zig → zdb).
     const exe = b.addExecutable(.{ .name = "zforest", .root_module = exe_mod });
 
     b.installArtifact(exe);
 
-    // The board app: shares the zefx/forest modules plus sqlite via db.zig.
+    // The board app: shares the zefx/forest modules plus sqlite via zdb.
     const zboard_mod = b.createModule(.{
-        .root_source_file = b.path("src/board_main.zig"),
+        .root_source_file = b.path("src/apps/board/main.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &app_imports,
+        .imports = &sqlite_imports,
     });
-    addSqlite(zboard_mod, b);
 
     const zboard = b.addExecutable(.{ .name = "zboard", .root_module = zboard_mod });
 
@@ -62,7 +118,7 @@ pub fn build(b: *std.Build) void {
     // The zmon dashboard: same zefx/forest modules, no sqlite — but libc
     // for time(3) (wall-clock uptime/start timestamps).
     const zmon_mod = b.createModule(.{
-        .root_source_file = b.path("src/mon_main.zig"),
+        .root_source_file = b.path("src/apps/mon/main.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &app_imports,
@@ -74,7 +130,7 @@ pub fn build(b: *std.Build) void {
 
     // The zcar booking app: same zefx/forest modules, no sqlite, no libc.
     const zcar_mod = b.createModule(.{
-        .root_source_file = b.path("src/car_main.zig"),
+        .root_source_file = b.path("src/apps/car/main.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &app_imports,
@@ -98,9 +154,9 @@ pub fn build(b: *std.Build) void {
     gen_run.setCwd(b.path("."));
     gen_step.dependOn(&gen_run.step);
 
-    // `zig build new-app -- <name>`: scaffold src/apps/<name>/ +
-    // src/<name>_main.zig, then regenerate gen/ for the new app in the
-    // same invocation (the scaffold step must finish first).
+    // `zig build new-app -- <name>`: scaffold src/apps/<name>/ (incl.
+    // main.zig), then regenerate gen/ for the new app in the same
+    // invocation (the scaffold step must finish first).
     const scaffold_mod = b.createModule(.{
         .root_source_file = b.path("src/zmeta/scaffold.zig"),
         .target = target,
@@ -119,7 +175,7 @@ pub fn build(b: *std.Build) void {
     // The zmeta demo app: file-based routes with typed params + the
     // comptime action table, served through the zmeta Session skeleton.
     const demo_mod = b.createModule(.{
-        .root_source_file = b.path("src/zmeta_demo_main.zig"),
+        .root_source_file = b.path("src/apps/zmeta_demo/main.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &app_imports,
@@ -159,16 +215,23 @@ pub fn build(b: *std.Build) void {
     const forest_tests = b.addTest(.{ .root_module = forest_mod });
     const run_forest_tests = b.addRunArtifact(forest_tests);
 
-    // exe tests pull db.zig/model.zig/store.zig via main.zig's test
-    // block — the amalgamation is compiled into this test binary only.
-    const exe_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &app_imports,
-    });
-    addSqlite(exe_test_mod, b);
-    const exe_tests = b.addTest(.{ .root_module = exe_test_mod });
+    // Framework module tests: zserver covers http/history; zmeta covers
+    // the Session skeleton (its tests instantiate Session(TestDeps)).
+    const zserver_tests = b.addTest(.{ .root_module = zserver_mod });
+    const run_zserver_tests = b.addRunArtifact(zserver_tests);
+
+    const zmeta_tests = b.addTest(.{ .root_module = zmeta_mod });
+    const run_zmeta_tests = b.addRunArtifact(zmeta_tests);
+
+    // zdb tests: the sqlite wrapper's own round-trip coverage (the
+    // amalgamation is compiled into this test binary via zdb itself).
+    const db_tests = b.addTest(.{ .root_module = db_mod });
+    const run_db_tests = b.addRunArtifact(db_tests);
+
+    // exe tests pull app files via each app's main.zig test block;
+    // zdb/db.zig tests run under the zdb target above. sqlite is only
+    // linked into the zforest/zboard exe + test binaries.
+    const exe_tests = b.addTest(.{ .root_module = exe_mod });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
     const zboard_tests = b.addTest(.{ .root_module = zboard_mod });
@@ -192,6 +255,9 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_zefx_tests.step);
     test_step.dependOn(&run_forest_tests.step);
+    test_step.dependOn(&run_zserver_tests.step);
+    test_step.dependOn(&run_zmeta_tests.step);
+    test_step.dependOn(&run_db_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_zboard_tests.step);
     test_step.dependOn(&run_zmon_tests.step);
