@@ -1955,3 +1955,31 @@ Verified: examples repo `zig build` (5 exes), `zig build test`,
 `zig build gen` (idempotent), `zig build new-app -- smoketest`
 (scaffold + regen), smoke `zmeta-demo`/`zboard`; framework repo
 `zig build`/`zig build test`/`zig fmt --check` green.
+
+## Correctness review (2026-11-17, docs/astra-reviews/2026-11-17-framework-correctness.md)
+
+Static pass over zefx/forest/zserver/zmeta/zdb + all five example apps
+(post repo-split). Headline results:
+
+- **Diamond problem: verified clean.** Every cross-boundary import is a
+  named module; `dep.module()` in zforest-examples preserves type
+  identity; sqlite3.c links once per exe; generated `gen/*.zig` reuses
+  the per-app `zmeta.zig` shim (named module), no relative escape.
+- **Critical found — remote crash**: `SessionStore.keyInto` panics when
+  `(cookie token, route)` exceeds a fixed 320-byte buffer
+  (`server/http.zig:111-118`); cookie token and route (`x-zforest-route`
+  header, `/events?r=`, request path) are attacker-controlled and reach
+  `lookup` unauthenticated → one request aborts the process. Fix:
+  bound token/route lengths before lookup (or heap fallback) + test.
+- **High — unbounded settle loop**: `Engine.flush`/`drainQueue` have no
+  iteration cap; a cyclic watcher/store pair spins forever inside
+  `srv.mutex` → silent full-server stall. Fix direction: flush budget.
+- Medium: snapshot ops don't cover attrs/text REMOVED from the view
+  (latent desync); `srv.mutex` scope is global (dispatch→flush→render,
+  servePage, syncPull, eviction deinit); implicit length invariants
+  (`groups.keyStringInto` 256B panic relies on `max_account_name_len`).
+- Verified safe: generational unwatch, incarnation+membershipEpoch SSE
+  recovery, bounded History/sessions/conns, arena discipline
+  (render/live/binder), `defer finalize` on sqlite stmts.
+
+Fixes pending: C1 + H1 above are the two to schedule first.
