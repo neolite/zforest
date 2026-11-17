@@ -88,6 +88,9 @@ never affect `gen/` output.
 | dynamic route params | `pub const params = struct { id: u64 }` or `{ tag: []const u8 }` | typed at compile time; int segments parse, string segments slice; `[...rest]` catch-all (last only) takes the raw tail, `[[...rest]]` is the optional variant (matches the bare prefix too); failures → 404 |
 | `getServerSideProps` / middleware gate | `pub fn prepare(...) !void` | runs before view; `error.NotFound` → 404 |
 | API routes | `pages/api/<name>.zig` → `pub fn api(a, s, p, env) ![]const u8` | GET /api/* → JSON body, no HTML shell; `Deps.serveApi` dispatches |
+| Raw endpoints | `pages/rss.xml.zig` (dotted final segment) → same `api` shape | GET /rss.xml → raw body, no HTML shell; `Deps.serveRaw` dispatches; default `text/plain` |
+| Endpoint content type | `pub const content_type = "application/rss+xml";` in an api/raw file | forwarded by generated `routes.contentType` → `Deps.endpointContentType`; api default `application/json`, raw default `text/plain` |
+| Per-page `<head>` | `pub fn head(a, s, p, env) ?zmeta.HeadSpec` in a page file | `HeadSpec{ .title, .extra, .lang }` — title overrides `page_title`, `extra` is raw HTML before `</head>`, `lang` overrides `page_lang` (default `"en"`); runs after `prepare` |
 | Live island page | `pub const live = true;` in a page file | view built once per servePage; `bindTree` pushes leaf ops, `render()` skips diff — all dynamic content must be store-bound |
 | Per-leaf island | `h.island(a, .{ .id = "…" }, children)` in any view | transparent subtree; after first bind `diff` skips it and `Bound.live` leaves inside push ops — all dynamic content inside must be store-bound |
 | server component | `pub fn view(a, s, p, env) h.Node` | returns a `forest.Node` tree via `h.*` |
@@ -139,6 +142,53 @@ A `_layout.zig` in a subdirectory wraps only that subtree; layouts
 nest outermost-first (`pages/_layout.zig` → `pages/item/_layout.zig`
 → page). `_`-prefixed files are reserved — other names are rejected
 by `zig build gen`.
+
+### SEO head + raw endpoints
+
+For a file-based blog you typically want three things: per-page
+`<title>`/meta/OG/JSON-LD, an RSS feed, and `robots.txt`/`sitemap.xml`.
+
+**Per-page head.** Add an optional `head` fn to any page file:
+
+```zig
+pub fn head(a: std.mem.Allocator, s: anytype, p: params, env: *const zmeta.Env) ?zmeta.HeadSpec {
+    return .{
+        .title = "My Post — blog",
+        .extra = "<meta name=\"description\" content=\"…\">",
+        .lang = "en",
+    };
+}
+```
+
+All fields are optional — `null` keeps the default (`title` ←
+`Deps.page_title`, `lang` ← `Deps.page_lang` which itself defaults
+to `"en"`). `extra` is raw HTML emitted verbatim before `</head>`.
+`head` runs after the page's `prepare`, so typed params are already
+validated. The app `zmeta.zig` shim needs
+`pub const HeadSpec = @import("zmeta").HeadSpec;` for pages to name
+the type.
+
+**Raw endpoints.** A page file whose final segment contains a dot is
+a raw endpoint — `pages/rss.xml.zig` serves `GET /rss.xml`,
+`pages/blog/feed.atom.zig` serves `/blog/feed.atom`. It uses the same
+handler shape as api endpoints:
+
+```zig
+pub const params = struct {};
+pub const content_type = "application/rss+xml"; // optional
+
+pub fn api(a: std.mem.Allocator, s: anytype, p: params, env: *const zmeta.Env) ![]const u8 {
+    return "<rss>…</rss>";
+}
+```
+
+Raw endpoints bypass the HTML shell, views, layouts, and middleware.
+Without `content_type` the server defaults to `text/plain` (api
+endpoints default to `application/json`). The dotted final segment
+is always literal — `[id].xml` is rejected; parent dirs may still use
+`[name]` params. Wire the Deps hooks in app.zig (`serveRaw`,
+`endpointContentType`, `headSpec`) — see
+`docs/meta-framework.md` §2.10 for the full contract.
 
 ### Middleware
 

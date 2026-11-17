@@ -61,7 +61,25 @@ const sse_heartbeat_ticks = 200; // 200 * 50ms ≈ 10s
 ///     the same response (board's `zfxa` account auth); probed via
 ///     `@hasDecl` so single-cookie apps are unaffected. Must be a decl
 ///     (fn/const), not a field — @hasDecl can't see struct fields.
-///   - `page_title` / `page_class` — <title> text and <main> class.
+///   - Optional `serveApi(path, writer) !bool` — JSON endpoint hook for
+///     GETs under /api/*; writes a body and returns true → the response
+///     skips the HTML shell. Default content-type application/json.
+///   - Optional `serveRaw(path, writer) !bool` — raw-endpoint hook for
+///     dotted `pages/**` files (zmeta: pages/rss.xml.zig → /rss.xml);
+///     writes a raw body and returns true → skips the HTML shell.
+///     Default content-type text/plain. Runs after serveApi, before
+///     page rendering, so a literal dotted route beats a dynamic
+///     page segment.
+///   - Optional `endpointContentType(path) ?[]const u8` — per-endpoint
+///     content-type override for api/raw responses (zmeta generates it
+///     from page files' `pub const content_type`); null → the
+///     per-kind default above.
+///   - Optional `headSpec() ?zmeta.HeadSpec` — per-page `<head>`
+///     overrides for the CURRENT route; called by renderHead after
+///     servePage resolved the route (setRoute + prepare ran). Null →
+///     page_title/page_lang defaults and no extra markup.
+///   - `page_title` / `page_class` / `page_lang` — <title> text,
+///     <main> class, <html lang>. `page_lang` defaults to "en".
 ///   - `cookie_name` — session cookie name (avoid host-wide clobbering).
 ///   - Optional `readCookies(cookie_header)` — called before dispatch so
 ///     the session can pick up auxiliary cookies (board's `zfxu`).
@@ -265,15 +283,47 @@ fn statusOf(err: anyerror) std.http.Status {
     };
 }
 
+/// Resolve the endpoint content type for a served api/raw response:
+/// `Session.endpointContentType` (zmeta-generated routes.contentType)
+/// when the session declares it, else null → caller picks the
+/// per-kind default. The returned slice lives in `arena`.
+fn endpointContentType(
+    comptime Session: type,
+    s: *Session,
+    path: []const u8,
+    arena: std.mem.Allocator,
+) ?[]const u8 {
+    if (!@hasDecl(Session, "endpointContentType")) return null;
+    const ct = s.endpointContentType(path) orelse return null;
+    return arena.dupe(u8, ct) catch @panic("OOM");
+}
+
 fn renderHead(comptime Session: type, s: *Session, out: anytype) !void {
     const title = if (@hasDecl(Session, "page_title")) Session.page_title else "zforest";
     const pclass = if (@hasDecl(Session, "page_class")) Session.page_class else "app";
+    var lang: []const u8 = if (@hasDecl(Session, "page_lang")) Session.page_lang else "en";
+    var head_title: []const u8 = title;
+    var extra: ?[]const u8 = null;
+    // Per-page head spec: the route is already resolved — handle()
+    // runs servePage BEFORE renderHead precisely so the session can
+    // dispatch to the page's optional `head` fn (zmeta HeadSpec).
+    // Sessions without the decl (or pages without `head`) get the
+    // defaults — output is byte-identical to the fixed shell.
+    if (@hasDecl(Session, "headSpec")) {
+        if (s.headSpec()) |spec| {
+            if (spec.title) |t| head_title = t;
+            if (spec.extra) |e| extra = e;
+            if (spec.lang) |l| lang = l;
+        }
+    }
+    try out.writeAll("<!doctype html><html lang=\"");
+    try out.writeAll(lang);
     try out.writeAll(
-        \\<!doctype html><html lang="en"><head><meta charset="utf-8">
+        \\"><head><meta charset="utf-8">
         \\<meta name="viewport" content="width=device-width,initial-scale=1">
         \\<title>
     );
-    try out.writeAll(title);
+    try out.writeAll(head_title);
     try out.writeAll(
         \\</title><link rel="stylesheet" href="/style.css">
         \\<meta name="zforest-csrf" content="
@@ -282,9 +332,11 @@ fn renderHead(comptime Session: type, s: *Session, out: anytype) !void {
     try out.writeAll("\"><meta name=\"zforest-rev\" content=\"");
     var rbuf: [24]u8 = undefined;
     try out.writeAll(std.fmt.bufPrint(&rbuf, "{d}", .{s.seq.get()}) catch unreachable);
-    try out.writeAll(
-        "\"></head>\n<body><main class=\"",
-    );
+    // Close the rev meta, THEN page-contributed head markup — extra
+    // must never land inside an attribute value.
+    try out.writeAll("\">");
+    if (extra) |e| try out.writeAll(e);
+    try out.writeAll("</head>\n<body><main class=\"");
     try out.writeAll(pclass);
     try out.writeAll(
         "\">\n",
@@ -456,23 +508,45 @@ fn handle(
         // later patch renders until the next navigation.
         const qmark = std.mem.indexOfScalar(u8, req.head.target, '?');
         e.setQuery(if (qmark) |i| req.head.target[i + 1 ..] else "");
-        // Api endpoints (pages/api/) answer JSON without the HTML
-        // shell — try them before page rendering.
+        // Api endpoints (pages/api/) answer without the HTML shell —
+        // try them before raw endpoints and page rendering.
         if (@hasDecl(Session, "serveApi")) {
             var jw: std.Io.Writer.Allocating = .init(arena);
             const api_ok = e.serveApi(rpath, &jw.writer) catch return .internal_server_error;
             if (api_ok) {
-                extra.append(arena, .{ .name = "content-type", .value = "application/json" }) catch @panic("OOM");
+                const ct = endpointContentType(Session, e, rpath, arena);
+                extra.append(arena, .{ .name = "content-type", .value = ct orelse "application/json" }) catch @panic("OOM");
+                out_body.appendSlice(arena, jw.writer.buffered()) catch @panic("OOM");
+                return .ok;
+            }
+        }
+        // Raw endpoints (dotted `pages/**` files — pages/rss.xml.zig →
+        // "/rss.xml") also bypass the HTML shell; default text/plain.
+        // They run before servePage so a literal dotted route always
+        // beats a dynamic page segment ("/feed.xml" over "/[slug]").
+        if (@hasDecl(Session, "serveRaw")) {
+            var jw: std.Io.Writer.Allocating = .init(arena);
+            const raw_ok = e.serveRaw(rpath, &jw.writer) catch return .internal_server_error;
+            if (raw_ok) {
+                const ct = endpointContentType(Session, e, rpath, arena);
+                extra.append(arena, .{ .name = "content-type", .value = ct orelse "text/plain" }) catch @panic("OOM");
                 out_body.appendSlice(arena, jw.writer.buffered()) catch @panic("OOM");
                 return .ok;
             }
         }
         extra.append(arena, .{ .name = "content-type", .value = "text/html; charset=utf-8" }) catch @panic("OOM");
-        // Render into the request arena; servePage decides route validity.
+        // The BODY renders before the head: the head spec is route-
+        // dependent, so servePage must resolve the route (setRoute +
+        // prepare inside it) before renderHead can ask the session
+        // for it. The body lands in its own arena buffer and is
+        // appended between head and tail — the emitted document is
+        // byte-identical to the old head-first order.
+        var bw: std.Io.Writer.Allocating = .init(arena);
+        const ok = e.servePage(rpath, &bw.writer) catch @panic("OOM");
+        if (!ok) return .not_found;
         var aw: std.Io.Writer.Allocating = .init(arena);
         renderHead(Session, e, &aw.writer) catch @panic("OOM");
-        const ok = e.servePage(rpath, &aw.writer) catch @panic("OOM");
-        if (!ok) return .not_found;
+        aw.writer.writeAll(bw.writer.buffered()) catch @panic("OOM");
         renderTail(&aw.writer) catch @panic("OOM");
         if (fresh_token) |tok| {
             extra.append(arena, .{

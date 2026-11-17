@@ -10,6 +10,9 @@
 
 pub const Archetype = @import("session.zig").Archetype;
 pub const Env = @import("env.zig").Env;
+/// Per-page `<head>` override spec — page files return it from an
+/// optional `pub fn head(a, s, p, env) ?zmeta.HeadSpec`.
+pub const HeadSpec = @import("head.zig").HeadSpec;
 pub const queryParam = @import("env.zig").queryParam;
 pub const Session = @import("session.zig").Session;
 /// Fluent HTML builder over `forest.view` — `h.div(a).id("x").node()`.

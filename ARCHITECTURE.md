@@ -2072,3 +2072,65 @@ cascade transactions) remain app-side work in zforest-examples.
 - **Build**: `.optimize` now propagates to every framework module
   (`zefx`/`forest`/`zassets`/`zserver`/`zmeta`/`zdb`), not just the
   gen/scaffold test roots — `-Doptimize` actually reaches tests.
+
+## zmeta: SEO head specs + raw endpoints (done)
+
+Blog-shaped apps need per-page `<title>`/meta/OG/JSON-LD, an RSS
+feed, and `robots.txt`/`sitemap.xml`. Both primitives landed on the
+same seam: typed dispatch resolved AFTER `prepare`, emitted only for
+apps that opt in (existing `gen/routes.zig` output is byte-identical).
+
+- **Head spec** — a page file may declare
+  `pub fn head(a, s, p, env) ?zmeta.HeadSpec` returning
+  `HeadSpec{ .title, .extra, .lang }` (all optional). `title`
+  overrides `Deps.page_title`, `extra` is raw HTML emitted verbatim
+  before `</head>` (NOT escaped — the page owns correctness), `lang`
+  overrides `Deps.page_lang` (new const, default `"en"`). `head` is
+  INFALLIBLE by contract — it returns `?HeadSpec`, not an error
+  union; allocations use `catch @panic("OOM")` or `return null`.
+  Rationale: head is best-effort metadata — a failure should degrade
+  to shell defaults, not 500 a page that already rendered. The
+  generated `routes.headSpec` dispatches on `s.deps.route` like
+  `prepare`/`viewNodes`, so `head` sees validated params and
+  `prepare`'s `s.deps` writes.
+- **Render order changed** — `http.zig handle` now runs `servePage`
+  BEFORE `renderHead`: the body renders into its own arena buffer,
+  then head, then head+body+tail are concatenated. The emitted
+  document is byte-identical (servePage never bumps `seq`, so the
+  `zforest-rev` meta stamps the same value), and a `prepare` 404
+  never reaches head rendering. This is the only clean way to give
+  `head` the resolved typed route — the alternative (a second
+  route-match inside renderHead) would duplicate parse logic.
+- **Raw endpoints** — a `pages/**` file whose FINAL segment contains
+  a dot is a raw endpoint (`pages/rss.xml.zig` → `/rss.xml`,
+  `pages/blog/feed.atom.zig` → `/blog/feed.atom`). The dotted segment
+  is always a literal static: `[id].xml` is rejected (`BadSegment`)
+  because bracketed stems are excluded from `isRawEndpoint` — which
+  also keeps `[...rest]`/`[[...rest]]` catch-all PAGES out of the
+  raw path (their stems contain dots!). Parent segments may still be
+  `[name]` dynamics. Files reuse the api handler shape
+  (`params` + `api(a, s, p, env) ![]const u8`) and get their own
+  `RawRoute` union + `parseRaw`/`raw`/`rawPath`, bypassing the HTML
+  shell, views, layouts, and middleware. `Deps.serveRaw` is the
+  session hook; the server tries it after `serveApi`, before
+  `servePage` — literal dotted routes beat dynamic page segments at
+  request time. Identical segment shapes across page/raw lists are a
+  gen-time `DuplicateRoute` (`rss.xml.zig` vs `rss.xml/index.zig`);
+  different shapes are legal (dispatch order decides).
+- **Content types** — endpoint files (api or raw) may declare
+  `pub const content_type = "..."`; generated `routes.contentType`
+  forwards it via `@hasDecl`/`P.content_type` (any comptime string
+  expr works — gen only probes decl PRESENCE to gate emission).
+  Server defaults per kind: `application/json` for `/api/*`,
+  `text/plain` for raw. Static decl only — no per-request types.
+- **New session hooks** — `Deps.serveRaw(path, writer) !bool`,
+  `Deps.endpointContentType(path) ?[]const u8`,
+  `Deps.headSpec(s, a, env) ?HeadSpec` (a = render arena), and
+  `Deps.page_lang` const — all `@hasDecl`-optional on the skeleton,
+  so hand-rolled sessions (board's aliases) and old Deps keep working
+  unchanged.
+- **Opt-in emission** — `headSpec`/`raw`/`contentType` blocks are
+  emitted only when a decl is detected (`hasHeadDecl`,
+  `hasContentTypeDecl`, `raws.len != 0`), preserving byte-identical
+  `gen/routes.zig` for apps that don't opt in — verified: `zig build
+  gen` in zforest-examples is a no-op.

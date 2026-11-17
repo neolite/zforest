@@ -11,6 +11,9 @@
 //!   pages/t/[post]/c/[c].zig    → route "/t/:post/c/:c"
 //!   pages/tag/[tag].zig         → route "/tag/:tag" (string param)
 //!   pages/docs/[...rest].zig    → route "/docs/*" (catch-all, last only)
+//!   pages/rss.xml.zig           → raw endpoint "/rss.xml" (dotted last
+//!                                 segment; api handler shape, raw body)
+//!   pages/blog/feed.atom.zig    → raw endpoint "/blog/feed.atom"
 //!   pages/_layout.zig           → root layout wrapping EVERY page
 //!   pages/item/_layout.zig      → layout wrapping pages under pages/item/
 //!   pages/_middleware.zig       → root middleware gating EVERY page
@@ -27,9 +30,13 @@
 //! page's directory or an ancestor (outermost-first, BEFORE the page's
 //! own `prepare`); any error → servePage 404s, same as prepare.
 //! `pages/api/` endpoints never run middleware (v1 scope: pages
-//! only). Env is immutable — middleware passes data through app-owned
-//! `s.deps` fields. Other `_`-prefixed files are rejected — underscore
-//! is reserved for framework files.
+//! only). Raw endpoints (a final segment containing a dot, outside
+//! api/) follow the same rule — they dispatch through `raw()` and
+//! never see layouts/middleware. The dotted final segment is always
+//! a literal static — "[id].xml" is rejected; parent segments may
+//! still be `[name]` dynamics. Env is immutable — middleware passes
+//! data through app-owned `s.deps` fields. Other `_`-prefixed files
+//! are rejected — underscore is reserved for framework files.
 //!
 //! Every page file MUST declare `pub const params = struct { ... };`
 //! (empty `struct {}` for static routes) — field names must match the
@@ -42,9 +49,14 @@
 //! routes stay valid after the request buffer is gone.
 //!
 //! Optional page decls: `pub fn prepare(s, p, env) !void` (any error →
-//! 404 before view work) and `pub fn view(a, s, p, env) forest.Node`
-//! (required). Optional `pub const route_name = "tag"` overrides the
-//! filename-derived union tag.
+//! 404 before view work), `pub fn view(a, s, p, env) forest.Node`
+//! (required), and `pub fn head(a, s, p, env) ?zmeta.HeadSpec`
+//! (per-page `<head>` overrides — title/extra/lang; see
+//! src/zmeta/head.zig). Optional `pub const route_name = "tag"`
+//! overrides the filename-derived union tag. Api and raw endpoint
+//! files may declare `pub const content_type = "..."` — the generated
+//! `contentType` lookup forwards it (absent → the server's per-kind
+//! default: application/json for api, text/plain for raw).
 //!
 //! actions.zig manifest: `pub const actions = .{ "ping", "like" };` —
 //! each name becomes `act.<name>` (comptime-checked in `.on` attrs) and
@@ -121,6 +133,18 @@ const Page = struct {
     /// `pages/api/` endpoint — not a page route; dispatched through
     /// `parseApi`/`api` instead of `parseRoute`/`viewNodes`.
     is_api: bool = false,
+    /// Dotted final segment outside `pages/api/` — a raw endpoint
+    /// (`pages/rss.xml.zig` → "/rss.xml"); dispatched through
+    /// `parseRaw`/`raw` like api endpoints but with a raw (non-JSON)
+    /// body and no HTML shell.
+    is_raw: bool = false,
+    /// Page file declares `pub fn head` — the generated `headSpec`
+    /// dispatch is emitted only when at least one page does, keeping
+    /// output byte-identical for apps that don't opt in.
+    has_head: bool = false,
+    /// Endpoint file (api or raw) declares `pub const content_type` —
+    /// presence gates emission of the generated `contentType` lookup.
+    has_content_type: bool = false,
 };
 
 /// A directory-scoped `pages/` framework file — `_layout.zig`
@@ -225,17 +249,22 @@ fn genApp(io: Io, arena: Allocator, app_dir: []const u8) !void {
     }
 
     // `pages/api/` files are endpoints, not page routes — separate
-    // union/dispatch, no layouts.
+    // union/dispatch, no layouts. Dotted final segments OUTSIDE api/
+    // (`pages/rss.xml.zig`) are raw endpoints — same handler shape,
+    // raw body, own union/dispatch.
     var api_rels: std.ArrayList([]const u8) = .empty;
+    var raw_rels: std.ArrayList([]const u8) = .empty;
     var real_page_rels: std.ArrayList([]const u8) = .empty;
     for (page_rels.items) |rel| {
         if (std.mem.startsWith(u8, rel, "pages/api/")) {
             try api_rels.append(arena, rel);
+        } else if (isRawEndpoint(rel)) {
+            try raw_rels.append(arena, rel);
         } else {
             try real_page_rels.append(arena, rel);
         }
     }
-    if (real_page_rels.items.len == 0 and api_rels.items.len == 0) return error.FileNotFound;
+    if (real_page_rels.items.len == 0 and api_rels.items.len == 0 and raw_rels.items.len == 0) return error.FileNotFound;
 
     // Sort scoped files outermost-first (shallowest dir, then
     // lexicographic) so `wraps`/`middleware` indices compose
@@ -249,6 +278,7 @@ fn genApp(io: Io, arena: Allocator, app_dir: []const u8) !void {
         parsed[i] = try buildPage(arena, rel, src, false);
         parsed[i].wraps = try pageWraps(arena, rel, layouts.items);
         parsed[i].middleware = try pageWraps(arena, rel, middlewares.items);
+        parsed[i].has_head = hasHeadDecl(src);
     }
     try checkConflicts(parsed);
     std.mem.sort(Page, parsed, {}, pageLessThan);
@@ -257,11 +287,26 @@ fn genApp(io: Io, arena: Allocator, app_dir: []const u8) !void {
     for (api_rels.items, 0..) |rel, i| {
         const src = try readAppFile(io, arena, app_dir, rel);
         apis[i] = try buildPage(arena, rel, src, true);
+        apis[i].has_content_type = hasContentTypeDecl(src);
     }
     try checkConflicts(apis);
     std.mem.sort(Page, apis, {}, pageLessThan);
 
-    const routes_src = try emitRoutes(arena, parsed, apis, layouts.items, middlewares.items);
+    var raws = try arena.alloc(Page, raw_rels.items.len);
+    for (raw_rels.items, 0..) |rel, i| {
+        const src = try readAppFile(io, arena, app_dir, rel);
+        raws[i] = try buildPage(arena, rel, src, false);
+        raws[i].is_raw = true;
+        raws[i].has_content_type = hasContentTypeDecl(src);
+    }
+    try checkConflicts(raws);
+    std.mem.sort(Page, raws, {}, pageLessThan);
+    // A raw endpoint and a page may not share a segment shape —
+    // `pages/rss.xml.zig` ("/rss.xml") vs `pages/rss.xml/index.zig`
+    // would be unresolvable (serveRaw wins silently otherwise).
+    try checkRawPageConflicts(raws, parsed);
+
+    const routes_src = try emitRoutes(arena, parsed, apis, raws, layouts.items, middlewares.items);
     const actions_src = try emitActions(io, arena, app_dir);
 
     const gen_rel = try std.fmt.allocPrint(arena, "{s}/gen", .{app_dir});
@@ -362,6 +407,56 @@ fn middlewareId(arena: Allocator, dir: []const u8) GenError![]const u8 {
 /// "pages/index.zig" → "pages", "pages/item/[id].zig" → "pages/item".
 fn pageDir(rel: []const u8) []const u8 {
     return std.fs.path.dirname(rel).?;
+}
+
+/// A `pages/**` file (outside `pages/api/`) is a RAW endpoint when its
+/// last path segment — the filename stem before `.zig` — contains a
+/// dot: "pages/rss.xml.zig" → "/rss.xml", "pages/blog/feed.atom.zig"
+/// → "/blog/feed.atom". Dots in DIRECTORY segments don't count
+/// ("pages/a.b/c.zig" is a normal page at "/a.b/c"), and the dotted
+/// segment itself is always a plain literal static — bracketed
+/// segments ("[id].xml", "[...rest]") are never raw; "[id].xml.zig"
+/// is rejected by routeSegments as BadSegment. Raw endpoints use the
+/// api handler shape (`api(a, s, p, env)`) but bypass the HTML shell.
+fn isRawEndpoint(rel: []const u8) bool {
+    // api/ wins: "pages/api/rss.xml.zig" is a JSON api endpoint at
+    // "/api/rss.xml", never a raw endpoint.
+    if (std.mem.startsWith(u8, rel, "pages/api/")) return false;
+    const base = std.fs.path.basename(rel);
+    if (!std.mem.endsWith(u8, base, ".zig")) return false;
+    const stem = base[0 .. base.len - ".zig".len];
+    // The dotted segment must be a plain literal — brackets mean a
+    // dynamic/catch-all segment ("[...rest].zig" is a catch-all PAGE,
+    // "[id].xml.zig" is rejected later by routeSegments as BadSegment).
+    if (std.mem.indexOfAny(u8, stem, "[]") != null) return false;
+    return std.mem.indexOfScalar(u8, stem, '.') != null;
+}
+
+/// `pub fn head(...)` presence — gates `headSpec` emission. The '('
+/// check disambiguates "pub fn header"-style names; every occurrence
+/// is scanned so an earlier non-match can't hide a later real decl.
+fn hasHeadDecl(src: []const u8) bool {
+    return hasDeclWith(src, "pub fn head", '(');
+}
+
+/// `pub const content_type = ...` presence on an endpoint file —
+/// gates `contentType` emission. Value is read by the generated code
+/// via `@hasDecl`/`P.content_type`, not parsed here.
+fn hasContentTypeDecl(src: []const u8) bool {
+    return hasDeclWith(src, "pub const content_type", '=');
+}
+
+/// True when `src` contains `needle` followed (after whitespace) by
+/// `terminator` — a cheap decl-presence probe matching the file's
+/// own convention (same substring-scan limits as parseParams).
+fn hasDeclWith(src: []const u8, needle: []const u8, terminator: u8) bool {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, src, from, needle)) |idx| {
+        const i = skipWs(src, idx + needle.len);
+        if (i < src.len and src[i] == terminator) return true;
+        from = idx + 1;
+    }
+    return false;
 }
 
 /// A scoped file (layout or middleware) applies to a page when its
@@ -563,7 +658,9 @@ fn checkParamSegments(segs: []const Seg, params: []const Param) GenError!void {
 /// Default tag: static segments joined with "_", or "index" for "/".
 /// Dynamics contribute nothing; a catch-all contributes its param
 /// name so "/docs/[...rest]" can't collide with "/docs" or
-/// "/docs/[id]" tags.
+/// "/docs/[id]" tags. Dots in static segments ("feed.xml" raw
+/// endpoints, dotted directory names) sanitize to "_" — previously
+/// such files failed BadRouteName, so no existing tag changes.
 fn deriveTag(arena: Allocator, segs: []const Seg) GenError![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     var first = true;
@@ -575,7 +672,9 @@ fn deriveTag(arena: Allocator, segs: []const Seg) GenError![]const u8 {
         };
         if (!first) buf.append(arena, '_') catch return error.OutOfMemory;
         first = false;
-        buf.appendSlice(arena, name) catch return error.OutOfMemory;
+        for (name) |c| {
+            buf.append(arena, if (c == '.') '_' else c) catch return error.OutOfMemory;
+        }
     }
     if (buf.items.len == 0) return "index";
     return buf.items;
@@ -600,6 +699,25 @@ fn checkConflicts(pages: []const Page) GenError!void {
                     .{ p.tag, p.rel, q.rel },
                 );
                 return error.DuplicateTag;
+            }
+        }
+    }
+}
+
+/// Cross-list conflict: a raw endpoint and a page route may not share
+/// a segment shape — `pages/rss.xml.zig` ("/rss.xml") vs
+/// `pages/rss.xml/index.zig` would be unresolvable (serveRaw would
+/// silently win). Different shapes are fine: "/feed.xml" raw beats a
+/// "/[slug]" page at request time by dispatch order, documented.
+fn checkRawPageConflicts(raws: []const Page, pages: []const Page) GenError!void {
+    for (raws) |r| {
+        for (pages) |p| {
+            if (sameShape(r.segs, p.segs)) {
+                std.debug.print(
+                    "zmeta-gen: ambiguous routes {s} and {s} — same segment shape\n",
+                    .{ r.rel, p.rel },
+                );
+                return error.DuplicateRoute;
             }
         }
     }
@@ -654,7 +772,7 @@ fn pageLessThan(_: void, a: Page, b: Page) bool {
 // emission: routes.zig
 // ─────────────────────────────────────────────
 
-fn emitRoutes(arena: Allocator, pages: []const Page, apis: []const Page, layouts: []const Layout, middlewares: []const Middleware) ![]const u8 {
+fn emitRoutes(arena: Allocator, pages: []const Page, apis: []const Page, raws: []const Page, layouts: []const Layout, middlewares: []const Middleware) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     const w = &out.writer;
 
@@ -676,6 +794,9 @@ fn emitRoutes(arena: Allocator, pages: []const Page, apis: []const Page, layouts
     }
     for (apis) |p| {
         try w.print("const {s}_api = @import(\"../{s}\");\n", .{ p.tag, p.rel });
+    }
+    for (raws) |p| {
+        try w.print("const {s}_raw = @import(\"../{s}\");\n", .{ p.tag, p.rel });
     }
     // Layout imports — only the ones some page actually wraps with.
     var used = std.AutoHashMap(usize, void).init(arena);
@@ -803,11 +924,12 @@ fn emitRoutes(arena: Allocator, pages: []const Page, apis: []const Page, layouts
         \\pub fn validPath(path: []const u8) bool {
         \\
     );
-    if (apis.len != 0) {
-        try w.writeAll("    return parseRoute(path) != null or apiPath(path);\n");
-    } else {
-        try w.writeAll("    return parseRoute(path) != null;\n");
-    }
+    var vp = std.ArrayList(u8).empty;
+    try vp.appendSlice(arena, "    return parseRoute(path) != null");
+    if (apis.len != 0) try vp.appendSlice(arena, " or apiPath(path)");
+    if (raws.len != 0) try vp.appendSlice(arena, " or rawPath(path)");
+    try vp.appendSlice(arena, ";\n");
+    try w.writeAll(vp.items);
     try w.writeAll(
         \\}
         \\
@@ -915,6 +1037,42 @@ fn emitRoutes(arena: Allocator, pages: []const Page, apis: []const Page, layouts
         \\
     );
 
+    // Per-page `<head>` spec — emitted ONLY when some page declares
+    // `pub fn head`, so apps that don't opt in keep byte-identical
+    // generated output (and the session's headSpec hook stays absent
+    // → renderHead uses the page_title/page_lang defaults).
+    var any_head = false;
+    for (pages) |p| {
+        if (p.has_head) any_head = true;
+    }
+    if (any_head) {
+        try w.writeAll(
+            \\
+            \\fn headFor(comptime Page: type, s: anytype, p: anytype, a: std.mem.Allocator, env: *const zmeta.Env) ?zmeta.HeadSpec {
+            \\    if (@hasDecl(Page, "head")) return Page.head(a, s, p, env);
+            \\    return null;
+            \\}
+            \\
+            \\/// Per-page `<head>` overrides for the CURRENT route —
+            \\/// `Deps.headSpec` delegates here. The session calls it
+            \\/// after servePage resolved the route (the page's
+            \\/// `prepare` already ran); `a` is the session render
+            \\/// arena. Pages without `pub fn head` → null → the
+            \\/// server's page_title/page_lang defaults apply.
+            \\pub fn headSpec(s: anytype, a: std.mem.Allocator, env: *const zmeta.Env) ?zmeta.HeadSpec {
+            \\    return switch (s.deps.route) {
+            \\
+        );
+        for (pages) |p| {
+            try w.print("        .{s} => |p| headFor({s}_page, s, p, a, env),\n", .{ p.tag, p.tag });
+        }
+        try w.writeAll(
+            \\    };
+            \\}
+            \\
+        );
+    }
+
     // ── api endpoints (pages/api/) — JSON, no view/layouts ──
     if (apis.len != 0) {
         try w.writeAll(
@@ -1001,6 +1159,134 @@ fn emitRoutes(arena: Allocator, pages: []const Page, apis: []const Page, layouts
             \\}
             \\
         );
+    }
+
+    // ── raw endpoints (dotted pages/** files) — raw body, no shell ──
+    // Emitted only when the app has them, so existing apps keep
+    // byte-identical generated output.
+    if (raws.len != 0) {
+        try w.writeAll(
+            \\/// Typed raw-endpoint route — one tag per dotted
+            \\/// `pages/**` file ("pages/rss.xml.zig" → "/rss.xml").
+            \\/// Handlers return a raw body (RSS/XML/text) through the
+            \\/// same `api(a, s, params, env)` shape as api endpoints;
+            \\/// the server skips the HTML shell and defaults the
+            \\/// content type to text/plain (see `contentType`).
+            \\pub const RawRoute = union(enum) {
+            \\
+        );
+        for (raws) |p| {
+            try w.print("    {s}: {s}_raw.params,\n", .{ p.tag, p.tag });
+        }
+        try w.writeAll("};\n\n");
+
+        // parseRaw — same segment machinery as parseRoute (full path,
+        // no prefix strip); the dotted final segment is a literal
+        // static, parent segments may be [name] dynamics.
+        var raw_max_depth: usize = 0;
+        for (raws) |p| raw_max_depth = @max(raw_max_depth, p.segs.len);
+        const raw_buf = @max(@as(usize, 1), raw_max_depth);
+        try w.writeAll(
+            \\/// Parse a raw-endpoint path ("/rss.xml", "/blog/feed.atom")
+            \\/// — same segment rules and precedence as parseRoute.
+            \\/// Returns null on any mismatch → the caller falls
+            \\/// through to page handling (404 for unknown paths).
+            \\pub fn parseRaw(path: []const u8) ?RawRoute {
+            \\    if (!std.mem.startsWith(u8, path, "/")) return null;
+            \\    var segs: [
+        );
+        try w.print("{d}", .{raw_buf});
+        try w.writeAll(
+            \\][]const u8 = undefined;
+            \\    var n: usize = 0;
+            \\    var it = std.mem.splitScalar(u8, path[1..], '/');
+            \\    while (it.next()) |seg| {
+            \\        if (n < segs.len) segs[n] = seg;
+            \\        n += 1;
+            \\    }
+            \\    return result: {
+            \\
+        );
+        for (raws) |p| {
+            try emitRouteMatch(arena, w, p, "RawRoute");
+        }
+        try w.writeAll(
+            \\        break :result null;
+            \\    };
+            \\}
+            \\
+            \\/// Pure raw-route pre-check — pairs with `validPath`.
+            \\pub fn rawPath(path: []const u8) bool {
+            \\    return parseRaw(path) != null;
+            \\}
+            \\
+            \\/// Raw-endpoint dispatch: returns the handler's body, or
+            \\/// null when `path` isn't a raw route. `a` is the caller's
+            \\/// arena; `env` carries route+query.
+            \\pub fn raw(a: std.mem.Allocator, s: anytype, path: []const u8, env: *const zmeta.Env) !?[]const u8 {
+            \\    const r = parseRaw(path) orelse return null;
+            \\    const body = switch (r) {
+            \\
+        );
+        for (raws) |p| {
+            try w.print("        .{s} => |p| try {s}_raw.api(a, s, p, env),\n", .{ p.tag, p.tag });
+        }
+        try w.writeAll(
+            \\    };
+            \\    return body;
+            \\}
+            \\
+        );
+    }
+
+    // ── endpoint content types — emitted only when some api/raw file
+    // declares `pub const content_type`, keeping output identical for
+    // apps that don't opt in. The decl is read via @hasDecl so any
+    // comptime string expression works; absent → null → the server's
+    // per-kind default (application/json api, text/plain raw).
+    var any_ct = false;
+    for (apis) |p| {
+        if (p.has_content_type) any_ct = true;
+    }
+    for (raws) |p| {
+        if (p.has_content_type) any_ct = true;
+    }
+    if (any_ct) {
+        try w.writeAll(
+            \\
+            \\fn endpointCt(comptime P: type) ?[]const u8 {
+            \\    if (@hasDecl(P, "content_type")) return P.content_type;
+            \\    return null;
+            \\}
+            \\
+            \\/// Content-type lookup for api/raw endpoint responses —
+            \\/// `Deps.endpointContentType` delegates here. Forwards each
+            \\/// file's `pub const content_type`; null → the server's
+            \\/// per-kind default.
+            \\pub fn contentType(path: []const u8) ?[]const u8 {
+            \\
+        );
+        if (apis.len != 0) {
+            try w.writeAll(
+                \\    if (parseApi(path)) |r| return switch (r) {
+                \\
+            );
+            for (apis) |p| {
+                try w.print("        .{s} => endpointCt({s}_api),\n", .{ p.tag, p.tag });
+            }
+            try w.writeAll("    };\n");
+        }
+        if (raws.len != 0) {
+            try w.writeAll(
+                \\    if (parseRaw(path)) |r| return switch (r) {
+                \\
+            );
+            for (raws) |p| {
+                try w.print("        .{s} => endpointCt({s}_raw),\n", .{ p.tag, p.tag });
+            }
+            try w.writeAll("    };\n");
+        }
+        try w.writeAll("    return null;\n}\n");
     }
     return out.toOwnedSlice() catch return error.OutOfMemory;
 }
@@ -1570,7 +1856,7 @@ test "emitRoutes runs applicable middleware before page prepare" {
     const apis = [_]Page{
         .{ .rel = "pages/api/ping.zig", .segs = &.{.{ .static = "ping" }}, .params = &.{}, .tag = "ping", .is_api = true },
     };
-    const src = try emitRoutes(arena, &pages, &apis, &[_]Layout{}, &middlewares);
+    const src = try emitRoutes(arena, &pages, &apis, &[_]Page{}, &[_]Layout{}, &middlewares);
     const s = src;
 
     // Only the middleware some page uses is imported.
@@ -1597,4 +1883,213 @@ test "emitRoutes runs applicable middleware before page prepare" {
 
     // search arm (no middleware): unchanged single-line form.
     try std.testing.expect(std.mem.indexOf(u8, s, ".search => |p| try preparePage(search_page, s, p, env),") != null);
+}
+
+test "isRawEndpoint detects dotted final segments only" {
+    // Dotted filename stem → raw endpoint.
+    try std.testing.expect(isRawEndpoint("pages/rss.xml.zig"));
+    try std.testing.expect(isRawEndpoint("pages/blog/feed.atom.zig"));
+    try std.testing.expect(isRawEndpoint("pages/index.xml.zig"));
+    try std.testing.expect(isRawEndpoint("pages/a.b.c.zig"));
+    // Plain pages, dotted DIRECTORY segments, bracketed segments
+    // (catch-alls/dynamics — "[...rest]" contains dots!), and api/
+    // files are not.
+    try std.testing.expect(!isRawEndpoint("pages/index.zig"));
+    try std.testing.expect(!isRawEndpoint("pages/about.zig"));
+    try std.testing.expect(!isRawEndpoint("pages/a.b/c.zig")); // dot in dir only
+    try std.testing.expect(!isRawEndpoint("pages/docs/[...rest].zig")); // catch-all page
+    try std.testing.expect(!isRawEndpoint("pages/wiki/[[...rest]].zig")); // optional catch-all
+    try std.testing.expect(!isRawEndpoint("pages/item/[id].zig"));
+    try std.testing.expect(!isRawEndpoint("pages/[id].xml.zig")); // dynamic dotted → rejected later
+    try std.testing.expect(!isRawEndpoint("pages/api/rss.xml.zig")); // api wins
+}
+
+test "routeSegments treats dotted finals as literal statics" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const rss = try routeSegments(arena, "pages/rss.xml.zig", false);
+    try std.testing.expectEqual(@as(usize, 1), rss.len);
+    try std.testing.expectEqualStrings("rss.xml", rss[0].static);
+    const feed = try routeSegments(arena, "pages/blog/feed.atom.zig", false);
+    try std.testing.expectEqual(@as(usize, 2), feed.len);
+    try std.testing.expectEqualStrings("blog", feed[0].static);
+    try std.testing.expectEqualStrings("feed.atom", feed[1].static);
+    // Dynamic PARENT segments still work for raw endpoints.
+    const dyn = try routeSegments(arena, "pages/blog/[id]/feed.xml.zig", false);
+    try std.testing.expectEqual(@as(usize, 3), dyn.len);
+    try std.testing.expectEqualStrings("id", dyn[1].dynamic);
+    // The dotted segment itself is always literal — "[id].xml" and
+    // friends are rejected outright.
+    try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/[id].xml.zig", false));
+    try std.testing.expectError(error.BadSegment, routeSegments(arena, "pages/feed.[id].zig", false));
+}
+
+test "deriveTag sanitizes dots in static segments" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const segs = [_]Seg{.{ .static = "feed.xml" }};
+    try std.testing.expectEqualStrings("feed_xml", try deriveTag(arena, &segs));
+    const nested = [_]Seg{ .{ .static = "blog" }, .{ .static = "feed.atom" } };
+    try std.testing.expectEqualStrings("blog_feed_atom", try deriveTag(arena, &nested));
+    // Undotted tags are untouched.
+    const plain = [_]Seg{.{ .static = "about" }};
+    try std.testing.expectEqualStrings("about", try deriveTag(arena, &plain));
+}
+
+test "hasHeadDecl and hasContentTypeDecl probe decl presence" {
+    try std.testing.expect(hasHeadDecl(
+        \\pub const params = struct {};
+        \\pub fn head(a: anytype, s: anytype, p: anytype, env: anytype) ?anytype { return null; }
+        \\pub fn view() void {}
+    ));
+    // "pub fn header" must not match; a later real decl still does.
+    try std.testing.expect(hasHeadDecl(
+        \\pub fn header() void {}
+        \\pub fn head() void {}
+    ));
+    try std.testing.expect(!hasHeadDecl("pub fn header() void {}\npub const params = struct {};"));
+    try std.testing.expect(hasContentTypeDecl(
+        \\pub const params = struct {};
+        \\pub const content_type = "application/rss+xml";
+    ));
+    try std.testing.expect(!hasContentTypeDecl("pub const params = struct {};"));
+    // Field access (no '=') must not match.
+    try std.testing.expect(!hasContentTypeDecl("const x = y.content_type;"));
+}
+
+test "checkRawPageConflicts rejects same-shape raw/page pairs" {
+    const raw = Page{
+        .rel = "pages/rss.xml.zig",
+        .segs = &.{.{ .static = "rss.xml" }},
+        .params = &.{},
+        .tag = "rss_xml",
+        .is_raw = true,
+    };
+    const clash = Page{
+        .rel = "pages/rss.xml/index.zig",
+        .segs = &.{.{ .static = "rss.xml" }},
+        .params = &.{},
+        .tag = "rss_xml_index",
+    };
+    const ok_page = Page{
+        .rel = "pages/[slug].zig",
+        .segs = &.{.{ .dynamic = "slug" }},
+        .params = &.{.{ .name = "slug", .ty = "[]const u8" }},
+        .tag = "slug",
+    };
+    // Same shape → DuplicateRoute.
+    try std.testing.expectError(error.DuplicateRoute, checkRawPageConflicts(&[_]Page{raw}, &[_]Page{clash}));
+    // Dynamic page vs static raw → allowed (raw wins at request time).
+    try checkRawPageConflicts(&[_]Page{raw}, &[_]Page{ok_page});
+}
+
+test "emitRoutes emits raw dispatch, headSpec, and contentType only when opted in" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const pages = [_]Page{
+        .{
+            .rel = "pages/index.zig",
+            .segs = &.{},
+            .params = &.{},
+            .tag = "index",
+            .has_head = true,
+        },
+        .{
+            .rel = "pages/post/[id].zig",
+            .segs = &.{ .{ .static = "post" }, .{ .dynamic = "id" } },
+            .params = &.{.{ .name = "id", .ty = "u64" }},
+            .tag = "post",
+        },
+    };
+    const apis = [_]Page{
+        .{
+            .rel = "pages/api/ping.zig",
+            .segs = &.{.{ .static = "ping" }},
+            .params = &.{},
+            .tag = "ping",
+            .is_api = true,
+            .has_content_type = true,
+        },
+    };
+    const raws = [_]Page{
+        .{
+            .rel = "pages/rss.xml.zig",
+            .segs = &.{.{ .static = "rss.xml" }},
+            .params = &.{},
+            .tag = "rss_xml",
+            .is_raw = true,
+            .has_content_type = true,
+        },
+        .{
+            .rel = "pages/notes.txt.zig",
+            .segs = &.{.{ .static = "notes.txt" }},
+            .params = &.{},
+            .tag = "notes_txt",
+            .is_raw = true,
+        },
+    };
+    const src = try emitRoutes(arena, &pages, &apis, &raws, &[_]Layout{}, &[_]Middleware{});
+    const s = src;
+
+    // Raw endpoint surface: import alias, union, parser, pre-check,
+    // dispatch — and validPath covers rawPath.
+    try std.testing.expect(std.mem.indexOf(u8, s, "const rss_xml_raw = @import(\"../pages/rss.xml.zig\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "const notes_txt_raw = @import(\"../pages/notes.txt.zig\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "pub const RawRoute = union(enum) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "rss_xml: rss_xml_raw.params,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "pub fn parseRaw(path: []const u8) ?RawRoute {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "pub fn rawPath(path: []const u8) bool {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, ".rss_xml => |p| try rss_xml_raw.api(a, s, p, env),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "return parseRoute(path) != null or apiPath(path) or rawPath(path);") != null);
+    // Raw routes are literal statics — the match arm pins "rss.xml".
+    try std.testing.expect(std.mem.indexOf(u8, s, "std.mem.eql(u8, segs[0], \"rss.xml\")") != null);
+
+    // headSpec: emitted because index declares `head`; every page gets
+    // an arm (post has no head → headFor returns null at runtime).
+    try std.testing.expect(std.mem.indexOf(u8, s, "pub fn headSpec(s: anytype, a: std.mem.Allocator, env: *const zmeta.Env) ?zmeta.HeadSpec {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, ".index => |p| headFor(index_page, s, p, a, env),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, ".post => |p| headFor(post_page, s, p, a, env),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "if (@hasDecl(Page, \"head\")) return Page.head(a, s, p, env);") != null);
+
+    // contentType: emitted because api+raw files declare content_type;
+    // covers BOTH unions, every tag gets an endpointCt arm.
+    try std.testing.expect(std.mem.indexOf(u8, s, "pub fn contentType(path: []const u8) ?[]const u8 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "if (parseApi(path)) |r| return switch (r) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, ".ping => endpointCt(ping_api),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "if (parseRaw(path)) |r| return switch (r) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, ".rss_xml => endpointCt(rss_xml_raw),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, ".notes_txt => endpointCt(notes_txt_raw),") != null);
+}
+
+test "emitRoutes stays silent without opt-ins (byte-identical baseline)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const pages = [_]Page{
+        .{ .rel = "pages/index.zig", .segs = &.{}, .params = &.{}, .tag = "index" },
+    };
+    const apis = [_]Page{
+        .{ .rel = "pages/api/ping.zig", .segs = &.{.{ .static = "ping" }}, .params = &.{}, .tag = "ping", .is_api = true },
+    };
+    const src = try emitRoutes(arena, &pages, &apis, &[_]Page{}, &[_]Layout{}, &[_]Middleware{});
+    const s = src;
+
+    // No raw files → no RawRoute/parseRaw/rawPath/raw dispatch, and
+    // validPath keeps the api-only form.
+    try std.testing.expect(std.mem.indexOf(u8, s, "RawRoute") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "parseRaw") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "rawPath") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "pub fn raw(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "return parseRoute(path) != null or apiPath(path);") != null);
+    // No head decls → no headSpec/headFor.
+    try std.testing.expect(std.mem.indexOf(u8, s, "headSpec") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "headFor") == null);
+    // No content_type decls → no contentType/endpointCt.
+    try std.testing.expect(std.mem.indexOf(u8, s, "contentType") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "endpointCt") == null);
 }

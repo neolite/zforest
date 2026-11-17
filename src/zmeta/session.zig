@@ -83,8 +83,32 @@
 //!       `routes.isLive` forwards page files' `pub const live = true`.
 //!       True → servePage builds the view once + bindTree; render()
 //!       only stamps the revision. Absent = all-diff (default).
-//!     `page_title` / `page_class` / `cookie_name` — consts forwarded
-//!       to the server contract (defaults match http.zig's).
+//!     `fn serveRaw(s, path, writer) !bool` — raw-endpoint hook for
+//!       GETs matching a dotted `pages/**` file (e.g. `pages/rss.xml.zig`
+//!       → "/rss.xml"); generated `routes.raw` dispatches to the file's
+//!       `api(a, s, p, env)` handler. false → falls through to page
+//!       handling (404 for unknown paths). Writes a raw body; the
+//!       server skips the HTML shell and defaults content-type to
+//!       `text/plain`.
+//!     `fn endpointContentType(s, path) ?[]const u8` — content type
+//!       for an api/raw endpoint response; generated
+//!       `routes.contentType` forwards page files'
+//!       `pub const content_type` decls (api default
+//!       `application/json`, raw default `text/plain`). Absent → the
+//!       server picks the per-kind default. Return a comptime/static
+//!       slice — the server dupes it into the request arena.
+//!     `fn headSpec(s, a, env: *const Env) ?HeadSpec` — per-page
+//!       `<head>` overrides for the CURRENT route; generated
+//!       `routes.headSpec` dispatches page files' optional
+//!       `pub fn head(a, s, p, env) ?zmeta.HeadSpec`. `a` is the
+//!       session's render arena — head strings only need to outlive
+//!       the synchronous response write. Called by the server's
+//!       renderHead AFTER servePage resolved the route, so `prepare`
+//!       has already run. Absent → null (defaults).
+//!     `page_title` / `page_class` / `page_lang` / `cookie_name` —
+//!       consts forwarded to the server contract (defaults match
+//!       http.zig's: "zforest"/"app"/"en"/"zfxs"). `page_lang` is the
+//!       app-wide `<html lang>`; a page's HeadSpec.lang overrides it.
 //!     `archetype` — `zmeta.Archetype` const documenting the §4.1
 //!       session shape (metadata only; hook emission is driven by the
 //!       hook decls themselves, see above).
@@ -153,6 +177,7 @@ const forest = @import("forest");
 // server/history.zig here would compile an incompatible second copy).
 const History = @import("zserver").History;
 const Env = @import("env.zig").Env;
+const HeadSpec = @import("head.zig").HeadSpec;
 
 /// Session archetypes (docs/meta-framework.md §4.1). Declare on `Deps`
 /// as `pub const archetype: zmeta.Archetype = .shared_model;` — it is
@@ -226,6 +251,8 @@ fn SessionMethods(comptime Deps: type) type {
         /// otherwise the same defaults `server/http.zig` applies.
         pub const page_title = if (@hasDecl(Deps, "page_title")) Deps.page_title else "zforest";
         pub const page_class = if (@hasDecl(Deps, "page_class")) Deps.page_class else "app";
+        /// App-wide `<html lang>` — a page's HeadSpec.lang overrides it.
+        pub const page_lang = if (@hasDecl(Deps, "page_lang")) Deps.page_lang else "en";
         pub const cookie_name = if (@hasDecl(Deps, "cookie_name")) Deps.cookie_name else "zfxs";
         /// §4.1 archetype — `Deps.archetype` or `.per_session`.
         pub const archetype = if (@hasDecl(Deps, "archetype")) Deps.archetype else Archetype.per_session;
@@ -305,6 +332,41 @@ fn SessionMethods(comptime Deps: type) type {
         pub fn serveApi(self: anytype, path: []const u8, writer: anytype) !bool {
             if (@hasDecl(Deps, "serveApi")) return Deps.serveApi(self, path, writer);
             return false;
+        }
+
+        /// Raw-endpoint hook for GETs matching a dotted `pages/**`
+        /// file (`pages/rss.xml.zig` → "/rss.xml") — forwarded to
+        /// `Deps.serveRaw` when declared; default false → falls
+        /// through to page handling. Writes a raw body (RSS/XML/
+        /// text); the server skips the HTML shell and defaults the
+        /// content type to `text/plain` (see `endpointContentType`).
+        pub fn serveRaw(self: anytype, path: []const u8, writer: anytype) !bool {
+            if (@hasDecl(Deps, "serveRaw")) return Deps.serveRaw(self, path, writer);
+            return false;
+        }
+
+        /// Content type for an api/raw endpoint response — forwarded
+        /// to `Deps.endpointContentType` when declared; null → the
+        /// server picks the per-kind default (`application/json` for
+        /// /api/*, `text/plain` for raw endpoints). Generated
+        /// `routes.contentType` forwards page files'
+        /// `pub const content_type` decls.
+        pub fn endpointContentType(self: anytype, path: []const u8) ?[]const u8 {
+            if (@hasDecl(Deps, "endpointContentType")) return Deps.endpointContentType(self, path);
+            return null;
+        }
+
+        /// Per-page `<head>` spec for the CURRENT route — forwarded to
+        /// `Deps.headSpec` when declared; null → renderHead uses the
+        /// page_title/page_lang defaults and emits no extra markup.
+        /// The env is rebuilt here (route + query) exactly like
+        /// prepare/view see it; the route was resolved by servePage
+        /// before the server calls this. `a` is the render arena —
+        /// head strings only need to outlive the response write.
+        pub fn headSpec(self: anytype) ?HeadSpec {
+            if (!@hasDecl(Deps, "headSpec")) return null;
+            const env = self.viewEnv();
+            return Deps.headSpec(self, self.render_arena.allocator(), &env);
         }
 
         /// Full-page render for a navigating client: resolve the route,
@@ -587,6 +649,8 @@ fn SessionPlain(comptime Deps: type) type {
         /// otherwise the same defaults `server/http.zig` applies.
         pub const page_title = M.page_title;
         pub const page_class = M.page_class;
+        /// App-wide `<html lang>` — a page's HeadSpec.lang overrides it.
+        pub const page_lang = M.page_lang;
         pub const cookie_name = M.cookie_name;
         /// §4.1 archetype — `Deps.archetype` or `.per_session`.
         pub const archetype = M.archetype;
@@ -606,6 +670,9 @@ fn SessionPlain(comptime Deps: type) type {
         pub const validPath = M.validPath;
         pub const readCookies = M.readCookies;
         pub const serveApi = M.serveApi;
+        pub const serveRaw = M.serveRaw;
+        pub const endpointContentType = M.endpointContentType;
+        pub const headSpec = M.headSpec;
         pub const servePage = M.servePage;
         pub const syncPull = M.syncPull;
         pub const bumpSeq = M.bumpSeq;
@@ -675,6 +742,8 @@ fn SessionGrouped(comptime Deps: type) type {
         /// otherwise the same defaults `server/http.zig` applies.
         pub const page_title = M.page_title;
         pub const page_class = M.page_class;
+        /// App-wide `<html lang>` — a page's HeadSpec.lang overrides it.
+        pub const page_lang = M.page_lang;
         pub const cookie_name = M.cookie_name;
         /// §4.1 archetype — `Deps.archetype` or `.per_session`.
         pub const archetype = M.archetype;
@@ -694,6 +763,9 @@ fn SessionGrouped(comptime Deps: type) type {
         pub const validPath = M.validPath;
         pub const readCookies = M.readCookies;
         pub const serveApi = M.serveApi;
+        pub const serveRaw = M.serveRaw;
+        pub const endpointContentType = M.endpointContentType;
+        pub const headSpec = M.headSpec;
         pub const servePage = M.servePage;
         pub const syncPull = M.syncPull;
         pub const bumpSeq = M.bumpSeq;
@@ -1245,4 +1317,123 @@ test "render-path overrides: Deps servePage/render/writeView/buildViewNodes/seed
     try std.testing.expectEqual(@as(u64, 1), s.deps.group_rev);
     try std.testing.expectEqual(@as(usize, 0), s.log.patches.items.len);
     try std.testing.expectEqual(@as(u64, 1), s.seq.get());
+}
+
+/// Deps exercising the SEO/endpoint hooks: `page_lang`, `serveRaw`,
+/// `endpointContentType`, `headSpec` — plus a `head`-shaped page
+/// result built in render_arena like generated glue would.
+const EndpointSession = Session(EndpointDeps);
+
+const EndpointDeps = struct {
+    pub const page_lang = "ru";
+
+    pub fn init(s: *EndpointSession) EndpointDeps {
+        _ = s;
+        return .{};
+    }
+
+    pub fn dispatch(
+        s: *EndpointSession,
+        action: []const u8,
+        arg: ?[]const u8,
+        value: ?[]const u8,
+        fields: ?*const std.json.ObjectMap,
+    ) !void {
+        _ = s;
+        _ = action;
+        _ = arg;
+        _ = value;
+        _ = fields;
+    }
+
+    pub fn view(a: std.mem.Allocator, s: *EndpointSession, env: *const Env) []const forest.Node {
+        _ = s;
+        _ = env;
+        return a.alloc(forest.Node, 0) catch @panic("OOM");
+    }
+
+    /// Route gate accepting "/" and "/post/1" — enough for headSpec.
+    pub fn setRoute(s: *EndpointSession, path: []const u8) bool {
+        _ = s;
+        return std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/post/1");
+    }
+
+    /// Raw endpoint stand-in: writes a fixed body for "/feed.xml".
+    pub fn serveRaw(s: *EndpointSession, path: []const u8, writer: anytype) !bool {
+        _ = s;
+        if (!std.mem.eql(u8, path, "/feed.xml")) return false;
+        try writer.writeAll("<rss/>");
+        return true;
+    }
+
+    /// Content type lookup: "/feed.xml" → rss, else null.
+    pub fn endpointContentType(s: *EndpointSession, path: []const u8) ?[]const u8 {
+        _ = s;
+        return if (std.mem.eql(u8, path, "/feed.xml")) "application/rss+xml" else null;
+    }
+
+    /// Head spec for "/post/1" only — env.route is asserted inside.
+    pub fn headSpec(s: *EndpointSession, a: std.mem.Allocator, env: *const Env) ?HeadSpec {
+        _ = s;
+        _ = a;
+        if (!std.mem.eql(u8, env.route, "/post/1")) return null;
+        return .{
+            .title = "Post: one",
+            .extra = "<meta name=\"description\" content=\"d\">",
+            .lang = "en",
+        };
+    }
+};
+
+test "endpoint + head hooks: defaults on plain Deps, forwarded on EndpointDeps" {
+    const alloc = std.testing.allocator;
+
+    // Defaults (TestDeps declares none of the new hooks): the server
+    // sees null/false and falls back to per-kind defaults.
+    const plain = TestSession.create(alloc, std.testing.io);
+    defer plain.deinit();
+    try std.testing.expectEqualStrings("en", TestSession.page_lang);
+    var pw: std.Io.Writer.Allocating = .init(alloc);
+    defer pw.deinit();
+    try std.testing.expect(!(try plain.serveRaw("/x", &pw.writer)));
+    try std.testing.expect(plain.endpointContentType("/x") == null);
+    try std.testing.expect(plain.headSpec() == null);
+
+    // EndpointDeps: page_lang forwarded; serveRaw writes only for the
+    // raw path; endpointContentType and headSpec return per-route data.
+    const s = EndpointSession.create(alloc, std.testing.io);
+    defer s.deinit();
+    try std.testing.expectEqualStrings("ru", EndpointSession.page_lang);
+
+    var rw: std.Io.Writer.Allocating = .init(alloc);
+    defer rw.deinit();
+    try std.testing.expect(try s.serveRaw("/feed.xml", &rw.writer));
+    try std.testing.expectEqualStrings("<rss/>", rw.writer.buffered());
+    try std.testing.expect(!(try s.serveRaw("/nope", &rw.writer)));
+    try std.testing.expectEqualStrings("application/rss+xml", s.endpointContentType("/feed.xml").?);
+    try std.testing.expect(s.endpointContentType("/other") == null);
+
+    // headSpec is route-dependent: the skeleton rebuilds Env from the
+    // session's stored route — "/" isn't "/post/1" → null.
+    try std.testing.expect(s.headSpec() == null);
+}
+
+test "headSpec sees the resolved route after servePage" {
+    const alloc = std.testing.allocator;
+    const s = EndpointSession.create(alloc, std.testing.io);
+    defer s.deinit();
+
+    // Before any servePage the route is the "/" default → null.
+    try std.testing.expect(s.headSpec() == null);
+
+    // servePage("/post/1") resolves the route through setRoute; the
+    // skeleton's headSpec then rebuilds Env{route="/post/1"} and
+    // EndpointDeps returns the spec.
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    try std.testing.expect(try s.servePage("/post/1", &aw.writer));
+    const spec = s.headSpec().?;
+    try std.testing.expectEqualStrings("Post: one", spec.title.?);
+    try std.testing.expectEqualStrings("<meta name=\"description\" content=\"d\">", spec.extra.?);
+    try std.testing.expectEqualStrings("en", spec.lang.?);
 }

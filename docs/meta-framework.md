@@ -428,13 +428,107 @@ board_app.zig:512-528). Two levels:
   hand-digging `ObjectMap`. Needs a mini-DSL; flagged as open
   question (§7) — the name table alone removes most of the risk.
 
-API routes (non-UI JSON endpoints) don't exist today — every GET is
-a page, every POST is `/action`. A `GET /api/<name>` → typed handler
-→ JSON response is ~30 lines in `handle` behind a decl; cheap enough
-to include in v0 as optional. Contract note: `/api/*` responses
+API routes (non-UI JSON endpoints) LANDED as `pages/api/<name>.zig`
+files exporting `pub fn api(a, s, params, env) ![]const u8` — the
+generated `parseApi`/`api`/`apiPath` dispatch lives next to
+`parseRoute`, `Deps.serveApi` is the session hook, and responses
+skip the HTML shell with a JSON content type. `/api/*` responses
 bypass the patch/ACK model — they're plain req/resp; mutations through
 them get SSE fan-out only if they go through the same
-dispatch/publish path (document, don't special-case).
+dispatch/publish path (document, don't special-case). Raw
+(non-JSON) endpoints and per-endpoint content types are covered in
+§2.10.
+
+### 2.10 SEO head + raw endpoints — LANDED
+
+Per-page `<head>` overrides and file-based raw endpoints (RSS,
+robots.txt, sitemap.xml) landed together — both ride the same
+codegen seam: typed dispatch resolved AFTER `prepare`, emitted only
+for apps that opt in.
+
+**Head spec.** A page file may declare:
+
+```zig
+pub fn head(
+    a: std.mem.Allocator,
+    s: anytype,
+    p: params,
+    env: *const zmeta.Env,
+) ?zmeta.HeadSpec
+```
+
+returning `zmeta.HeadSpec{ .title, .extra, .lang }` — every field
+optional, `null` keeps the default:
+
+- `title` overrides `Deps.page_title` (the `<title>` text);
+- `extra` is RAW HTML emitted verbatim before `</head>` — meta
+  description, Open Graph/Twitter cards, canonical links, JSON-LD,
+  extra stylesheets. It is NOT escaped — the page owns correctness;
+- `lang` overrides `Deps.page_lang` (the `<html lang>`; `page_lang`
+  itself defaults to `"en"`).
+
+Pages without `head` keep the shell defaults — SSR output is
+byte-identical. The generated `routes.headSpec` dispatches on the
+resolved typed route (`s.deps.route`), so `head` runs AFTER
+`prepare` — params are validated and `prepare`'s `s.deps` writes are
+visible. `a` is the session's render arena: head strings only need
+to outlive the synchronous response write. `head` is INFALLIBLE by
+contract (returns `?HeadSpec`, not an error union) — allocate with
+`catch @panic("OOM")`, or `return null` to decline overrides for a
+request.
+
+The server renders the page BODY before the head for exactly this
+reason: `handle` runs `servePage` (route resolve + prepare) into an
+arena buffer, then `renderHead` asks the session for the spec, then
+appends head+body+tail — the emitted document order is unchanged,
+and a route that 404s in `prepare` never reaches head rendering.
+
+**Raw endpoints.** A `pages/**` file whose FINAL segment contains a
+dot is a raw endpoint: `pages/rss.xml.zig` → `GET /rss.xml`,
+`pages/blog/feed.atom.zig` → `GET /blog/feed.atom`. The dotted
+segment is always a literal static — `[id].xml` is rejected at gen
+time (`BadSegment`); parent segments may still be `[name]`
+dynamics (`pages/blog/[id]/feed.xml.zig` → `/blog/:id/feed.xml`).
+Endpoint files use the api handler shape — `pub const params` +
+`pub fn api(a, s, p, env) ![]const u8` — and bypass the HTML shell,
+views, layouts, and middleware entirely, dispatched through the
+generated `RawRoute` union + `parseRaw`/`raw`/`rawPath`. The session
+hook is `Deps.serveRaw`; the server tries it after `serveApi` and
+before page rendering, so a literal dotted route beats a dynamic
+page segment ("/feed.xml" over "/[slug]"). Conflict rules: identical
+segment shapes across page/raw lists are a gen-time
+`DuplicateRoute` (`pages/rss.xml.zig` vs `pages/rss.xml/index.zig`);
+different shapes are legal — dispatch order decides.
+
+**Content types.** Api and raw endpoint files may declare
+`pub const content_type = "application/rss+xml";` — a comptime
+string forwarded by the generated `routes.contentType` through
+`Deps.endpointContentType` (the server dupes it into the request
+arena). Absent → per-kind defaults: `application/json` for
+`/api/*`, `text/plain` for raw endpoints. Per-request content types
+are not supported — the decl is static by design.
+
+**Opt-in emission.** `headSpec`, `RawRoute`/`raw`, and
+`contentType` are emitted ONLY when some page/endpoint declares the
+hook, so existing apps regenerate byte-identical `gen/routes.zig`.
+App-side glue (app.zig `Deps`) mirrors the api pattern:
+
+```zig
+pub fn serveRaw(s: *Session, path: []const u8, writer: anytype) !bool {
+    // arena + env, then: routes.raw(a, s, path, &env)
+}
+pub fn endpointContentType(s: *Session, path: []const u8) ?[]const u8 {
+    return routes.contentType(path);
+}
+pub fn headSpec(s: *Session, a: std.mem.Allocator, env: *const zmeta.Env) ?zmeta.HeadSpec {
+    return routes.headSpec(s, a, env);
+}
+// plus `pub const page_lang = "...";` for the app-wide <html lang>.
+```
+
+The app `zmeta.zig` shim must also re-export `HeadSpec`
+(`pub const HeadSpec = @import("zmeta").HeadSpec;`) for page files
+to name the type.
 
 ## 3. What zforest already gives for free
 
@@ -602,6 +696,7 @@ src/apps/<name>/             # every app incl. its exe entry point
     b/[slug].zig             # route "/b/:slug"
     t/[post]/index.zig       # route "/t/:post"
     t/[post]/c/[comment].zig # route "/t/:post/c/:comment"
+    rss.xml.zig             # raw endpoint "/rss.xml" (dotted final seg, §2.10)
     _layout.zig              # optional; wraps pages in its dir + below
     _middleware.zig          # optional; pre-prepare gate, same dir scoping
   entities/                  # optional FSD slice — domain state leaf (§5.6)
@@ -690,12 +785,16 @@ contract is already stable and compile-enforced.
 
 ### 5.4 Request lifecycle (what the framework owns)
 
-1. `GET path` → generated `validPath` (`parseRoute`, no session on
-   404) → `(token, route)` session lookup/create → `servePage`:
-   `setRoute` → generated dispatch (applicable `_middleware.zig`
-   files, outermost-first, then the page's) `prepare(params)` (404 on
-   error) → [shared-model: `syncMembership` + `ensureGroupCurrent`]
-   → `writeView` = layouts∘page → `seedDom`.
+1. `GET path` → generated `validPath` (`parseRoute` + `apiPath` +
+   `rawPath`, no session on 404) → `(token, route)` session lookup/create
+   → `serveApi` (JSON, `/api/*`) → `serveRaw` (raw body, dotted
+   endpoints) → `servePage`: `setRoute` → generated dispatch
+   (applicable `_middleware.zig` files, outermost-first, then the
+   page's) `prepare(params)` (404 on error) → [shared-model:
+   `syncMembership` + `ensureGroupCurrent`] → `writeView` =
+   layouts∘page into a buffer → `renderHead` (page `head` spec via
+   `Deps.headSpec` — route already resolved) → head+body+tail →
+   `seedDom`.
 2. Browser: controls gated → `EventSource ?r=route` → `snapshot`
    (full-state ops) → live `patch` events.
 3. `POST /action` → CSRF → `readCookies` → generated action-name
