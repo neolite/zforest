@@ -1918,3 +1918,40 @@ convention alone.
 Verified: `zig build gen` (regenerated `gen/routes.zig` ×5 — only the
 zmeta import line changed), `zig fmt --check`, `zig build test`,
 `zig build`, smoke (`zboard`/`zforest`/`zmeta-demo` serve SSR).
+
+## Repo split: framework (zforest) vs apps (zforest-examples) (done)
+
+The module-graph separation landed earlier ("Framework/app module
+separation") made the boundary mechanical; this step makes it a
+REPOSITORY boundary: `neolite/zforest` keeps only `src/` framework +
+`vendor/sqlite3`, and the five apps move to the new public repo
+`neolite/zforest-examples` (apps land at `src/apps/<name>/` there —
+the layout `gen.zig`/`scaffold.zig` hardcode, unchanged).
+
+- Examples repo consumes the framework as a Zig package dependency:
+  `.zforest = .{ .path = "../zforest" }` (sibling checkout; a git-URL
+  dep is a future option). Its `build.zig` pulls the named modules via
+  `zforest_dep.module("zefx"|"forest"|"zserver"|"zmeta"|"zdb")` — the
+  SAME `*Module` objects the dep's `b.addModule` created, so
+  `History`/`Dom`/zefx/forest type identity holds across the boundary
+  with zero rewiring. No fallback to hand-built modules was needed.
+- `zdb` keeps the sqlite3 amalgamation + C flags ON the module
+  (`addSqlite` in the framework's build.zig); whichever consumer exe
+  imports `zdb` links the C exactly once — carried through the
+  dependency unchanged. `build.zig.zon` `paths` gained `vendor` so the
+  amalgamation ships to consumers.
+- `gen.zig`/`scaffold.zig` are std-only, so the examples repo roots
+  its own tool modules at `zforest_dep.path("src/zmeta/{gen,scaffold}.zig")`
+  and `setCwd(b.path("."))` — codegen scans the EXAMPLES repo's
+  `src/apps/`. In the framework repo they are test-only modules (no
+  executables).
+- Framework `build.zig` now produces no artifacts — module graph +
+  `zig build test` only. zboard's design doc (`docs/zboard.html`) and
+  `docs/adr/` moved to the examples repo; `meta-framework.md` /
+  `getting-started.md` keep the `src/apps/` convention text with a
+  repo note pointing at examples.
+
+Verified: examples repo `zig build` (5 exes), `zig build test`,
+`zig build gen` (idempotent), `zig build new-app -- smoketest`
+(scaffold + regen), smoke `zmeta-demo`/`zboard`; framework repo
+`zig build`/`zig build test`/`zig fmt --check` green.

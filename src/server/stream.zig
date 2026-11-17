@@ -2,8 +2,9 @@ const std = @import("std");
 const forest = @import("forest");
 // NOTE: no app imports here — this file compiles inside the `zserver`
 // named module, which must stay framework-only. The snapshot test
-// against the real todo view lives in `src/apps/todo/app.zig` and
-// reaches `writeSnapshotJson` via `zserver.writeSnapshotJson`.
+// against the real todo view lives in `src/apps/todo/app.zig` in the
+// zforest-examples repo and reaches `writeSnapshotJson` via
+// `zserver.writeSnapshotJson`.
 
 /// Serialize the full-state snapshot event payload: {"rev":N,"ops":[…]}.
 /// `ops` is the declarative view emitted as an idempotent state dump —

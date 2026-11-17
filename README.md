@@ -2,104 +2,67 @@
 
 Server-driven UIs in Zig: the `zefx` reactive graph core plus `forest`, a
 fine-grained DOM patch layer, served by a minimal `std.http` server with a
-vanilla JS patch client. Five apps share the transport:
+vanilla JS patch client. This repo is the **framework**; the example apps
+(todo, board, dashboard, booking, zmeta demo) live in
+[zforest-examples](https://github.com/neolite/zforest-examples).
 
-- **`zforest`** — the Todo demo (per-session view state; todos persist
-  to SQLite keyed by a `ztd` client cookie).
-- **`zboard`** — an anonymous message board (static boards, threads,
-  nested tree comments) over a shared SQLite-backed model.
-- **`zmon`** — a live ops dashboard (mock request stream, windowed
-  rps/error/latency stats, 384-line request-log firehose, inject +
-  storm buttons, traffic sliders, SVG sparklines) on **fine-grained
-  live bindings**: the view tree is built once per session and every
-  bound leaf subscribes to its store, so updates emit patch ops with
-  no rebuild+diff (`forest.bindTree`).
-- **`zcar`** — a service-booking demo (brand → model → year cascade,
-  vehicle specs, service catalogue by category, context upsells, combo
-  discounts, booking form + history) — exercises keyed lists and
-  conditional subtrees on the diff path.
-- **`zmeta-demo`** — the `zmeta` meta-framework demo: file-based
-  routes, typed params, generated action dispatch, `Session(Deps)`
-  skeleton. See [docs/getting-started.md](docs/getting-started.md).
+## Modules
 
-The repo is split into a framework and its apps. `src/` is pure
-framework — `zefx/` (reactive graph), `forest/` (view/diff/snapshot),
-`zmeta/` (file-routing meta-framework), `server/` (HTTP/SSE transport),
-`db.zig` + `assets.zig` — exposed as the named Zig modules `zefx`,
-`forest`, `zserver`, `zmeta`, `zdb`, `zassets`. Each app is a
-self-contained `src/apps/<name>/` directory with its own `main.zig`
-entry point and may only reach the framework through those named
-modules — the dependency arrow never points back.
+`src/` is pure framework, exposed as named Zig modules:
+
+- **`zefx`** (`src/zefx/`) — the reactive graph core: stores, events,
+  two-phase flush (pure → effects), derived stores (`map`/`sample`/
+  `combine`), generational subscription slots, `watchCtx`.
+- **`forest`** (`src/forest/`) — the declarative view tree
+  (`el`/`text`/`eachOf`/`computed`/`variant`/`when`), SSR
+  (`writeHtml`), DOM-patch `diff`, full-state snapshot ops, and
+  `bindTree` live bindings (store → leaf patch ops, no rebuild).
+- **`zserver`** (`src/server/`) — generic-over-`Session` HTTP/SSE
+  server: cookie sessions, `POST /action` → ACK, `GET /events` → SSE
+  stream, `History` retained-batch ring, `stream` snapshot serializer.
+- **`zmeta`** (`src/zmeta/`) — file-routing meta-framework: `Session(Deps)`
+  skeleton, `Env` render context, plus the std-only `gen.zig` /
+  `scaffold.zig` codegen tools (`zig build gen` / `new-app` in an apps
+  repo).
+- **`zdb`** (`src/db.zig`) — typed wrapper over the vendored sqlite3
+  amalgamation (`vendor/sqlite3`, official 3.54.1). Apps opt in per-exe;
+  the framework never imports it.
+- **`zassets`** (`src/assets.zig`) — embeds `client.js`/`style.css`.
 
 <p align="center">
   <img src="docs/architecture.svg" alt="zforest architecture" width="900">
 </p>
 
-## Run
+## Using the framework
 
-```sh
-zig build        # produces zig-out/bin/{zforest,zboard,zmon,zcar,zmeta-demo}
-zig build run    # serves the todo app on http://127.0.0.1:8080
-zig build run-board 8081 127.0.0.1 board.db  # board on :8081, file db
-zig build run-mon 8082 127.0.0.1             # dashboard on :8082
-zig build run-car 8083 127.0.0.1             # booking demo on :8083
-zig build run-demo 8084 127.0.0.1            # zmeta demo on :8084
-./zig-out/bin/zforest [port] [bind-ip] [db-path]  # db-path default "zforest-todos.db"
-./zig-out/bin/zboard   [port] [bind-ip] [db-path]   # db-path default ":memory:"
-./zig-out/bin/zmon     [port] [bind-ip]
-./zig-out/bin/zcar     [port] [bind-ip]
-./zig-out/bin/zmeta-demo [port] [bind-ip]
-zig build test   # all module + app test targets
+Apps are separate Zig packages that depend on this repo:
+
+```zig
+// build.zig.zon
+.zforest = .{ .path = "../zforest" },   // or a git URL once published
 ```
 
-## zboard
+```zig
+// build.zig — pull the named modules from the dependency
+const zforest_dep = b.dependency("zforest", .{});
+const zefx_mod = zforest_dep.module("zefx");
+// … then wire .imports on each app module
+```
 
-Routes: `/` (board list + latest posts), `/b/<slug>` (post form + keyed
-post list), `/t/<post>` (post card + comment form + nested comment tree),
-`/t/<post>/c/<comment>` (breadcrumbs + focused comment subtree). Unknown
-paths and dangling ids return 404.
+See [zforest-examples](https://github.com/neolite/zforest-examples) for
+five working apps (`zforest` todo, `zboard`, `zmon`, `zcar`,
+`zmeta-demo`) and the `gen`/`new-app` codegen steps. Framework docs:
+[docs/meta-framework.md](docs/meta-framework.md) (zmeta spec),
+[docs/getting-started.md](docs/getting-started.md) (tutorial),
+[ARCHITECTURE.md](ARCHITECTURE.md) (design decisions).
 
-- `src/apps/board/entities/model.zig` — `BoardModel`: static board
-  whitelist, in-memory post/comment/user arrays, write-through SQLite
-  inserts, one shared `next_id` across posts and comments (display
-  `#N`), and `global_seq`, an atomic bumped on every mutation.
-- `src/db.zig` (module `zdb`) + `vendor/sqlite3/` — the official
-  SQLite 3.54.1 amalgamation, linked only into the sqlite-using exes
-  (`zforest`, `zboard`) and their test targets.
-- `src/apps/board/` — the zmeta app dir (FSD layers): `app.zig`
-  (session/deps + action handlers) + `groups.zig` (render groups) at
-  the app root, `entities/` (model + accounts), `features/` (auth),
-  `shared/` (view components + markdown), `pages/` file routes (`/`,
-  `/b/<slug>`, `/t/<post>`, `/t/<post>/c/<comment>`). Every browser
-  session still owns an
-  isolated zefx graph + DOM state, but all sessions share
-  the one model: each SSE worker calls `syncPull()` every 50 ms, which
-  re-renders when `global_seq` moved and publishes the resulting patch
-  batch — so a post in one tab appears live in every other tab (and a
-  no-op diff for sessions on unrelated routes).
-- Identity is anonymous: the first `POST /action` without a `zfxu`
-  cookie mints a `users` row and returns `Set-Cookie: zfxu=<token>`
-  (one-shot — later POSTs don't re-send it); posts display as
-  `Anon#<base36(rownum)>`, stable across restarts. The session cookie
-  stays `zfxb` so the two apps can share a host.
-- Inline replies mount via `when("w-rep-N")` anchors inside each comment
-  row; `reply_to` is per-session, cleared on navigation and after a
-  successful comment.
+## Build & test
 
-File databases persist everything: `zboard 8081 127.0.0.1 board.db`
-restarts with posts/comments/users intact (`:memory:` is ephemeral).
-
-## zforest (todo)
-
-`zig build run` serves the TodoMVC app on `127.0.0.1:8080` with todos
-persisted to `zforest-todos.db` in the cwd (`zforest [port] [bind-ip]
-[db-path]`; `:memory:` opts back into the ephemeral demo). Persistence
-is keyed by a `ztd` client cookie — minted on the first `POST /action`
-— not by the session cookie, so todos survive session eviction (32-cap
-FIFO), server restarts, and are shared by tabs of the same browser.
-Rows write through on every mutation; a session lazy-loads its client's
-rows on first contact. `src/apps/todo/store.zig` holds the `TodoStore`
-(schema + prepared statements); `src/db.zig` is shared with zboard.
+```sh
+zig build        # module graph only — this repo ships no executables
+zig build test   # all framework module + tool test targets
+zig fmt --check  # zig fmt is the source of truth
+```
 
 ## How it works
 
@@ -181,18 +144,16 @@ rows on first contact. `src/apps/todo/store.zig` holds the `TodoStore`
 ## Roadmap
 
 Shipped: reactive core (`zefx`), declarative view + SSR + snapshot, SSE
-patch transport, keyed lists, `when` branches, delegated events, four
-apps (todo + SQLite board + `zmon` live dashboard + `zcar` booking),
+patch transport, keyed lists, `when` branches, delegated events,
 route-keyed sessions, cross-tab fan-out, **fine-grained live bindings**
-(`forest.bindTree`: store → leaf patch ops with no view rebuild —
-zmon's cards and status pill update per-store-notification),
-**client-keyed todo persistence** (`ztd` cookie → SQLite write-through,
-survives eviction/restart), board accounts + markdown (ADR-0001).
+(`forest.bindTree`: store → leaf patch ops with no view rebuild),
+**client-keyed persistence pattern** (cookie → SQLite write-through,
+survives eviction/restart), **zmeta** file-routing meta-framework with
+codegen (`gen`/`new-app`), and five example apps in
+[zforest-examples](https://github.com/neolite/zforest-examples).
 
 Next, roughly in order:
 
-- **Board moderation** — post/comment edit + delete.
-- **Todo polish** — drag&drop reorder (model needs an order field).
 - **Live-mode structure** — reactive keyed lists and multi-key
   variants; per-item reactive cells still deferred (see
   [ARCHITECTURE.md](ARCHITECTURE.md)).

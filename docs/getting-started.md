@@ -4,6 +4,11 @@ zmeta is the meta-framework layer of zforest: file-based routes, typed
 params, generated action dispatch, and a `Session(Deps)` skeleton —
 server-rendered HTML plus SSE patches, no client runtime, no hydration.
 
+> **Repo note:** the framework lives in `neolite/zforest`; apps (and all
+> commands below) live in `neolite/zforest-examples`. `src/apps/` paths
+> in this guide refer to the examples repo — check it out as a sibling
+> of the framework repo (`../zforest` relative to examples).
+
 This guide mirrors the shape of a Next.js "getting started" page:
 install, project layout, core concepts, first page.
 
@@ -13,14 +18,16 @@ Prerequisite: Zig **0.17.1** (`zig version`).
 
 ```sh
 git clone https://github.com/neolite/zforest
-cd zforest
+git clone https://github.com/neolite/zforest-examples
+cd zforest-examples   # sibling of ../zforest — the path dependency
 zig build        # produces zig-out/bin/{zforest,zboard,zmon,zcar,zmeta-demo}
-zig build test   # engine, forest, session, app, and codegen tests
+zig build test   # app test targets (framework tests: cd ../zforest && zig build test)
 zig build run-demo   # serves the zmeta demo on http://127.0.0.1:8084
 ```
 
 The demo is the reference app: open `/`, click around, then read
-`src/apps/zmeta_demo/` — every concept below lives there.
+`src/apps/zmeta_demo/` (in zforest-examples) — every concept below
+lives there.
 
 ### Scaffolding a new app
 
@@ -60,10 +67,12 @@ src/apps/<name>/
 ├── features/         optional FSD slice — session-bound features
 ├── shared/           optional FSD slice — shared view components/helpers
 └── gen/              GENERATED — routes.zig + actions.zig (checked in)
-src/zefx/ src/forest/ src/zmeta/ src/server/   framework (named modules)
-src/db.zig           sqlite wrapper — `zdb` module, sqlite exes only
-src/client.js src/style.css   embedded web assets (`zassets` module)
 ```
+
+(zforest-examples repo; the framework modules — `src/zefx/`,
+`src/forest/`, `src/zmeta/`, `src/server/`, `src/db.zig`,
+`src/client.js`, `src/style.css` — live in the sibling `../zforest`
+repo and are consumed as named Zig modules.)
 
 Layer dirs are created on demand as the app grows — `entities/`
 holds domain state, `features/` session-bound behavior, `shared/`

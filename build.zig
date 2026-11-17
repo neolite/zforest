@@ -5,7 +5,8 @@ const sqlite_flags = [_][]const u8{ "-DSQLITE_THREADSAFE=1", "-DSQLITE_OMIT_LOAD
 
 /// Attach the vendored sqlite3 amalgamation (SQLite 3.54.1) to a module:
 /// link libc, compile sqlite3.c with the documented flags. Only modules
-/// that actually link the db get this — zmon/zcar/zmeta-demo never see C.
+/// that actually link the db get this — the framework itself never
+/// imports zdb; apps (in the zforest-examples repo) opt in per-exe.
 fn addSqlite(m: *std.Build.Module, b: *std.Build) void {
     m.link_libc = true;
     m.addIncludePath(b.path("vendor/sqlite3"));
@@ -15,6 +16,12 @@ fn addSqlite(m: *std.Build.Module, b: *std.Build) void {
     });
 }
 
+// zforest is the FRAMEWORK repo: zefx (reactive graph), forest (view /
+// DOM diff / snapshot), zserver (HTTP/SSE transport), zmeta
+// (file-routing meta-framework), zdb (sqlite wrapper) and zassets
+// (client.js/style.css embedding). The example apps that consume
+// these modules live in the sibling zforest-examples repo — this build
+// produces no executables, only the module graph plus tests.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -29,8 +36,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
-    // Framework modules — named so every exe compiles ONE copy of each
-    // type (History/Dom/zefx/forest): `zserver` (HTTP/SSE transport,
+    // Framework modules — named so every consumer compiles ONE copy of
+    // each type (History/Dom/zefx/forest): `zserver` (HTTP/SSE transport,
     // generic over Session) sits below `zmeta` (session skeleton), and
     // zmeta reaching `zserver.History` through the named module is what
     // keeps the retained-batch ring type identical everywhere. No
@@ -64,150 +71,34 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const app_imports = [_]std.Build.Module.Import{
-        .{ .name = "zefx", .module = zefx_mod },
-        .{ .name = "forest", .module = forest_mod },
-        .{ .name = "zserver", .module = zserver_mod },
-        .{ .name = "zmeta", .module = zmeta_mod },
-    };
-
     // `db.zig` → named module `zdb`: it sits at the `src/` root, outside
-    // every app's module path (`src/apps/<name>/`), so relative imports
-    // can no longer reach it — and only the sqlite-linked exe modules
-    // (zforest/zboard) get the import, keeping "db is app-side, never
-    // framework" enforced by the module graph. The sqlite3 amalgamation
-    // + flags live on zdb itself: whichever exe imports it links the C
-    // exactly once per compilation.
+    // every app's module path. Apps import it by name; only the
+    // sqlite-linked exes get the import, keeping "db is app-side,
+    // never framework" enforced by the module graph. The sqlite3
+    // amalgamation + flags live on zdb itself: whichever exe imports it
+    // links the C exactly once per compilation.
     const db_mod = b.addModule("zdb", .{
         .root_source_file = b.path("src/db.zig"),
         .target = target,
     });
     addSqlite(db_mod, b);
 
-    const sqlite_imports = [_]std.Build.Module.Import{
-        .{ .name = "zefx", .module = zefx_mod },
-        .{ .name = "forest", .module = forest_mod },
-        .{ .name = "zserver", .module = zserver_mod },
-        .{ .name = "zmeta", .module = zmeta_mod },
-        .{ .name = "zdb", .module = db_mod },
-    };
-
-    const exe_mod = b.createModule(.{
-        .root_source_file = b.path("src/apps/todo/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &sqlite_imports,
-    });
-    // The todo app persists to sqlite (apps/todo/store.zig → zdb).
-    const exe = b.addExecutable(.{ .name = "zforest", .root_module = exe_mod });
-
-    b.installArtifact(exe);
-
-    // The board app: shares the zefx/forest modules plus sqlite via zdb.
-    const zboard_mod = b.createModule(.{
-        .root_source_file = b.path("src/apps/board/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &sqlite_imports,
-    });
-
-    const zboard = b.addExecutable(.{ .name = "zboard", .root_module = zboard_mod });
-
-    b.installArtifact(zboard);
-
-    // The zmon dashboard: same zefx/forest modules, no sqlite — but libc
-    // for time(3) (wall-clock uptime/start timestamps).
-    const zmon_mod = b.createModule(.{
-        .root_source_file = b.path("src/apps/mon/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &app_imports,
-    });
-    zmon_mod.link_libc = true;
-    const zmon = b.addExecutable(.{ .name = "zmon", .root_module = zmon_mod });
-
-    b.installArtifact(zmon);
-
-    // The zcar booking app: same zefx/forest modules, no sqlite, no libc.
-    const zcar_mod = b.createModule(.{
-        .root_source_file = b.path("src/apps/car/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &app_imports,
-    });
-    const zcar = b.addExecutable(.{ .name = "zcar", .root_module = zcar_mod });
-
-    b.installArtifact(zcar);
-
-    // zmeta codegen: `zig build gen` regenerates src/apps/*/gen/*.zig
-    // from each app's pages/ tree + actions.zig manifest. The output is
-    // deterministic and checked in — the demo module below compiles the
-    // checked-in files directly (no build-time codegen dependency).
+    // zmeta codegen/scaffold are std-only CLI tools shipped with the
+    // framework. They are consumed by the examples repo, which roots
+    // its own tool modules at these files (dep.path("src/zmeta/…")) and
+    // runs them with cwd = the examples repo; here they exist only as
+    // test targets.
     const gen_mod = b.createModule(.{
         .root_source_file = b.path("src/zmeta/gen.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const gen_tool = b.addExecutable(.{ .name = "zmeta-gen", .root_module = gen_mod });
-    const gen_step = b.step("gen", "Regenerate zmeta app gen/ files (routes.zig, actions.zig)");
-    const gen_run = b.addRunArtifact(gen_tool);
-    gen_run.setCwd(b.path("."));
-    gen_step.dependOn(&gen_run.step);
 
-    // `zig build new-app -- <name>`: scaffold src/apps/<name>/ (incl.
-    // main.zig), then regenerate gen/ for the new app in the same
-    // invocation (the scaffold step must finish first).
     const scaffold_mod = b.createModule(.{
         .root_source_file = b.path("src/zmeta/scaffold.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const scaffold_tool = b.addExecutable(.{ .name = "zmeta-new", .root_module = scaffold_mod });
-    const new_app_step = b.step("new-app", "Scaffold a new zmeta app: zig build new-app -- <name>");
-    const new_app_run = b.addRunArtifact(scaffold_tool);
-    new_app_run.setCwd(b.path("."));
-    new_app_run.addPassthruArgs();
-    new_app_step.dependOn(&new_app_run.step);
-    const gen_for_new = b.addRunArtifact(gen_tool);
-    gen_for_new.step.dependOn(&new_app_run.step);
-    new_app_step.dependOn(&gen_for_new.step);
-
-    // The zmeta demo app: file-based routes with typed params + the
-    // comptime action table, served through the zmeta Session skeleton.
-    const demo_mod = b.createModule(.{
-        .root_source_file = b.path("src/apps/zmeta_demo/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &app_imports,
-    });
-    const demo = b.addExecutable(.{ .name = "zmeta-demo", .root_module = demo_mod });
-
-    b.installArtifact(demo);
-
-    const run_step = b.step("run", "Run the todo server");
-    const run_cmd = b.addRunArtifact(exe);
-    run_step.dependOn(&run_cmd.step);
-    run_cmd.step.dependOn(b.getInstallStep());
-
-    const run_board_step = b.step("run-board", "Run the board server");
-    const run_board_cmd = b.addRunArtifact(zboard);
-    run_board_step.dependOn(&run_board_cmd.step);
-    run_board_cmd.step.dependOn(b.getInstallStep());
-
-    const run_mon_step = b.step("run-mon", "Run the zmon dashboard");
-    const run_mon_cmd = b.addRunArtifact(zmon);
-    run_mon_step.dependOn(&run_mon_cmd.step);
-    run_mon_cmd.step.dependOn(b.getInstallStep());
-
-    const run_car_step = b.step("run-car", "Run the zcar booking app");
-    const run_car_cmd = b.addRunArtifact(zcar);
-    run_car_step.dependOn(&run_car_cmd.step);
-    run_car_cmd.step.dependOn(b.getInstallStep());
-
-    const run_demo_step = b.step("run-demo", "Run the zmeta demo app");
-    const run_demo_cmd = b.addRunArtifact(demo);
-    run_demo_step.dependOn(&run_demo_cmd.step);
-    run_demo_cmd.step.dependOn(b.getInstallStep());
 
     const zefx_tests = b.addTest(.{ .root_module = zefx_mod });
     const run_zefx_tests = b.addRunArtifact(zefx_tests);
@@ -228,24 +119,6 @@ pub fn build(b: *std.Build) void {
     const db_tests = b.addTest(.{ .root_module = db_mod });
     const run_db_tests = b.addRunArtifact(db_tests);
 
-    // exe tests pull app files via each app's main.zig test block;
-    // zdb/db.zig tests run under the zdb target above. sqlite is only
-    // linked into the zforest/zboard exe + test binaries.
-    const exe_tests = b.addTest(.{ .root_module = exe_mod });
-    const run_exe_tests = b.addRunArtifact(exe_tests);
-
-    const zboard_tests = b.addTest(.{ .root_module = zboard_mod });
-    const run_zboard_tests = b.addRunArtifact(zboard_tests);
-
-    const zmon_tests = b.addTest(.{ .root_module = zmon_mod });
-    const run_zmon_tests = b.addRunArtifact(zmon_tests);
-
-    const zcar_tests = b.addTest(.{ .root_module = zcar_mod });
-    const run_zcar_tests = b.addRunArtifact(zcar_tests);
-
-    const demo_tests = b.addTest(.{ .root_module = demo_mod });
-    const run_demo_tests = b.addRunArtifact(demo_tests);
-
     const gen_tests = b.addTest(.{ .root_module = gen_mod });
     const run_gen_tests = b.addRunArtifact(gen_tests);
 
@@ -258,11 +131,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_zserver_tests.step);
     test_step.dependOn(&run_zmeta_tests.step);
     test_step.dependOn(&run_db_tests.step);
-    test_step.dependOn(&run_exe_tests.step);
-    test_step.dependOn(&run_zboard_tests.step);
-    test_step.dependOn(&run_zmon_tests.step);
-    test_step.dependOn(&run_zcar_tests.step);
-    test_step.dependOn(&run_demo_tests.step);
     test_step.dependOn(&run_gen_tests.step);
     test_step.dependOn(&run_scaffold_tests.step);
 }

@@ -1,45 +1,36 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-`zforest` hosts five server-driven apps on one transport: the `zefx`
-reactive core plus a `forest` fine-grained DOM patch layer, a `zmeta`
-session/meta-framework, and a minimal generic `std.http` server. The
-repo splits FRAMEWORK from APPS without splitting git: `src/` is 100%
-framework (`zefx/`, `forest/`, `zmeta/`, `server/`, `assets.zig`,
-`db.zig`, `client.js`, `style.css`) and every app — including its exe
-entry point `main.zig` — lives under `src/apps/<name>/`. Cross-boundary
-imports go through NAMED build modules only: `zefx`, `forest`,
-`zserver` (`server/http.zig`), `zmeta` (`zmeta/root.zig`), plus `zdb`
-(the sqlite wrapper — sqlite-linked exes only) and `zassets` (embedded
-`client.js`/`style.css` — zserver only). A framework file must never
-relative-import app code, and app code must never relative-import
-`src/{zefx,forest,zmeta,server}/` — `History`/`Dom`/`zefx`/`forest` type
-identity is enforced by the module graph (one type per program).
-`zforest` is the Todo demo (per-session model); `zboard` is an
-anonymous board (shared SQLite-backed model); `zmon` is a live ops
-dashboard on fine-grained live bindings; `zcar` is a service-booking
-demo (vehicle cascade, service catalogue, upsells, combo discounts,
-booking history); `zmeta-demo` is the codegen showcase.
+`zforest` is the FRAMEWORK repo: the `zefx` reactive core plus a
+`forest` fine-grained DOM patch layer, a `zmeta` session/meta-framework,
+and a minimal generic `std.http` server — all under `src/`, exposed as
+named Zig modules: `zefx`, `forest`, `zserver` (`server/http.zig`),
+`zmeta` (`zmeta/root.zig`), plus `zdb` (the sqlite wrapper) and
+`zassets` (embedded `client.js`/`style.css`). The example apps that
+consume these modules — `zforest` (todo), `zboard`, `zmon`, `zcar`,
+`zmeta-demo` — live in the sibling repo
+[neolite/zforest-examples](https://github.com/neolite/zforest-examples),
+checked out as `../zforest-examples` relative to this repo (or consumed
+via `.path = "../zforest"` from that side). `History`/`Dom`/`zefx`/
+`forest` type identity is enforced by the module graph (one type per
+program): consumers pull the SAME `*Module` objects via
+`dep.module(name)`, and no framework file may import app code — the
+dependency arrow only ever points app → framework.
 
 - `src/zefx/root.zig`: public API surface exported as module `zefx`.
 - `src/zefx/engine.zig`, `event.zig`, `store.zig`, `sample.zig`, `shape.zig`, `effect.zig`: reactive graph primitives and operators.
 - `src/forest/patch.zig`: HTML escaping + `Patch`/`PatchLog` (owned strings, JSON batch; `writeOpJson` serializes one op).
 - `src/forest/dom.zig`: server-side DOM state tracking, text/attr bindings, keyed list diff, `when_states` branch keys for `z-when` anchors.
-- `src/forest/view.zig`: declarative view tree (`el`/`text`/`raw`/`eachOf`/`fragment`/`computed`/`variant`/`when`) — one tree drives SSR (`writeHtml`), the DOM-patch `diff`, and the full-state snapshot (`writeSnapshotOps`). Attrs and `.text` accept duck-typed `*T.get()` store pointers and `computed` wrappers resolved lazily; `.on`/`.arg` emit `data-on-<event>`/`data-arg` DOM-event attrs; `variant`/`when` mount/unmount subtrees between `<!--z-when:ID-->` comment pairs via idempotent `when` ops; `island` marks a transparent binder-owned subtree (`bindIslands` subscribes its `Bound.live` leaves while `diff` skips it). `bindTree` is the live mode: subscribes bound leaves (`Bound.live`, populated when the store exposes `watchCtx`/`unwatch`/`Value`) so store notifications emit patch ops with no rebuild — used by zmon; see ARCHITECTURE.md "Live bindings".
-- `src/apps/todo/`: the TodoMVC app on the zmeta convention — `main.zig` the `zforest` exe entry point (`zforest [port] [bind-ip] [db-path]`; installs the todo `TodoStore`, default db `zforest-todos.db`), `app.zig` holds the per-session model (`TodoDeps`: todos/filter/sparse edit state, `mutate` event, `remaining` derived store, `on_<action>` handlers), `store.zig` the `TodoStore` SQLite write-through persistence (module-global `shared`, keyed by the `ztd` client cookie — survives session eviction/restart), `pages/index.zig` the single "/" view, `actions.zig` the manifest, `gen/` the checked-in codegen output. `Session.dispatch` is the whitelisted action entry (`{action, arg?, value?, fields?}`).
-- `src/apps/board/`: the zboard anonymous board on the zmeta convention, laid out in FSD slices — app root `app.zig` (`BoardDeps` + hand-declared `Session`, needs `scopeForRoute`/`scopeVersion` statics for groups) and `groups.zig` (render-group registry: sessions with equal route/reply_to/name/sort/account share one Dom/history/rev — session/render infra, not a domain slice), `entities/model.zig` the shared `BoardModel` (static board whitelist, in-memory posts/comments/users, write-through SQLite, one shared `next_id` (`#N` display ids), `global_seq` atomic, module-global `shared`/`get()`) + `entities/accounts.zig` the account operations, `features/auth.zig` the session-auth handlers/cookie resolution, `shared/components.zig` the domain `Route`/`Sort`/`ViewEnv` + all components + `shared/markdown.zig` the text renderer, `pages/` the file routes (`index`, `b/[slug]`, `t/[post]`, `t/[post]/c/[comment]`), `actions.zig` the manifest, `seed.zig` the db seeder, `gen/` the checked-in codegen, `main.zig` the `zboard` exe entry point (`zboard [port] [bind-ip] [db-path]`).
-- `src/db.zig`: typed wrapper over the vendored sqlite3 amalgamation (`vendor/sqlite3`, official 3.54.1; flags `-DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_LOAD_EXTENSION`). Compiled as named module `zdb`, imported only by the sqlite-linked exe modules (zforest's todo store, zboard's model) — never zmon/zcar/zmeta-demo, never framework.
-- `src/apps/car/`: the zcar booking app on the zmeta convention — `main.zig` the `zcar` exe entry point (`zcar [port] [bind-ip]`), `app.zig` holds the per-session model (`CarDeps`: vehicle cascade, service cart `AutoHashMapUnmanaged`, upsell suggestions, bookings, `mutate` event, `on_<action>` handlers, cart math/discounts/suggestions), `car_data.zig` the static catalogue (brands/models/years with specs, service list by `Cat`, combo rules), `pages/index.zig` the single "/" view, `actions.zig` the manifest, `gen/` the checked-in codegen. `discounts` writes into a caller buffer (no stack-slice escape).
-- `src/apps/mon/`: the zmon live ops dashboard on the zmeta convention — `main.zig` the `zmon` exe entry point (`zmon [port] [bind-ip]`; spawns the model ticker thread), `app.zig` holds `MonDeps` (per-session stores/arenas/view cache/`ping`, `.live_shared` archetype, the live render-path overrides `servePage`/`render`/`writeView`/`buildViewNodes`/`seedDom`), `mon_model.zig` the module-global shared `MonModel` (ticker thread mutates under its mutex), `pages/index.zig` the once-built dashboard view (live `Bound` leaves), `actions.zig` the manifest, `gen/` the checked-in codegen.
-- `src/zmeta/`: the meta-framework layer as NAMED module `zmeta` (root `root.zig` export surface; imports `{zefx, forest, zserver}` so `History`/`Dom`/`zefx`/`forest` types stay identical to what the server and apps see). `session.zig` is the generic `Session(Deps)` skeleton (incl. the optional `Deps.beforeAction` pre-dispatch hook), `env.zig` the render context, `gen.zig` the routing/action codegen (`zig build gen`), `scaffold.zig` the `new-app` scaffolder. Apps reach it through their per-app `zmeta.zig` shim re-exporting the named module — never a relative import into `src/zmeta/`.
-- `src/apps/<name>/`: zmeta app dirs — `main.zig` the exe entry point (inside the app dir, like every app), `zmeta.zig` the shim re-exporting the `zmeta` named module, `pages/**/*.zig` (file-based routes; `[name]`/`[...name]`/`[[...name]]` segments → typed `params` fields: ints + `[]const u8` strings slicing the session-owned route path), `pages/**/_layout.zig`/`_middleware.zig` directory-scoped framework files (view wrapping / prepare-time gate, other `_` files rejected), `actions.zig` (action-name manifest), `pages/api/` JSON endpoints (`api(a,s,p,env)` handlers → `Deps.serveApi`; middleware never runs for api), `pub const live = true` page opt-in (live islands: `bindTree` leaf ops, no diff), `forest.island`/`h.island` per-leaf islands inside diff pages (`bindIslands` after every `forest.diff`; bound leaves push ops, diff skips the subtree), generated `gen/routes.zig` + `gen/actions.zig` (checked in). Optional FSD slices (zboard is the reference; create on demand, codegen only scans `pages/`): `entities/` domain state leaf (no slice imports), `features/` session-bound slices (may import entities+shared plus the app root's session/render contract — `app.zig` `Session`/`Deps`, `groups.zig`), `shared/` shared view components/helpers (may import entities for view-model types — zmeta-FSD order app→pages→features→shared→entities, docs/meta-framework.md §5.6); app-root `*.zig` + `gen/` + `zmeta.zig` form the app layer and may import everything.
-- `src/apps/zmeta_demo/`: the `zmeta-demo` codegen showcase (`zmeta-demo [port] [bind-ip]`).
+- `src/forest/view.zig`: declarative view tree (`el`/`text`/`raw`/`eachOf`/`fragment`/`computed`/`variant`/`when`) — one tree drives SSR (`writeHtml`), the DOM-patch `diff`, and the full-state snapshot (`writeSnapshotOps`). Attrs and `.text` accept duck-typed `*T.get()` store pointers and `computed` wrappers resolved lazily; `.on`/`.arg` emit `data-on-<event>`/`data-arg` DOM-event attrs; `variant`/`when` mount/unmount subtrees between `<!--z-when:ID-->` comment pairs via idempotent `when` ops; `island` marks a transparent binder-owned subtree (`bindIslands` subscribes its `Bound.live` leaves while `diff` skips it). `bindTree` is the live mode: subscribes bound leaves (`Bound.live`, populated when the store exposes `watchCtx`/`unwatch`/`Value`) so store notifications emit patch ops with no rebuild; see ARCHITECTURE.md "Live bindings".
+- `src/zmeta/`: the meta-framework layer as NAMED module `zmeta` (root `root.zig` export surface; imports `{zefx, forest, zserver}` so `History`/`Dom`/`zefx`/`forest` types stay identical to what the server and apps see). `session.zig` is the generic `Session(Deps)` skeleton (incl. the optional `Deps.beforeAction` pre-dispatch hook), `env.zig` the render context. `gen.zig` (routing/action codegen) and `scaffold.zig` (`new-app` scaffolder) are std-only CLI tools SHIPPED with the framework but EXECUTED by the examples repo — apps reach zmeta through a per-app `zmeta.zig` shim re-exporting the named module; here gen/scaffold exist only as test targets.
 - `src/server/http.zig`: generic-over-`Session` HTTP/SSE server — named module `zserver` (cookie sessions, POST /action → ACK, GET /events → SSE stream, `Ip4Address` bind, `setRoute`/`servePage`/`syncPull`/`out_cookie`/`readCookies` hooks, per-action `Set-Cookie`). Re-exports `History` and `writeSnapshotJson` as the public type surface.
 - `src/server/history.zig`: bounded per-session ring of serialized patch batches for SSE subscribers.
 - `src/server/stream.zig`: `{rev,ops}` snapshot serialization for SSE snapshot events.
+- `src/db.zig`: typed wrapper over the vendored sqlite3 amalgamation (`vendor/sqlite3`, official 3.54.1; flags `-DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_LOAD_EXTENSION`). Compiled as named module `zdb` with the C sources/flags on the module itself — whichever app exe imports it links sqlite exactly once; the framework never imports it.
 - `src/assets.zig`: named module `zassets` — the only file whose package path (`src/`) can `@embedFile` `client.js`/`style.css`; imported by `zserver` only.
 - `src/client.js`: app-agnostic DOM patch renderer + delegated `data-on-*` event → action POST plumbing; `src/style.css`: app styling.
-- `build.zig`: build graph, run step, and test step definitions.
+- `vendor/sqlite3/`: the sqlite3 amalgamation — listed in `build.zig.zon` `paths` so it ships to dependency consumers.
+- `build.zig`: module graph + test step definitions (no executables — apps live in zforest-examples).
 - `build.zig.zon`: package metadata (`minimum_zig_version = 0.17.1`).
 
 ## Architecture decisions
@@ -63,10 +54,11 @@ booking history); `zmeta-demo` is the codegen showcase.
   `view.zig` tree that is diffed via `Dom` into `PatchLog`; the same tree
   renders the SSR page (`writeView`) and the snapshot `ops`
   (`buildViewNodes` → `writeSnapshotOps`).
-- zboard's model is shared across sessions while each session keeps its
-  own graph/DOM state: mutations bump `BoardModel.global_seq`, and each
-  SSE worker's `syncPull()` re-renders (publishing the batch) when the
-  counter moved — cross-tab fan-out through the normal patch pipeline.
+- Shared-model fan-out is an app-side pattern: each session keeps its
+  own graph/DOM state while mutations bump a model-global sequence
+  counter; each SSE worker's `syncPull()` re-renders (publishing the
+  batch) when the counter moved — cross-tab fan-out through the normal
+  patch pipeline (see the zboard app in zforest-examples).
 - The server spawns one worker task per accepted connection
   (`std.Io.Group.concurrent`, thread-per-connection; beyond 128 concurrent
   connections the socket is closed before any headers are read — no inline
@@ -78,23 +70,17 @@ booking history); `zmeta-demo` is the codegen showcase.
 - Generated artifacts: `.zig-cache/` and `zig-out/` (do not edit manually).
 
 ## Build, Test, and Development Commands
-- `zig build`: compile and install the executables (`zforest`, `zboard`, `zmon`, `zcar`, `zmeta-demo`).
-- `zig build run`: run the todo server on 127.0.0.1:8080 (port arg optional).
-- `zig build run-board`: run the board server (`zboard [port] [bind-ip] [db-path]`).
-- `zig build run-mon`: run the dashboard (`zmon [port] [bind-ip]`).
-- `zig build run-car`: run the booking demo (`zcar [port] [bind-ip]`).
-- `zig build run-demo`: run the zmeta codegen demo (`zmeta-demo [port] [bind-ip]`).
-- `zig build gen`: regenerate `src/apps/*/gen/*.zig` from pages/ + actions.zig manifests (`_layout.zig` files become route layouts, other `_`-prefixed files are rejected).
-- `zig build new-app -- <name>`: scaffold `src/apps/<name>/` (incl. `main.zig`), then regenerate gen/ (prints the build.zig lines needed to register the exe).
-- `zig build test`: run module + executable test targets for all apps.
-- `zig build -Doptimize=ReleaseFast`: build with release optimization.
+- `zig build`: configure the module graph — this repo ships NO executables (apps live in zforest-examples).
+- `zig build test`: run all framework module + tool test targets (zefx, forest, zserver, zmeta, zdb, gen, scaffold).
+- `zig build -Doptimize=ReleaseFast`: release-optimized test binaries.
 - `zig fmt src/**/*.zig build.zig`: format code before committing.
+- App-side commands (`run*`, `gen`, `new-app`) live in the zforest-examples repo — its `build.zig` roots tool modules at this repo's `src/zmeta/{gen,scaffold}.zig` via `dep.path(...)` with cwd pinned there, so `src/apps/` resolves in the examples repo.
 
 ## Coding Style & Naming Conventions
 - Use `zig fmt` as the source of truth (4-space indentation, consistent wrapping).
 - Keep filenames lowercase snake-style (`engine.zig`, `sample.zig`).
 - Use `PascalCase` for types (`Engine`, `Event`, `Store`) and `camelCase` for functions (`createEvent`, `createStore`, `trackGraphAlloc`).
-- Keep public API in `src/root.zig`; keep implementation details in focused modules.
+- Keep public API in `src/root.zig` / module roots; keep implementation details in focused modules.
 - Prefer explicit, typed helpers over broad `anytype` unless API flexibility requires it.
 
 ## Testing Guidelines

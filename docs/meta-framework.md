@@ -6,6 +6,13 @@ transport, records which ones fit and which do not, and sketches a
 minimal v0. It exists so the discussion has a concrete target; per
 AGENTS.md, any outcome gets summarized in ARCHITECTURE.md.
 
+> **Repo note (post-split):** the framework lives in `neolite/zforest`;
+> the apps described below live in `neolite/zforest-examples`. Every
+> `src/apps/<name>/` path in this document refers to the examples repo —
+> the layout convention itself is unchanged. `zig build gen` /
+> `new-app` run there (tool sources stay in this repo under
+> `src/zmeta/`).
+
 ## Stack recap (for readers without the code open)
 
 zforest is server-authoritative UI in Zig 0.17.1:
@@ -29,7 +36,8 @@ zforest is server-authoritative UI in Zig 0.17.1:
 - `src/client.js` — ~200-line framework-free op applier + delegated
   `data-on-*` event → action POST plumbing. No app knowledge, no
   hydration, no router (embedded via the `zassets` module).
-- Apps: `src/apps/todo/` + `src/apps/car/` (per-session models, diff
+- Apps (now in the zforest-examples repo): `src/apps/todo/` +
+  `src/apps/car/` (per-session models, diff
   path, file-based routing), `src/apps/board/` (shared SQLite-backed
   `BoardModel` in `model.zig`, `global_seq` fan-out, render groups
   sharing one Dom/History/revision across N sessions, file routes for
