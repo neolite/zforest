@@ -442,6 +442,11 @@ fn resolveValue(a: std.mem.Allocator, v: anytype) ?[]const u8 {
         .int, .comptime_int => return std.fmt.allocPrint(a, "{d}", .{v}) catch @panic("OOM"),
         .pointer => {
             if (comptime isGetPtr(T)) return resolveValue(a, v.get());
+            // Borrowed slices (stack buffers, caller memory) must be
+            // copied into the arena — the node tree outlives the
+            // expression that built it.
+            if (comptime @typeInfo(T).pointer.size == .slice)
+                return a.dupe(u8, v) catch @panic("OOM");
             return v;
         },
         else => @compileError("unsupported view value type: " ++ @typeName(T)),
