@@ -41,6 +41,7 @@ pub const Tag = enum {
     p,
     pre,
     polyline,
+    rect,
     script,
     section,
     select,

@@ -451,6 +451,9 @@ pub fn pre(alloc: std.mem.Allocator) Builder(.pre) {
 pub fn polyline(alloc: std.mem.Allocator) Builder(.polyline) {
     return .{ .a = alloc };
 }
+pub fn rect(alloc: std.mem.Allocator) Builder(.rect) {
+    return .{ .a = alloc };
+}
 pub fn script(alloc: std.mem.Allocator) Builder(.script) {
     return .{ .a = alloc };
 }
